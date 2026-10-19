@@ -58,17 +58,28 @@ To ensure zero-copy execution and cache coherency, buffers follow an explicit 8-
    - If `ES_NPU_SetDevice(deviceId)` has not been called on the calling thread, `ES_NPU_Prepare` immediately aborts with error `0xA00F604A` (`ES_NPU_ERROR_CONTEXT_NOT_FOUND`).
    - `DmaBuffer::prepare(uint16_t device_id)` automatically calls `set_device(device_id)` prior to invoking the SMMU mapping routine.
 
-### Device Node Permissions (`/dev/npu*`)
-- By default, `/dev/npu0` and `/dev/npu1` are created with `0660 root:root`.
-- Non-root processes calling `ES_NPU_Prepare` will receive `EACCES (Permission denied)` when opening `/dev/npu0` during `ioctl(0xc0046e0f)`.
-- Applications must either run with `sudo` or install a udev rule:
+### Device Node Permissions (`/dev/npu*`, `/dev/mmz_vb`)
+- In default vendor firmware, `/etc/udev/rules.d/86-ai.rules` and `20-memory.rules` specified `GROUP="eswin", OWNER="eswin"` with mode `0660`. Because the `eswin` user and group do not exist in standard user accounts, the kernel udev engine fell back to `root:root` with mode `0660`.
+- Consequently, unprivileged non-root users (such as `chri`) attempting to run inference or map DMA buffers encountered `openat("/dev/npu0") = -1 EACCES (Permission denied)` and `open("/dev/mmz_vb") failed!`, causing `ES_NPU_Prepare` to fail with error `0xFFFFFFFF`.
+- To allow standard non-root execution without requiring `sudo`, configure `/etc/udev/rules.d/86-ai.rules` and `/etc/udev/rules.d/20-memory.rules` with mode `0666`:
   ```bash
-  # /etc/udev/rules.d/99-eswin-npu.rules
-  KERNEL=="npu[0-9]*", MODE="0666"
+  # /etc/udev/rules.d/86-ai.rules
   KERNEL=="es-dsp[0-9]*", MODE="0666"
+  KERNEL=="npu[0-9]*", MODE="0666"
   KERNEL=="es_hae*", MODE="0666"
-  KERNEL=="dma_heap/*", MODE="0666"
+  KERNEL=="mmz_nid_*", MODE="0666"
+  KERNEL=="eswin_ipc_*", MODE="0666"
+
+  # /etc/udev/rules.d/20-memory.rules
+  KERNEL=="linux,cma", MODE="0666"
+  KERNEL=="llc_spram[0-1]", MODE="0666"
+  KERNEL=="mmz_nid_[0-1]_part_[0-1]", MODE="0666"
+  KERNEL=="system", MODE="0666"
+  KERNEL=="mmz_vb", MODE="0666"
+  KERNEL=="malloc_dmabuf", MODE="0666"
+  KERNEL=="perf_count", MODE="0666"
   ```
+  Apply with: `sudo udevadm control --reload-rules && sudo udevadm trigger`.
 
 ---
 
