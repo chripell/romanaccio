@@ -309,6 +309,24 @@ During implementation of Milestone 5:
      - DSP: Attention Softmax
      - NPU: Output context projection (lowered to 1x1 Conv)
 
+---
+
+## 17. Dual-Die Partitioning & End-to-End Compiler CLI (`compiler.py`)
+
+During implementation of Milestone 6:
+1. **Dual-Die Vocabulary Tensor Parallelism (`passes/dual_die_splitter.py`)**:
+   - Wide projection layers (Language Model Head $V=49,152$ or $152,064$) are split along the output channel dimension:
+     - Die 0: $C_0 = [0 \dots V/2 - 1]$
+     - Die 1: $C_1 = [V/2 \dots V - 1]$
+   - Emits paired loadables (`*_d0.model` and `*_d1.model`) that execute concurrently across `/dev/npu0` and `/dev/npu1`.
+2. **Sequential Pipeline Parallelism**:
+   - Partitions Transformer layers across dies (e.g. Layers $0 \dots 14$ on Die 0, Layers $15 \dots 29$ on Die 1).
+3. **End-to-End Compiler Driver (`compiler.py`)**:
+   - Ingests both ONNX models (YOLOv3, YOLOv5, ResNet) and Hugging Face SafeTensors directories (SmolLM-135M, Qwen2.5, DeepSeek, Llama-3.2).
+   - Automatically parses model hyperparameters from `config.json` (`hidden_size`, `intermediate_size`, `vocab_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`).
+   - Chains the complete lowering pipeline: `GemmToConv1x1Pass` $\to$ `SDPFusionPass` $\to$ `DSPPartitionerPass` $\to$ `SRAMTilerPass` $\to$ `DualDieSplitterPass` $\to$ `NVDLAConvBuilder` / `DSPSubmodelBuilder` $\to$ `ModelWriter`.
+
+
 
 
 
