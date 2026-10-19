@@ -1,0 +1,40 @@
+# Model weights, offline loadables, and large binary data
+*.bin
+*.model
+*.onnx
+*.safetensors
+*.pt
+*.pth
+*.gguf
+*.ofmap_order.txt
+
+# C/C++ build artifacts and compiled binaries
+build/
+build-*/
+bin/
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.a
+smollm_chat
+es_qwen2
+
+# Python artifacts and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editor and OS files
+*~
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/

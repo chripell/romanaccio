@@ -1,2 +1,107 @@
 # romanaccio
-Work on FML13V03  DC-ROMA
+
+**romanaccio** (a Romanesco pun on *roma*) is an open-source development suite, reverse-engineering repository, and runtime library collection for the **ESWIN EIC7700X / EIC7702** SoC (found on the **DC-ROMA RISC-V AI PC** and **FML13V03 Mainboard II**).
+
+It provides standalone runtimes, bug fixes for vendor software, comprehensive reverse-engineered hardware/firmware documentation, and architectural plans for open re-implementations of the compiler, simulator, and runtime toolchain.
+
+---
+
+## 1. Repository Layout
+
+```
+romanaccio/
+├── README.md                         # Main repository guide and model download instructions
+├── FINDINGS.md                       # Master summary of reverse engineering discoveries
+├── findings/                         # Detailed standalone technical reports
+│   ├── NPU_OPERATIONS.md             # Hardware engine & 372 DSP kernels catalog, GPU profile
+│   ├── MODEL_FORMAT.md               # Reverse-engineered .model (NVDA FlatBuffers) specification
+│   ├── SYSTEM_CAPABILITIES_AND_MODELS.md # Compute envelope, latency benchmarks, model feasibility
+│   ├── RUNTIME_API.md                # Userspace NPU runtime API specification & multi-die caveats
+│   └── CPU_NPU_PROTOCOL.md           # Kernel ioctl catalog (eic7700_npu.ko) & SMMU DMA mapping
+└── src/
+    ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
+    ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
+    ├── eswin_runtime/                # Open C11/C++ NPU runtime & llama.cpp tooling (PLAN.md)
+    ├── smollm/                       # SmolLM-135M chat engine (C++17 & Python) with dual-die offload
+    └── qwen2_fix/                    # Root cause fixes for Issue #47 (DeepSeek/Qwen2) + chat REPL
+```
+
+---
+
+## 2. Components Overview
+
+### 2.1 Runtimes & Applications
+- **SmolLM-135M Chat Engine (`src/smollm/`)**:
+  A lightweight, dependency-free C++17 chat engine and Python reference runtime for [SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M). Features interactive terminal streaming, RoPE, GQA, SwiGLU FFN, KV-cache, and concurrent dual-die NPU offload for the 49K-token LM Head (~0.9 ms latency).
+- **Framework Issue #47 Fixes (`src/qwen2_fix/`)**:
+  Complete resolution for [Framework Issue #47](https://github.com/DC-DeepComputing/Framework/issues/47) (heap corruption in `repetitionPenalty`, greedy token loops, KV cache buffer overflow, multi-die deadlocks on early exit) and a redesigned chat REPL (`es_qwen2_demo.cpp`) supporting customizable system prompts and sampling controls.
+
+### 2.2 Re-Implementation Architecture Plans
+- **Open Compiler (`src/eswin_compiler/PLAN.md`)**:
+  Incremental plan for an open-source `EsAAC` alternative. Features a hybrid frontend (ONNX for vision; native `safetensors` + `config.json` for LLMs), 4D tensor IR, NVDLA hardware engine lowering, and DSP offloading.
+- **Open Simulator (`src/eswin_simulator/PLAN.md`)**:
+  Incremental plan for a 64-bit cross-platform `EsSimulator` equivalent for bit-accurate numerical verification against PyTorch and ONNX golden data.
+- **Open Runtime (`src/eswin_runtime/PLAN.md`)**:
+  Incremental plan for a modern C11/C++ userspace library linkable into edge applications. Resolves multi-die driver deadlocks via a dedicated NUMA worker pool, and embeds `llama.cpp`-style tokenizers and samplers.
+
+---
+
+## 3. Large Binary Files & Model Download Instructions
+
+To keep the git repository lightweight and compatible with GitHub hosting, large binary files (raw model weights `*.bin`, compiled NPU loadables `*.model`, and ONNX graphs) are **not stored directly in git**.
+
+### 3.1 SmolLM-135M Model Data
+The SmolLM-135M runtime requires the following model files under `src/smollm/models/`:
+- `smollm_135m.bin` (514 MB): Raw FP32 weights for all 30 transformer layers.
+- `tokenizer.bin` (517 KB): Clean UTF-8 BPE token vocabulary.
+- `smollm_lm_head_d0_npu_b1.model` (28 MB): Die 0 NPU offline loadable (tokens 0..24575).
+- `smollm_lm_head_d1_npu_b1.model` (28 MB): Die 1 NPU offline loadable (tokens 24576..49151).
+
+#### How to Obtain / Generate Model Files:
+1. **Download Upstream Model**:
+   Download the original SmolLM-135M model from Hugging Face:
+   - Base weights: [HuggingFaceTB/SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M)
+   - Or ONNX model: [HuggingFaceTB/SmolLM-135M ONNX](https://huggingface.co/HuggingFaceTB/SmolLM-135M)
+2. **Export Binary Weights**:
+   Place the ONNX model (e.g. `SmolLM-135M.onnx`) in your working directory and run:
+   ```bash
+   cd src/smollm
+   python3 export_smollm.py
+   ```
+   This automatically generates `models/smollm_135m.bin` and `models/tokenizer.bin`.
+3. **Compile Dual-Die LM Head NPU Models**:
+   Compile the partitioned LM Head ONNX slices for Die 0 and Die 1 using `EsAAC`:
+   ```bash
+   # In your ESWIN compilation environment (or container):
+   EsAAC --model=smollm_lm_head_d0.onnx --gen-fp16-model=yes --target-device=EIC7700X
+   EsAAC --model=smollm_lm_head_d1.onnx --gen-fp16-model=yes --target-device=EIC7700X
+   ```
+   Place the resulting `.model` files into `src/smollm/models/`.
+
+> [!NOTE]
+> **Local Workspace Note (`deep` + `romanaccio`)**:
+> If working alongside the local development repository `deep`, `src/smollm/models/` contains symbolic links pointing back to `deep/models/smollm/`, allowing immediate execution without re-downloading or duplicating files.
+
+### 3.2 Qwen2-0.5B and DeepSeek-7B Models
+For testing `src/qwen2_fix/`, download the pre-quantized vendor NPU packages or place the vendor models into:
+- `/opt/eswin/data/npu/` (on the target board)
+- `~/models/Qwen2-0.5B_ENNP/` or `~/models/deepseek-r1-distill-qwen-7b_ENNP/`
+The runtime flags in `es_qwen2_demo` accept custom model paths via `--model-dir`.
+
+---
+
+## 4. Building the Projects
+
+### SmolLM-135M C++ Engine
+```bash
+cd src/smollm
+make
+./smollm_chat
+```
+
+### Qwen2 / DeepSeek Fix
+```bash
+cd src/qwen2_fix
+./build.sh
+./build/es_qwen2 --system "You are a helpful coding assistant."
+```
