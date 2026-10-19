@@ -1,0 +1,38 @@
+{
+  "name": "SmolLM-135M-Instruct-DualDie",
+  "version": "2.0.0",
+  "description": "SmolLM 135M Instruct accelerated with Open ESWIN Runtime on dual-die NPU",
+  "tensor_parallel": 2,
+  "config": {
+    "architecture": "llama",
+    "vocab_size": 49152,
+    "hidden_size": 576,
+    "intermediate_size": 1536,
+    "num_hidden_layers": 30,
+    "num_attention_heads": 9,
+    "num_key_value_heads": 3,
+    "rope_theta": 10000.0,
+    "bos_token_id": 0,
+    "eos_token_id": 0
+  },
+  "files": [
+    {
+      "name": "smollm_die0.model",
+      "role": "npu_die0",
+      "size": 56641216,
+      "sha256": ""
+    },
+    {
+      "name": "smollm_die1.model",
+      "role": "npu_die1",
+      "size": 56641216,
+      "sha256": ""
+    },
+    {
+      "name": "tokenizer.json",
+      "role": "tokenizer",
+      "size": 2104556,
+      "sha256": ""
+    }
+  ]
+}

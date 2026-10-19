@@ -21,28 +21,43 @@ romanaccio/
 └── src/
     ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
     ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
-    ├── eswin_runtime/                # Open C11/C++ NPU runtime & llama.cpp tooling (PLAN.md)
-    ├── smollm/                       # SmolLM-135M chat engine (C++17 & Python) with dual-die offload
-    └── qwen2_fix/                    # Root cause fixes for Issue #47 (DeepSeek/Qwen2) + chat REPL
+    ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
+    ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
+    ├── eswin_runtime/                # Open C11/C++ NPU runtime, CLI chat REPL & Python bindings
+    ├── smollm/                       # SmolLM-135M chat engine (v1 prototype)
+    ├── smollm_v2/                    # SmolLM-135M chat engine (v2 using Open Runtime & dual-die NPU)
+    ├── qwen2_fix/                    # Root cause fixes for Issue #47 (v1 standalone prototype)
+    └── qwen2_v2/                     # Qwen2 / DeepSeek chat engine (v2 using Open Runtime & anti-looping)
 ```
 
 ---
 
 ## 2. Components Overview
 
-### 2.1 Runtimes & Applications
-- **SmolLM-135M Chat Engine (`src/smollm/`)**:
-  A lightweight, dependency-free C++17 chat engine and Python reference runtime for [SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M). Features interactive terminal streaming, RoPE, GQA, SwiGLU FFN, KV-cache, and concurrent dual-die NPU offload for the 49K-token LM Head (~0.9 ms latency).
-- **Framework Issue #47 Fixes (`src/qwen2_fix/`)**:
-  Complete resolution for [Framework Issue #47](https://github.com/DC-DeepComputing/Framework/issues/47) (heap corruption in `repetitionPenalty`, greedy token loops, KV cache buffer overflow, multi-die deadlocks on early exit) and a redesigned chat REPL (`es_qwen2_demo.cpp`) supporting customizable system prompts and sampling controls.
+### 2.1 Open ESWIN Runtime (`src/eswin_runtime/`)
+A production-ready C11 and Python userspace runtime library (`libes_runtime.so`):
+- **Contiguous DMA Allocator**: Zero-copy MMZ physical memory manager (`/dev/es_mem`) with automatic SMMU address mapping and CPU data cache maintenance.
+- **WorkerPool NUMA Isolation**: Spawns isolated worker daemons for Die 0 (cores 0–3) and Die 1 (cores 4–7), eliminating single-process driver lock stalls (`0xa00f6046`) and kernel teardown Oops.
+- **Model Package Manifest & Downloader**: Manifest parser (`manifest.json`), zero-dependency NIST SHA-256 validator, local cache manager, and `eswin-fetch` CLI.
+- **Embedded Tokenizer & Sampler**: Ported from `llama.cpp` supporting Hugging Face Byte-Level BPE, TikToken, and ChatML with Issue #47 anti-looping protections (sliding-window repetition penalty, consecutive duplicate suppression, cyclic loop detection).
+- **TransformerSession & KV-Cache**: Circular multi-layer KV-cache and dual-die LM Head reduction engine.
+- **CLI Chat REPL & Python SDK**: Interactive streaming terminal chat CLI (`eswin-chat`) and Pythonic ctypes bindings (`eswin_runtime`).
 
-### 2.2 Re-Implementation Architecture Plans
+### 2.2 Applications (v2 Powered by Open Runtime)
+- **SmolLM-v2 Chat Engine (`src/smollm_v2/`)**:
+  Modular C++17 and Python interactive chat engine for [SmolLM-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM-135M) built on `libes_runtime.so`. Offloads the 49K-token vocabulary LM Head across both NPU dies simultaneously (~0.9 ms latency).
+- **Qwen2-v2 Chat Engine (`src/qwen2_v2/`)**:
+  Modular C++17 and Python interactive chat engine for Qwen2-0.5B, 1.5B, and DeepSeek-R1-Distill-Qwen models. Integrates native anti-looping samplers that permanently resolve [Framework Issue #47](https://github.com/DC-DeepComputing/Framework/issues/47).
+
+### 2.3 Legacy Prototype Baselines (Preserved)
+- `src/smollm/`: First-generation standalone C++17 prototype.
+- `src/qwen2_fix/`: First-generation standalone C++17 patch.
+
+### 2.4 Re-Implementation Architecture Plans
 - **Open Compiler (`src/eswin_compiler/PLAN.md`)**:
   Incremental plan for an open-source `EsAAC` alternative. Features a hybrid frontend (ONNX for vision; native `safetensors` + `config.json` for LLMs), 4D tensor IR, NVDLA hardware engine lowering, and DSP offloading.
 - **Open Simulator (`src/eswin_simulator/PLAN.md`)**:
   Incremental plan for a 64-bit cross-platform `EsSimulator` equivalent for bit-accurate numerical verification against PyTorch and ONNX golden data.
-- **Open Runtime (`src/eswin_runtime/PLAN.md`)**:
-  Incremental plan for a modern C11/C++ userspace library linkable into edge applications. Resolves multi-die driver deadlocks via a dedicated NUMA worker pool, and embeds `llama.cpp`-style tokenizers and samplers.
 
 ---
 

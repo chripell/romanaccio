@@ -1,0 +1,19 @@
+{
+  "name": "Qwen2-0.5B-Instruct-DualDie",
+  "version": "2.0.0",
+  "description": "Qwen2-0.5B / DeepSeek model package with Issue #47 anti-looping protections and dual-die NPU offload",
+  "tensor_parallel": 2,
+  "config": {
+    "architecture": "qwen2",
+    "vocab_size": 151936,
+    "hidden_size": 896,
+    "intermediate_size": 4864,
+    "num_hidden_layers": 24,
+    "num_attention_heads": 14,
+    "num_key_value_heads": 2,
+    "rope_theta": 1000000.0,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645
+  },
+  "files": []
+}

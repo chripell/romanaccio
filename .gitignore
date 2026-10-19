@@ -18,8 +18,10 @@ bin/
 *.so.*
 *.dylib
 *.a
-smollm_chat
-es_qwen2
+/src/smollm/smollm_chat
+/src/smollm_v2/smollm_v2
+/src/qwen2_fix/es_qwen2
+/src/qwen2_v2/qwen2_v2
 
 # Python artifacts and caches
 __pycache__/
