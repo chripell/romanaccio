@@ -311,8 +311,19 @@ class NVDLAConvBuilder:
         kmd_dep_data = bytearray(8704)
         struct.pack_into("<hh", kmd_dep_data, 8, -1, 1)
 
-        # kmd-task-lut_list (688 bytes zeros)
-        kmd_lut_data = bytes(688)
+        # kmd-task-lut_list (688 bytes: zeros or piecewise LUT)
+        act = conv_node.attributes.get("activation")
+        if act == "silu":
+            from .lut_generator import ActivationType, generate_sdp_lut
+            kmd_lut_data = generate_sdp_lut(ActivationType.SILU)
+        elif act == "sigmoid":
+            from .lut_generator import ActivationType, generate_sdp_lut
+            kmd_lut_data = generate_sdp_lut(ActivationType.SIGMOID)
+        elif act == "tanh":
+            from .lut_generator import ActivationType, generate_sdp_lut
+            kmd_lut_data = generate_sdp_lut(ActivationType.TANH)
+        else:
+            kmd_lut_data = bytes(688)
 
         # kmd-task-op_list (7936 bytes)
         kmd_op_data = bytearray(7936)
@@ -468,7 +479,22 @@ def compile_eir_to_model(graph: EIRGraph, output_path: Optional[Union[str, Path]
     pass_gemm = GemmToConv1x1Pass()
     pass_gemm.run(graph)
 
-    # 2. Find primary Conv node
+    # 2. Fuse Bias and SDP Activations (ReLU, Sigmoid, SiLU, Clip)
+    try:
+        from ..passes.fusion_sdp import SDPFusionPass
+        from ..passes.sram_tiler import SRAMTilerPass
+    except (ImportError, ValueError):
+        from passes.fusion_sdp import SDPFusionPass
+        from passes.sram_tiler import SRAMTilerPass
+
+    pass_sdp = SDPFusionPass()
+    pass_sdp.run(graph)
+
+    # 3. Plan SPRAM (4MB) residency
+    pass_sram = SRAMTilerPass()
+    pass_sram.run(graph)
+
+    # 4. Find primary Conv node
     conv_nodes = [n for n in graph.nodes if n.op_type == OpType.CONV]
     if not conv_nodes:
         raise ValueError("Graph contains no CONV nodes for NPU compilation.")
@@ -480,3 +506,4 @@ def compile_eir_to_model(graph: EIRGraph, output_path: Optional[Union[str, Path]
         ModelWriter.write_file(model, output_path)
 
     return model
+

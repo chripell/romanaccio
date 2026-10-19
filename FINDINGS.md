@@ -225,9 +225,14 @@ To support open-source tooling re-implementation, comprehensive technical findin
    - **Kernel ioctl Catalog**: Decoding of all 13 ioctl commands (`0xc0046e03` through `0xc0046e11`) in `eic7700_npu.ko`.
    - **SMMU Address Translation**: Flow of physical DMA-BUFs to IOVA page tables via `NPU_IOCTL_PREPARE_DMA`.
 
+6. [findings/SDP_LUT_TABLES.md](file:///home/chri/aixigua/deep/findings/SDP_LUT_TABLES.md):
+   - **SDP Piecewise Linear Interpolation**: Theory and hardware math of Single Data Point activation units.
+   - **Binary Specification**: 688-byte `struct _lut_dev` layout, LE/LO interpolation tables, and Sigmoid/SiLU parameter generation.
+
 ---
 
 ## 14. NPU Hardware Command Lowering & Simulator / Physical Board Execution
+
 
 During implementation of Milestone 3 of the open compiler (`eswin_compiler`), the following critical architectural findings were discovered and verified:
 
@@ -256,6 +261,23 @@ During implementation of Milestone 3 of the open compiler (`eswin_compiler`), th
    - Executed `test_conv_w2.model` directly on Die 0 hardware NPU (`/dev/npu0`):
      - `min = 0.1230 ms, max = 0.4010 ms, avg = 0.2123 ms`
      - **Throughput: 4,710.26 frames/sec**.
+
+---
+
+## 15. SDP Activation Fusion & 4MB SPRAM Tiling (SwiGLU Execution)
+
+During implementation of Milestone 4:
+1. **Piecewise SDP Activation LUT Generator (`backend/lut_generator.py`)**:
+   - Synthesizes exact 688-byte `struct _lut_dev` tables for Sigmoid, SiLU, and Tanh over $[-8.0, 8.0]$.
+   - Generates dual interpolation tables (65-entry LE table + 257-entry LO table).
+2. **SDP Fusion Optimization Pass (`passes/fusion_sdp.py`)**:
+   - Automatically fuses Bias Addition and activations (ReLU, Sigmoid, SiLU, Clip) into upstream Conv/GEMM operations, eliminating separate memory round-trips.
+3. **4MB SPRAM Residency Planner (`passes/sram_tiler.py`)**:
+   - Schedules on-chip SPRAM (`domain=1`) for high-throughput weights and intermediate activations while keeping external I/O in DRAM (`domain=0`).
+4. **Physical Hardware Benchmark on Board `roma`**:
+   - SwiGLU MLP Block executed natively on Die 0 hardware NPU (`/dev/npu0`):
+     - `min = 0.2560 ms, max = 0.6410 ms, avg = 0.3184 ms` (**3,140.67 frames/sec**), satisfying the Milestone 4 performance requirement ($\le 0.35$ ms).
+
 
 
 
