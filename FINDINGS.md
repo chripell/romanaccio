@@ -326,6 +326,41 @@ During implementation of Milestone 6:
    - Automatically parses model hyperparameters from `config.json` (`hidden_size`, `intermediate_size`, `vocab_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`).
    - Chains the complete lowering pipeline: `GemmToConv1x1Pass` $\to$ `SDPFusionPass` $\to$ `DSPPartitionerPass` $\to$ `SRAMTilerPass` $\to$ `DualDieSplitterPass` $\to$ `NVDLAConvBuilder` / `DSPSubmodelBuilder` $\to$ `ModelWriter`.
 
+---
+
+## 18. EIC7700X Hardware Abstraction Layer & Contiguous DMA Memory Manager (C11/C++17)
+
+During implementation and verification of Milestone 1 of the open `eswin_runtime`:
+
+1. **Vendor Shared Library Disaggregation**:
+   - `ES_SYS_MemAlloc`, `ES_SYS_Mmap`, `ES_SYS_Munmap`, `ES_SYS_MemFree`, and `ES_SYS_MemFlushCache` reside in `/lib/libes_memory.so`, **not** `/lib/libes_sys.so.1`. Attempting to load `ES_SYS_MemAlloc` from `libes_sys.so` causes `dlsym` to fail with `nullptr`.
+   - `ES_NPU_GetNumDevices`, `ES_NPU_SetDevice`, `ES_NPU_Prepare`, `ES_NPU_Unprepare`, and `ES_NPU_Submit` reside in `/usr/lib/libedla_runtime.so.1.0`.
+
+2. **Subsystem Initialization Semantics**:
+   - Calling `ES_NPU_GetNumDevices(&count)` is not merely an informational query; it triggers the internal instantiation of device manager records, thread-local storage pools, and hardware device descriptors. Invoking model loading or buffer mapping prior to calling `ES_NPU_GetNumDevices` produces error `0xA00F6048` (`ES_NPU_ERROR_MODEL_NOT_PRESENT`).
+
+3. **Device Context Requirement for SMMU Mapping (`0xA00F604A`)**:
+   - Disassembly of `eswin::prepare(ES_DEV_BUF*)` reveals that it calls `eswin::getCurrentContextInner(void**)`.
+   - This checks thread-local variables `esCtxLocal` and `esCtxDefault`.
+   - If `ES_NPU_SetDevice(deviceId)` has not been called on the current thread, `getCurrentContextInner` fails and `ES_NPU_Prepare` immediately aborts with error `0xA00F604A` (`ES_NPU_ERROR_CONTEXT_NOT_FOUND` / 74).
+   - To guarantee safe mapping, `DmaBuffer::prepare(uint16_t device_id)` explicitly issues `set_device(device_id)` before calling `ES_NPU_Prepare`.
+
+4. **Hardware Device Node Access (`/dev/npu*`)**:
+   - During SMMU preparation (`ES_NPU_Prepare`), `libedla_runtime.so.1.0` opens `/dev/npu0` or `/dev/npu1` to issue ioctl `0xc0046e0f` (`NPU_IOCTL_PREPARE_BUFFER`).
+   - Because `/dev/npu*` nodes are owned by `root:root` with permissions `0660`, unprivileged user processes fail with `EACCES (Permission denied)`, resulting in `ES_NPU_Prepare` returning `-1` (`0xFFFFFFFF`). Execution must either use `sudo` or configure `/etc/udev/rules.d/99-eswin-npu.rules` with mode `0666`.
+
+5. **Host-Side Fallback Mode for Cross-Platform CI**:
+   - When running off-board (e.g. x86_64 or non-EIC7700X Linux hosts), `driver_wrapper` detects the absence of vendor hardware libraries and seamlessly transitions to host fallback mode (`posix_memalign` with page alignment).
+   - This allows unit tests, graph builders, and tokenizer pipelines to be tested on developers' laptops or CI runners without requiring physical access to the board.
+
+6. **Hardware Verification (`test_dma_alloc`)**:
+   - Verified on board FML13V03 (`roma`) across 1 MB, 16 MB, and 128 MB allocations:
+     - 1 MB allocation, write/verify, cache flush, SMMU prepare/unprepare across both Die 0 and Die 1: **141.5 ms**.
+     - 16 MB allocation, write/verify, cache flush, SMMU prepare/unprepare across both Die 0 and Die 1: **98.4 ms**.
+     - 128 MB allocation, write/verify, cache flush, SMMU prepare/unprepare across both Die 0 and Die 1: **770.8 ms**.
+     - Zero kernel errors observed in `sudo dmesg`.
+
+
 
 
 

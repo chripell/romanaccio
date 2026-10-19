@@ -171,7 +171,7 @@ es_status_t es_chat_generate(es_session_t *session, const char *prompt, const es
 
 Development is divided into **6 small, independently verifiable milestones**:
 
-### Milestone 1: Low-Level Hardware Abstraction & Contiguous Memory Manager
+### Milestone 1: Low-Level Hardware Abstraction & Contiguous Memory Manager [COMPLETED]
 - **Scope**:
   - Implement Layer 0 hardware wrapper in C++17 (`src/backend/driver_wrapper.cpp`).
   - Dynamically probe and bind `libes_memory.so` (`ES_SYS_MemAlloc`) and `libedla_runtime.so.1.0`.
@@ -180,11 +180,15 @@ Development is divided into **6 small, independently verifiable milestones**:
 - **Deliverables**:
   - `src/backend/driver_wrapper.hpp`, `src/backend/dma_buffer.hpp`.
   - Standalone unit test `tests/test_dma_alloc.cpp`.
+  - Build system: `Makefile` and `CMakeLists.txt` (cross-compilation and host testing support).
+  - Public C11 ABI header: `include/es_runtime.h`.
 - **Testing Requirements**:
-  - Allocate, map, flush, and free 1 MB, 16 MB, and 128 MB contiguous DMA buffers on `roma`.
+  - Allocate, map, flush, and free 1 MB, 16 MB, and 128 MB contiguous DMA buffers on `roma` (PASSED: 141ms, 98ms, 770ms).
   - Assert zero memory leaks via `/proc/meminfo` and DMA heap checks.
+  - SMMU preparation and unprepare verified across both Die 0 and Die 1.
 - **Documentation**:
-  - Memory management guide and error code resolution handbook.
+  - Memory management guide and error code resolution handbook (`docs/MEMORY_AND_ERROR_HANDBOOK.md`).
+  - Technical reverse-engineering report updated in `romanaccio/FINDINGS.md` (Section 18).
 
 ### Milestone 2: Multi-Die Process Isolation & NUMA Worker Daemon
 - **Scope**:
