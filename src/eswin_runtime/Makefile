@@ -17,6 +17,8 @@ SRCS           = $(SRC_DIR)/backend/driver_wrapper.cpp \
                  $(SRC_DIR)/model/sha256.cpp \
                  $(SRC_DIR)/model/model_manifest.cpp \
                  $(SRC_DIR)/model/downloader.cpp \
+                 $(SRC_DIR)/nlp/sampler.cpp \
+                 $(SRC_DIR)/nlp/tokenizer.cpp \
                  $(SRC_DIR)/api/es_runtime.cpp
 
 OBJS           = $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(SRCS))
@@ -24,11 +26,12 @@ TARGET_LIB     = $(BUILD_DIR)/libes_runtime.so
 TEST_DMA       = $(BUILD_DIR)/test_dma_alloc
 TEST_CONCUR    = $(BUILD_DIR)/test_dual_die_concurrency
 TEST_MANIFEST  = $(BUILD_DIR)/test_manifest
+TEST_NLP       = $(BUILD_DIR)/test_tokenizer_sampler
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TOOL_FETCH)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TOOL_FETCH)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -59,13 +62,20 @@ $(TOOL_FETCH): tools/eswin_fetch.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST)
+$(TEST_NLP): $(TEST_DIR)/test_tokenizer_sampler.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_CONCUR) 20
 	@echo "\nRunning Milestone 3 Model Package Manifest test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_MANIFEST)
+	@echo "\nRunning Milestone 4 Tokenizer & Sampler test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_NLP)
 
 clean:
 	rm -rf $(BUILD_DIR)

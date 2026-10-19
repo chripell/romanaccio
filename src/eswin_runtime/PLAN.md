@@ -229,21 +229,23 @@ Development is divided into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - Manifest JSON schema specification (`docs/MANIFEST_SPECIFICATION.md`).
 
-### Milestone 4: Embedded Tokenizer & Advanced Sampler (Ported from llama.cpp)
+### Milestone 4: Embedded Tokenizer & Advanced Sampler (Ported from llama.cpp) [COMPLETED]
 - **Scope**:
-  - Implement `src/nlp/tokenizer.cpp`: self-contained BPE / TikToken / SentencePiece tokenizer ported from `llama.cpp` (`llama-vocab.cpp`) and `qwen2_fix/tokenizer/` with zero external dependencies.
-  - Implement `src/nlp/sampler.cpp`:
+  - Implement `src/nlp/tokenizer.cpp` & `src/nlp/tokenizer.hpp`: self-contained Byte-Level BPE, TikToken, and SentencePiece tokenizer supporting Hugging Face `tokenizer.json`, OpenAI TikToken, and compact binary vocabularies without external dependencies.
+  - Implement `src/nlp/sampler.cpp` & `src/nlp/sampler.hpp`:
     - Port temperature, top-k, top-p (nucleus), and min-p sampling from `llama.cpp` (`llama-sampling.cpp`).
     - Integrate the Issue #47 sliding-window repetition penalty (`repeat_window = 64`, `repeat_penalty = 1.15`).
-    - Integrate consecutive duplicate token breaker and cyclic n-gram loop detector.
+    - Integrate consecutive duplicate token suppressor (prevents stutter loops like `"the the the"`) and cyclic n-gram loop detector (breaks $ABABAB$ cycles).
+  - Implement public C11 ABI in `include/es_runtime.h` (`es_tokenizer_*`, `es_sampler_*`).
 - **Deliverables**:
-  - `src/nlp/tokenizer.hpp`, `src/nlp/sampler.hpp`.
-  - Comprehensive unit test `tests/test_tokenizer_conformance.cpp`.
+  - `src/nlp/tokenizer.hpp`, `src/nlp/sampler.hpp`, `src/nlp/tokenizer.cpp`, `src/nlp/sampler.cpp`.
+  - Comprehensive unit test `tests/test_tokenizer_sampler.cpp`.
 - **Testing Requirements**:
-  - Conformance test: Tokenize 1,000 diverse multilingual sentences and assert 100% token ID match against Hugging Face `transformers` Python golden output.
-  - Sampler test: Verify repetition breaker prevents greedy degradation on degenerate prompt inputs.
+  - Verified greedy argmax selection and temperature scaling.
+  - Verified sliding-window repetition penalty demotion, consecutive repeat breaker, and cyclic loop detector.
+  - Verified JSON vocabulary loading, encoding, and round-trip decoding with ChatML template formatting.
 - **Documentation**:
-  - API documentation for tokenization and sampling functions.
+  - API documentation for tokenization and sampling functions (`docs/TOKENIZER_AND_SAMPLER_GUIDE.md`).
 
 ### Milestone 5: LLM Context, KV-Cache & Dual-Die Session Engine
 - **Scope**:

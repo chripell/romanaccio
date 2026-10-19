@@ -225,6 +225,32 @@ es_status_t es_worker_pool_submit_task(
     uint64_t *elapsed_ns
 );
 
+// =============================================================================
+// NLP Tokenizer & Sampler APIs (Milestone 4)
+// =============================================================================
+
+typedef struct {
+    float    temperature;
+    int32_t  top_k;
+    float    top_p;
+    float    min_p;
+    float    repeat_penalty;
+    int32_t  repeat_window;
+    int32_t  max_consecutive_duplicates;
+    uint32_t seed;
+} es_sampler_params_t;
+
+es_status_t es_tokenizer_load(const char *filepath, es_tokenizer_t **out_tokenizer);
+void es_tokenizer_free(es_tokenizer_t *tokenizer);
+int32_t es_tokenizer_encode(const es_tokenizer_t *tokenizer, const char *text, int32_t *out_tokens, size_t max_tokens);
+int32_t es_tokenizer_decode(const es_tokenizer_t *tokenizer, const int32_t *tokens, size_t num_tokens, char *out_text, size_t max_len);
+
+es_status_t es_sampler_create(const es_sampler_params_t *params, es_sampler_t **out_sampler);
+void es_sampler_free(es_sampler_t *sampler);
+int32_t es_sampler_sample(es_sampler_t *sampler, float *logits, size_t vocab_size);
+void es_sampler_accept(es_sampler_t *sampler, int32_t token_id);
+void es_sampler_reset(es_sampler_t *sampler);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,6 +15,8 @@ set(RUNTIME_SOURCES
     src/model/sha256.cpp
     src/model/model_manifest.cpp
     src/model/downloader.cpp
+    src/nlp/sampler.cpp
+    src/nlp/tokenizer.cpp
     src/api/es_runtime.cpp
 )
 
@@ -41,7 +43,12 @@ target_link_libraries(test_manifest PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 add_executable(eswin-fetch tools/eswin_fetch.cpp)
 target_link_libraries(eswin-fetch PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 4 Tokenizer & Sampler Test Executable
+add_executable(test_tokenizer_sampler tests/test_tokenizer_sampler.cpp)
+target_link_libraries(test_tokenizer_sampler PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 enable_testing()
 add_test(NAME test_dma_alloc COMMAND test_dma_alloc)
 add_test(NAME test_dual_die_concurrency COMMAND test_dual_die_concurrency 20)
 add_test(NAME test_manifest COMMAND test_manifest)
+add_test(NAME test_tokenizer_sampler COMMAND test_tokenizer_sampler)

@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <new>
+#include <cstring>
 
 // =============================================================================
 // Internal Context & Handle Implementations
@@ -200,4 +201,100 @@ es_status_t es_worker_pool_submit_task(
 
     return pool->pool->submit_task(die_id, model_id, inputs, outputs, elapsed_ns)
         ? ES_SUCCESS : ES_ERR_HARDWARE_FAULT;
+}
+
+// =============================================================================
+// NLP Tokenizer & Sampler Implementations
+// =============================================================================
+
+#include "../nlp/tokenizer.hpp"
+#include "../nlp/sampler.hpp"
+
+struct es_tokenizer_t {
+    std::unique_ptr<eswin::Tokenizer> tokenizer;
+};
+
+struct es_sampler_t {
+    std::unique_ptr<eswin::Sampler> sampler;
+};
+
+es_status_t es_tokenizer_load(const char *filepath, es_tokenizer_t **out_tokenizer) {
+    if (!filepath || !out_tokenizer) return ES_ERR_INVALID_ARG;
+    auto tok = std::make_unique<eswin::Tokenizer>();
+    std::string err;
+    if (!tok->load(filepath, err)) {
+        return ES_ERR_HARDWARE_FAULT;
+    }
+    auto handle = new es_tokenizer_t();
+    handle->tokenizer = std::move(tok);
+    *out_tokenizer = handle;
+    return ES_SUCCESS;
+}
+
+void es_tokenizer_free(es_tokenizer_t *tokenizer) {
+    if (tokenizer) {
+        delete tokenizer;
+    }
+}
+
+int32_t es_tokenizer_encode(const es_tokenizer_t *tokenizer, const char *text, int32_t *out_tokens, size_t max_tokens) {
+    if (!tokenizer || !tokenizer->tokenizer || !text || !out_tokens || max_tokens == 0) return -1;
+    auto tokens = tokenizer->tokenizer->encode(text);
+    size_t count = std::min(max_tokens, tokens.size());
+    for (size_t i = 0; i < count; ++i) {
+        out_tokens[i] = tokens[i];
+    }
+    return static_cast<int32_t>(count);
+}
+
+int32_t es_tokenizer_decode(const es_tokenizer_t *tokenizer, const int32_t *tokens, size_t num_tokens, char *out_text, size_t max_len) {
+    if (!tokenizer || !tokenizer->tokenizer || !tokens || !out_text || max_len == 0) return -1;
+    std::vector<int32_t> tok_vec(tokens, tokens + num_tokens);
+    std::string text = tokenizer->tokenizer->decode(tok_vec);
+    size_t copy_len = std::min(max_len - 1, text.size());
+    std::memcpy(out_text, text.data(), copy_len);
+    out_text[copy_len] = '\0';
+    return static_cast<int32_t>(copy_len);
+}
+
+es_status_t es_sampler_create(const es_sampler_params_t *params, es_sampler_t **out_sampler) {
+    if (!out_sampler) return ES_ERR_INVALID_ARG;
+    eswin::SamplerParams p;
+    if (params) {
+        p.temperature = params->temperature;
+        p.top_k = params->top_k;
+        p.top_p = params->top_p;
+        p.min_p = params->min_p;
+        p.repeat_penalty = params->repeat_penalty;
+        p.repeat_window = params->repeat_window;
+        p.max_consecutive_duplicates = params->max_consecutive_duplicates;
+        p.seed = params->seed;
+    }
+    auto handle = new es_sampler_t();
+    handle->sampler = std::make_unique<eswin::Sampler>(p);
+    *out_sampler = handle;
+    return ES_SUCCESS;
+}
+
+void es_sampler_free(es_sampler_t *sampler) {
+    if (sampler) {
+        delete sampler;
+    }
+}
+
+int32_t es_sampler_sample(es_sampler_t *sampler, float *logits, size_t vocab_size) {
+    if (!sampler || !sampler->sampler || !logits || vocab_size == 0) return -1;
+    return sampler->sampler->sample(logits, vocab_size);
+}
+
+void es_sampler_accept(es_sampler_t *sampler, int32_t token_id) {
+    if (sampler && sampler->sampler) {
+        sampler->sampler->accept(token_id);
+    }
+}
+
+void es_sampler_reset(es_sampler_t *sampler) {
+    if (sampler && sampler->sampler) {
+        sampler->sampler->reset();
+    }
 }
