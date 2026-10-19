@@ -34,24 +34,28 @@ The ENNP (ESWIN Neural Network Processing) toolchain consists of:
 
 ---
 
-## 3. Reverse Engineering the `.model` File Format
+## 3. Reverse Engineering the `.model` File Format & Open Emitter
 
 - **Container Format**: Extended NVIDIA NVDLA FlatBuffers loadable format (file identifier `NVDA` at byte offset 4).
-- **Core Interfaces (demangled from `libedla_runtime.so.1.0`)**:
-  - `eswin::priv::Loadable` implements the standard NVDLA `ILoadable` abstraction:
-    - Memory list (`getNumMemoryListEntries`)
-    - Event list (`getNumEventListEntries`, sync points)
-    - SubModel / Submit list (`getNumSubModelListEntries`, `KmdSubModel`, `UmdSubModel`)
-    - Address list (`getNumAddressListEntries`)
-    - Tensor descriptors (`getNumTensorDescListEntries`, `getInputTensorDesc`, `getOutputTensorDesc`)
-    - Relocation entries (`getNumRelocEntries`)
-- **Tensor Descriptors in FlatBuffer**:
-  - Name string (e.g., `input`, `output`, `conv1_cvtPrecision`)
-  - Dimensions: `[N, C, H, W]`
-  - Data Type: enum matching `es_npu_types.h` (`ES_NPU_DATA_TYPE_HALF = 2`)
-  - Buffer Size: aligned byte count (`1 * 3 * 32 * 32 * 2 = 6144` bytes for FP16 input)
-- **Sub-models**:
-  - Contains UMD (User Mode Driver) task operations (e.g. `umd-task-surf_list`, `umd-task-op_list`, `umd-task-dep_graph`) and KMD (Kernel Mode Driver) hardware register programs.
+- **Exact DWARF Extraction (`EsSimulator`)**:
+  - Namespace: `eswin.loadable`
+  - Version: Struct `Version { major: ubyte, minor: ubyte, sub_minor: ubyte }` (standard vendor version `0.7.0`).
+  - Root Table: `Loadable` with exactly 9 fields:
+    1. `version: Version` (struct)
+    2. `task_list: [SubModelListEntry]` (submodel execution partitions)
+    3. `memory_list: [MemoryListEntry]` (memory allocations, sizes, flags, alignments)
+    4. `address_list: [AddressListEntry]` (symbolic address mappings to memory buffers)
+    5. `event_list: [EventListEntry]` (synchronization primitives: wait/signal)
+    6. `blobs: [Blob]` (weight tensors, register command lists, surface lists, LUT tables)
+    7. `tensor_desc_list: [TensorDescListEntry]` (network I/O tensor metadata: shapes, formats, strides)
+    8. `reloc_list: [RelocListEntry]` (physical IOVA address relocation table for DMA patching)
+    9. `submit_list: [SubmitListEntry]` (hardware execution submission queues)
+- **Open-Source Schema & Emitter**:
+  - Schema definition: `src/eswin_compiler/schema/loadable.fbs`
+  - Python bindings generated with `flatc` 2.0.0 in `src/eswin_compiler/schema/generated/`
+  - High-level reader & writer: `src/eswin_compiler/backend/flatbuffer_emitter.py` (`ModelReader`, `ModelWriter`, `LoadableModel`)
+  - Full round-trip parity verified against vendor models in `src/eswin_compiler/tests/test_schema_roundtrip.py`
+  - Full specification documented in [findings/MODEL_FORMAT.md](findings/MODEL_FORMAT.md).
 
 ---
 
