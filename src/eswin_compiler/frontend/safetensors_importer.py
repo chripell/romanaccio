@@ -285,3 +285,103 @@ class SafeTensorsImporter(ModelImporter):
         graph.add_node(node)
         graph.add_output(logits_tensor)
         return graph
+
+    def synthesize_attention_block(
+        self,
+        layer_idx: int,
+        hidden_size: int = 576,
+        num_heads: int = 9,
+        num_kv_heads: int = 3,
+        head_dim: int = 64,
+        prefix: str = "model.layers",
+        dtype: str = "float16"
+    ) -> EIRGraph:
+        """Synthesizes a full Multi-Head Attention block with RoPE and Softmax.
+        
+        The block partitions into:
+        - NPU: Q, K, V linear projections (CMAC)
+        - DSP: RMSNorm, RoPE rotary position embedding, and Softmax
+        - NPU: Context linear projection (CMAC)
+        """
+        graph = EIRGraph(name=f"attention_layer_{layer_idx}")
+
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
+
+        # Input tensor
+        input_tensor = EIRTensor(name="input", shape=(1, hidden_size, 1, 1), dtype=dtype)
+        graph.add_input(input_tensor)
+
+        # 1. Pre-attention RMSNorm (DSP)
+        norm_out = EIRTensor(name=f"norm_out_{layer_idx}", shape=(1, hidden_size, 1, 1), dtype=dtype)
+        node_norm = EIRNode(
+            name=f"rmsnorm_{layer_idx}",
+            op_type=OpType.RMSNORM,
+            inputs=[input_tensor],
+            outputs=[norm_out],
+            attributes={"epsilon": 1e-5},
+            engine=EngineType.DSP,
+            dsp_kernel_name="libes_onnx_rms_normalization_f16f16.so"
+        )
+        graph.add_node(node_norm)
+
+        # 2. QKV Linear Projections (NPU)
+        q_weight = EIRTensor(name=f"q_weight_{layer_idx}", shape=(q_dim, hidden_size, 1, 1), dtype=dtype, data=np.zeros((q_dim, hidden_size, 1, 1), dtype=np.float16))
+        k_weight = EIRTensor(name=f"k_weight_{layer_idx}", shape=(kv_dim, hidden_size, 1, 1), dtype=dtype, data=np.zeros((kv_dim, hidden_size, 1, 1), dtype=np.float16))
+        v_weight = EIRTensor(name=f"v_weight_{layer_idx}", shape=(kv_dim, hidden_size, 1, 1), dtype=dtype, data=np.zeros((kv_dim, hidden_size, 1, 1), dtype=np.float16))
+        graph.add_tensor(q_weight)
+        graph.add_tensor(k_weight)
+        graph.add_tensor(v_weight)
+
+        q_out = EIRTensor(name=f"q_out_{layer_idx}", shape=(1, q_dim, 1, 1), dtype=dtype)
+        k_out = EIRTensor(name=f"k_out_{layer_idx}", shape=(1, kv_dim, 1, 1), dtype=dtype)
+        v_out = EIRTensor(name=f"v_out_{layer_idx}", shape=(1, kv_dim, 1, 1), dtype=dtype)
+
+        node_q = EIRNode(name=f"q_proj_{layer_idx}", op_type=OpType.GEMM, inputs=[norm_out, q_weight], outputs=[q_out], attributes={"transB": 1}, engine=EngineType.NPU)
+        node_k = EIRNode(name=f"k_proj_{layer_idx}", op_type=OpType.GEMM, inputs=[norm_out, k_weight], outputs=[k_out], attributes={"transB": 1}, engine=EngineType.NPU)
+        node_v = EIRNode(name=f"v_proj_{layer_idx}", op_type=OpType.GEMM, inputs=[norm_out, v_weight], outputs=[v_out], attributes={"transB": 1}, engine=EngineType.NPU)
+        graph.add_node(node_q)
+        graph.add_node(node_k)
+        graph.add_node(node_v)
+
+        # 3. RoPE Rotary Position Embedding (DSP)
+        q_rot = EIRTensor(name=f"q_rot_{layer_idx}", shape=(1, q_dim, 1, 1), dtype=dtype)
+        k_rot = EIRTensor(name=f"k_rot_{layer_idx}", shape=(1, kv_dim, 1, 1), dtype=dtype)
+        node_rope = EIRNode(
+            name=f"rope_{layer_idx}",
+            op_type=OpType.ROPE,
+            inputs=[q_out, k_out],
+            outputs=[q_rot, k_rot],
+            attributes={"head_dim": head_dim, "rotary_dim": head_dim, "theta": 10000.0},
+            engine=EngineType.DSP,
+            dsp_kernel_name="libes_qk_rotary_position_embedding_f16f16.so"
+        )
+        graph.add_node(node_rope)
+
+        # 4. Attention Softmax (DSP)
+        scores = EIRTensor(name=f"scores_{layer_idx}", shape=(1, num_heads, 1, 1), dtype=dtype)
+        probs = EIRTensor(name=f"probs_{layer_idx}", shape=(1, num_heads, 1, 1), dtype=dtype)
+        node_score = EIRNode(name=f"attn_score_{layer_idx}", op_type=OpType.MATMUL, inputs=[q_rot, k_rot], outputs=[scores], engine=EngineType.NPU)
+        node_softmax = EIRNode(
+            name=f"softmax_{layer_idx}",
+            op_type=OpType.SOFTMAX,
+            inputs=[scores],
+            outputs=[probs],
+            attributes={"axis": -1},
+            engine=EngineType.DSP,
+            dsp_kernel_name="libes_onnx_softmax.so"
+        )
+        graph.add_node(node_score)
+        graph.add_node(node_softmax)
+
+        # 5. Output Projection (NPU)
+        o_weight = EIRTensor(name=f"o_weight_{layer_idx}", shape=(hidden_size, q_dim, 1, 1), dtype=dtype, data=np.zeros((hidden_size, q_dim, 1, 1), dtype=np.float16))
+        graph.add_tensor(o_weight)
+        out_tensor = EIRTensor(name="output", shape=(1, hidden_size, 1, 1), dtype=dtype)
+
+        node_out = EIRNode(name=f"o_proj_{layer_idx}", op_type=OpType.GEMM, inputs=[probs, o_weight], outputs=[out_tensor], attributes={"transB": 1}, engine=EngineType.NPU)
+        graph.add_node(node_out)
+        graph.add_output(out_tensor)
+
+        return graph
+

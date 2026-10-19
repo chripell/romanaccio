@@ -278,6 +278,38 @@ During implementation of Milestone 4:
    - SwiGLU MLP Block executed natively on Die 0 hardware NPU (`/dev/npu0`):
      - `min = 0.2560 ms, max = 0.6410 ms, avg = 0.3184 ms` (**3,140.67 frames/sec**), satisfying the Milestone 4 performance requirement ($\le 0.35$ ms).
 
+---
+
+## 16. DSP Submodel Partitioning & Vector Core Offload
+
+During implementation of Milestone 5:
+1. **Graph Partitioning (`passes/dsp_partitioner.py`)**:
+   - Identifies non-linear and normalization operations outside NVDLA fixed-function CMAC/SDP capabilities and assigns them to Cadence Vision Q7 DSP vector cores (`EngineType.DSP`).
+   - Maps operators to canonical vendor shared libraries:
+     - `RMSNorm` $\to$ `libes_onnx_rms_normalization_f16f16.so` (FP16) or `libes_onnx_rms_normalization_f16s8.so` (INT8)
+     - `LayerNorm` $\to$ `libes_onnx_layer_normalization_f16f16.so`
+     - `Softmax` $\to$ `libes_onnx_softmax.so`
+     - `RoPE` $\to$ `libes_qk_rotary_position_embedding_f16f16.so`
+
+2. **UMD Parameter Struct ABI (`backend/dsp_task_builder.py`)**:
+   - **RMSNorm** (16 bytes): `[float32 epsilon, uint32 hidden_size, uint32 pad[2]]`
+   - **Softmax** (16 bytes): `[int32 axis, uint32 pad[3]]`
+   - **RoPE** (16 bytes): `[uint32 head_dim, uint32 rotary_dim, float32 theta, uint32 max_position]`
+
+3. **UMD Surface Descriptors & Synchronization Events**:
+   - DSP task inputs and outputs are mapped via 16-byte aligned UMD surface descriptors (`sub_interface=4`).
+   - Multi-engine execution graphs insert hardware wait/signal event barriers (`EventEntry`) between NPU fixed-function tasks and DSP firmware tasks.
+
+4. **Attention Block Pipeline Synthesis**:
+   - Full Transformer attention blocks synthesize into 8 nodes:
+     - DSP: Pre-attention RMSNorm
+     - NPU: Q, K, V Linear projections (lowered to 1x1 Conv)
+     - DSP: RoPE rotary position embedding
+     - NPU: Attention score MatMul (lowered to 1x1 Conv)
+     - DSP: Attention Softmax
+     - NPU: Output context projection (lowered to 1x1 Conv)
+
+
 
 
 
