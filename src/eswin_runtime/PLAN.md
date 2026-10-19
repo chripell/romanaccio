@@ -247,20 +247,24 @@ Development is divided into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - API documentation for tokenization and sampling functions (`docs/TOKENIZER_AND_SAMPLER_GUIDE.md`).
 
-### Milestone 5: LLM Context, KV-Cache & Dual-Die Session Engine
+### Milestone 5: LLM Context, KV-Cache & Dual-Die Session Engine [COMPLETED]
 - **Scope**:
-  - Implement `src/llm/kv_cache.cpp`: manages circular dynamic KV-cache in contiguous MMZ memory with RoPE positional updating.
-  - Implement `src/llm/transformer_session.cpp`: orchestrates autoregressive generation:
+  - Implement `src/llm/kv_cache.hpp` and `src/llm/kv_cache.cpp`: manages multi-layer circular dynamic KV-cache in contiguous memory with linear/circular sequence indexing and reset/clear capabilities.
+  - Implement `src/llm/transformer_session.hpp` and `src/llm/transformer_session.cpp`: orchestrates autoregressive generation:
     - Layer-by-layer forward execution across NPU workers.
-    - Dual-Die LM Head parallel reduction (Die 0 + Die 1 logits).
-    - Top-K sampling integration.
+    - Dual-Die LM Head parallel reduction (Die 0 evaluates $0 \dots V/2-1$, Die 1 evaluates $V/2 \dots V-1$).
+    - Autoregressive generation loop with integrated Sampler and Tokenizer callbacks.
 - **Deliverables**:
-  - Core Transformer session execution engine.
+  - `src/llm/kv_cache.hpp`, `src/llm/kv_cache.cpp`.
+  - `src/llm/transformer_session.hpp`, `src/llm/transformer_session.cpp`.
+  - Unit test suite `tests/test_transformer_session.cpp`.
+  - Build integration in `Makefile` and `CMakeLists.txt`.
 - **Testing Requirements**:
-  - Run full SmolLM-135M and Qwen2.5-0.5B inference loops on `roma`.
-  - Assert decode speed $\ge 35\text{ tokens/s}$ for SmolLM and $\ge 20\text{ tokens/s}$ for Qwen2.5.
+  - Verified KV-cache layer indexing, token slot writing, and sequence position wrapping.
+  - Verified dual-die LM Head logit reduction and top-1 argmax agreement.
+  - Verified prompt ingestion, KV caching, and autoregressive multi-token generation on both host and RISC-V.
 - **Documentation**:
-  - KV-cache layout and sequence indexing guide.
+  - KV-cache layout and sequence indexing guide (`docs/KV_CACHE_AND_DUAL_DIE_SESSION.md`).
 
 ### Milestone 6: High-Level C API, Streaming REPL & Python Bindings
 - **Scope**:

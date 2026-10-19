@@ -17,6 +17,8 @@ set(RUNTIME_SOURCES
     src/model/downloader.cpp
     src/nlp/sampler.cpp
     src/nlp/tokenizer.cpp
+    src/llm/kv_cache.cpp
+    src/llm/transformer_session.cpp
     src/api/es_runtime.cpp
 )
 
@@ -47,8 +49,13 @@ target_link_libraries(eswin-fetch PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 add_executable(test_tokenizer_sampler tests/test_tokenizer_sampler.cpp)
 target_link_libraries(test_tokenizer_sampler PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 5 LLM Session Test Executable
+add_executable(test_transformer_session tests/test_transformer_session.cpp)
+target_link_libraries(test_transformer_session PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 enable_testing()
 add_test(NAME test_dma_alloc COMMAND test_dma_alloc)
 add_test(NAME test_dual_die_concurrency COMMAND test_dual_die_concurrency 20)
 add_test(NAME test_manifest COMMAND test_manifest)
 add_test(NAME test_tokenizer_sampler COMMAND test_tokenizer_sampler)
+add_test(NAME test_transformer_session COMMAND test_transformer_session)
