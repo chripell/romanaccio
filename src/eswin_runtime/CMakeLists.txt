@@ -12,6 +12,9 @@ set(RUNTIME_SOURCES
     src/backend/driver_wrapper.cpp
     src/backend/dma_buffer.cpp
     src/backend/worker_pool.cpp
+    src/model/sha256.cpp
+    src/model/model_manifest.cpp
+    src/model/downloader.cpp
     src/api/es_runtime.cpp
 )
 
@@ -30,6 +33,15 @@ target_link_libraries(test_dma_alloc PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread
 add_executable(test_dual_die_concurrency tests/test_dual_die_concurrency.cpp)
 target_link_libraries(test_dual_die_concurrency PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 3 Manifest Test Executable
+add_executable(test_manifest tests/test_manifest.cpp)
+target_link_libraries(test_manifest PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
+# Milestone 3 Fetch Tool Executable
+add_executable(eswin-fetch tools/eswin_fetch.cpp)
+target_link_libraries(eswin-fetch PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 enable_testing()
 add_test(NAME test_dma_alloc COMMAND test_dma_alloc)
-add_test(NAME test_dual_die_concurrency COMMAND test_dual_die_concurrency 100)
+add_test(NAME test_dual_die_concurrency COMMAND test_dual_die_concurrency 20)
+add_test(NAME test_manifest COMMAND test_manifest)

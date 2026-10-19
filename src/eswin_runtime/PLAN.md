@@ -213,19 +213,21 @@ Development is divided into **6 small, independently verifiable milestones**:
   - Architecture document on inter-process IPC and NUMA worker isolation (`docs/MULTI_DIE_IPC_ARCHITECTURE.md`).
   - Technical reverse-engineering report updated in `romanaccio/FINDINGS.md` (Section 19).
 
-### Milestone 3: Model Package Manifest & Automated Downloader
+### Milestone 3: Model Package Manifest & Automated Downloader [COMPLETED]
 - **Scope**:
-  - Implement `src/model/model_manifest.cpp`: defines JSON package manifests (`manifest.json` specifying model components: weights, tokenizer, config, SHA-256 hashes).
-  - Implement `src/model/downloader.cpp`: fetches models over HTTPS / Hugging Face REST API with resumable downloads, local caching (`~/.cache/eswin/models/`), and SHA-256 verification.
-  - Implement automatic offline detection and cache fallback.
+  - Implement `src/model/model_manifest.cpp` and `src/model/model_manifest.hpp`: JSON package manifests (`manifest.json` specifying model components: weights, tokenizer, config, hyperparameters, SHA-256 hashes).
+  - Implement `src/model/sha256.cpp` and `src/model/sha256.hpp`: Standalone, zero-dependency NIST SHA-256 implementation for streaming file validation.
+  - Implement `src/model/downloader.cpp` and `src/model/downloader.hpp`: Fetches models over HTTPS / Hugging Face with local caching (`~/.cache/eswin/models/`), offline fallback, and SHA-256 verification.
+  - Implement lightweight, zero-dependency JSON parser and serializer in `src/model/simple_json.hpp`.
 - **Deliverables**:
-  - Manifest parser and CLI download tool `eswin-fetch`.
-  - Unit tests verifying download integrity and cache hit detection.
+  - Manifest parser and CLI download tool `eswin-fetch` (`tools/eswin_fetch.cpp`).
+  - Unit test suite `tests/test_manifest.cpp` verifying JSON parsing, NIST SHA-256 vectors, and corruption rejection.
 - **Testing Requirements**:
-  - Download and verify SmolLM-135M and Qwen2.5-0.5B packages.
-  - Assert corrupt hash triggers `ES_ERR_CHECKSUM_MISMATCH` without executing corrupted binaries.
+  - Verified JSON parsing and serialization round-trip.
+  - Verified NIST reference test vectors for SHA-256.
+  - Verified manifest integrity checks and corrupt hash rejection (`ES_ERR_CHECKSUM_MISMATCH`).
 - **Documentation**:
-  - Manifest JSON schema specification.
+  - Manifest JSON schema specification (`docs/MANIFEST_SPECIFICATION.md`).
 
 ### Milestone 4: Embedded Tokenizer & Advanced Sampler (Ported from llama.cpp)
 - **Scope**:

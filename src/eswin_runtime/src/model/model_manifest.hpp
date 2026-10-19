@@ -1,0 +1,57 @@
+#ifndef ESWIN_MODEL_MANIFEST_HPP
+#define ESWIN_MODEL_MANIFEST_HPP
+
+#include <string>
+#include <vector>
+#include <cstdint>
+
+namespace eswin {
+
+struct ModelFileDesc {
+    std::string name;       // Local filename (e.g. "model_d0.model")
+    std::string role;       // "weights_die0", "weights_die1", "tokenizer", "config"
+    std::string sha256;     // SHA-256 hash for integrity verification
+    uint64_t    size_bytes = 0;
+    std::string url;        // Remote download URL (Hugging Face / ModelScope / CDN)
+};
+
+struct ModelConfig {
+    std::string architecture = "transformer";
+    uint32_t    vocab_size = 49152;
+    uint32_t    hidden_size = 576;
+    uint32_t    intermediate_size = 1536;
+    uint32_t    num_hidden_layers = 30;
+    uint32_t    num_attention_heads = 9;
+    uint32_t    num_key_value_heads = 3;
+    float       rope_theta = 10000.0f;
+    uint32_t    bos_token_id = 0;
+    uint32_t    eos_token_id = 0;
+};
+
+class ModelManifest {
+public:
+    ModelManifest() = default;
+
+    bool load_from_file(const std::string &path, std::string &err);
+    bool load_from_string(const std::string &json_str, std::string &err);
+    bool save_to_file(const std::string &path, std::string &err) const;
+    std::string to_json_string(int indent = 2) const;
+
+    // Integrity check for files inside a base directory
+    bool verify_files(const std::string &base_dir, std::string &err) const;
+
+    // Helper accessors
+    const ModelFileDesc* find_file_by_role(const std::string &role) const;
+
+    // Properties
+    std::string                name;
+    std::string                version = "1.0.0";
+    std::string                description;
+    uint16_t                   tensor_parallel = 1; // 1 = Single Die, 2 = Dual Die
+    ModelConfig                config;
+    std::vector<ModelFileDesc> files;
+};
+
+} // namespace eswin
+
+#endif // ESWIN_MODEL_MANIFEST_HPP
