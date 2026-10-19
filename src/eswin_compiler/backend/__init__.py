@@ -13,11 +13,15 @@ from .flatbuffer_emitter import (
     RelocEntry,
     SubmitEntry,
 )
+from .nvdla_builder import NVDLAConvBuilder, compile_eir_to_model
 
 __all__ = [
     "ModelReader",
     "ModelWriter",
+    "NVDLAConvBuilder",
+    "compile_eir_to_model",
     "LoadableModel",
+
     "ModelVersion",
     "SubModel",
     "MemoryEntry",

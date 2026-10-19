@@ -225,6 +225,39 @@ To support open-source tooling re-implementation, comprehensive technical findin
    - **Kernel ioctl Catalog**: Decoding of all 13 ioctl commands (`0xc0046e03` through `0xc0046e11`) in `eic7700_npu.ko`.
    - **SMMU Address Translation**: Flow of physical DMA-BUFs to IOVA page tables via `NPU_IOCTL_PREPARE_DMA`.
 
+---
+
+## 14. NPU Hardware Command Lowering & Simulator / Physical Board Execution
+
+During implementation of Milestone 3 of the open compiler (`eswin_compiler`), the following critical architectural findings were discovered and verified:
+
+1. **FlatBuffers Vector Invariant in Vendor Runtime**:
+   - In `libnn_runtime.so` / `EsSimulator` (`loadable.cpp:626`), the deserializer iterates over table vectors (such as `event_list`) via `loadable->event_list()->begin()` without checking for `nullptr`.
+   - In FlatBuffers, if an empty vector is omitted during table construction, the field offset in the vtable defaults to `0`, causing `->event_list()` to return `nullptr` and resulting in an immediate segmentation fault (SIGSEGV).
+   - **Requirement**: All 8 vectors in root table `Loadable` (`task_list`, `memory_list`, `address_list`, `event_list`, `blobs`, `tensor_desc_list`, `reloc_list`, `submit_list`) must **always** be explicitly serialized and attached to the table, even if their element count is 0.
+
+2. **NVDLA Surface Descriptors (`dla_data_cube`)**:
+   - The 64-byte hardware surface descriptor (`struct dla_data_cube`) defines:
+     - `+0: type`: memory domain (0: DRAM, 1: SRAM, 2: flying/intermediate).
+     - `+2: address`: index into `address_list`.
+     - `+4: offset`: byte offset inside the memory buffer.
+     - `+8: size`: total byte size of the tensor.
+     - `+12: batch, +14: width, +16: height, +18: channel`.
+     - `+22: line_stride, +26: surf_stride, +30: plane_stride`.
+   - In `kmd-task-surf_list`, the IOVA relocation points directly to `src_data` (+1216 + 22 = offset 1238) and `dst_data` (+2304 + 22 = offset 2326).
+
+3. **Bit-Accurate Simulator Verification (`EsSimulator`)**:
+   - Tested generated model `test_conv_w2.model` with modified weights against PyTorch golden tensor:
+     - **Cosine distance: 1.000000**
+     - **Relative difference: 0.000023**
+     - Model output comparison: **SUCCESS**.
+
+4. **Hardware Execution on Physical Board `roma`**:
+   - Executed `test_conv_w2.model` directly on Die 0 hardware NPU (`/dev/npu0`):
+     - `min = 0.1230 ms, max = 0.4010 ms, avg = 0.2123 ms`
+     - **Throughput: 4,710.26 frames/sec**.
+
+
 
 
 

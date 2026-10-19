@@ -576,63 +576,47 @@ class ModelWriter:
             submit_offsets.append(SubmitListEntry.End(builder))
 
         # ----------------------------------------------------------------------
-        # 9. Build Root Vector Offsets
+        # 9. Build Root Vector Offsets (always create vectors even if empty)
         # ----------------------------------------------------------------------
-        task_list_vec = 0
-        if task_offsets:
-            Loadable.StartTaskListVector(builder, len(task_offsets))
-            for toff in reversed(task_offsets):
-                builder.PrependUOffsetTRelative(toff)
-            task_list_vec = builder.EndVector()
+        Loadable.StartTaskListVector(builder, len(task_offsets))
+        for toff in reversed(task_offsets):
+            builder.PrependUOffsetTRelative(toff)
+        task_list_vec = builder.EndVector()
 
-        mem_list_vec = 0
-        if mem_offsets:
-            Loadable.StartMemoryListVector(builder, len(mem_offsets))
-            for moff in reversed(mem_offsets):
-                builder.PrependUOffsetTRelative(moff)
-            mem_list_vec = builder.EndVector()
+        Loadable.StartMemoryListVector(builder, len(mem_offsets))
+        for moff in reversed(mem_offsets):
+            builder.PrependUOffsetTRelative(moff)
+        mem_list_vec = builder.EndVector()
 
-        addr_list_vec = 0
-        if addr_offsets:
-            Loadable.StartAddressListVector(builder, len(addr_offsets))
-            for aoff in reversed(addr_offsets):
-                builder.PrependUOffsetTRelative(aoff)
-            addr_list_vec = builder.EndVector()
+        Loadable.StartAddressListVector(builder, len(addr_offsets))
+        for aoff in reversed(addr_offsets):
+            builder.PrependUOffsetTRelative(aoff)
+        addr_list_vec = builder.EndVector()
 
-        ev_list_vec = 0
-        if ev_offsets:
-            Loadable.StartEventListVector(builder, len(ev_offsets))
-            for eoff in reversed(ev_offsets):
-                builder.PrependUOffsetTRelative(eoff)
-            ev_list_vec = builder.EndVector()
+        Loadable.StartEventListVector(builder, len(ev_offsets))
+        for eoff in reversed(ev_offsets):
+            builder.PrependUOffsetTRelative(eoff)
+        ev_list_vec = builder.EndVector()
 
-        blobs_vec = 0
-        if blob_offsets:
-            Loadable.StartBlobsVector(builder, len(blob_offsets))
-            for boff in reversed(blob_offsets):
-                builder.PrependUOffsetTRelative(boff)
-            blobs_vec = builder.EndVector()
+        Loadable.StartBlobsVector(builder, len(blob_offsets))
+        for boff in reversed(blob_offsets):
+            builder.PrependUOffsetTRelative(boff)
+        blobs_vec = builder.EndVector()
 
-        td_list_vec = 0
-        if td_offsets:
-            Loadable.StartTensorDescListVector(builder, len(td_offsets))
-            for tdoff in reversed(td_offsets):
-                builder.PrependUOffsetTRelative(tdoff)
-            td_list_vec = builder.EndVector()
+        Loadable.StartTensorDescListVector(builder, len(td_offsets))
+        for tdoff in reversed(td_offsets):
+            builder.PrependUOffsetTRelative(tdoff)
+        td_list_vec = builder.EndVector()
 
-        reloc_list_vec = 0
-        if reloc_offsets:
-            Loadable.StartRelocListVector(builder, len(reloc_offsets))
-            for roff in reversed(reloc_offsets):
-                builder.PrependUOffsetTRelative(roff)
-            reloc_list_vec = builder.EndVector()
+        Loadable.StartRelocListVector(builder, len(reloc_offsets))
+        for roff in reversed(reloc_offsets):
+            builder.PrependUOffsetTRelative(roff)
+        reloc_list_vec = builder.EndVector()
 
-        submit_list_vec = 0
-        if submit_offsets:
-            Loadable.StartSubmitListVector(builder, len(submit_offsets))
-            for soff in reversed(submit_offsets):
-                builder.PrependUOffsetTRelative(soff)
-            submit_list_vec = builder.EndVector()
+        Loadable.StartSubmitListVector(builder, len(submit_offsets))
+        for soff in reversed(submit_offsets):
+            builder.PrependUOffsetTRelative(soff)
+        submit_list_vec = builder.EndVector()
 
         # ----------------------------------------------------------------------
         # 10. Assemble Root Loadable Table
@@ -648,22 +632,15 @@ class ModelWriter:
         )
         Loadable.AddVersion(builder, v_offset)
 
-        if task_list_vec != 0:
-            Loadable.AddTaskList(builder, task_list_vec)
-        if mem_list_vec != 0:
-            Loadable.AddMemoryList(builder, mem_list_vec)
-        if addr_list_vec != 0:
-            Loadable.AddAddressList(builder, addr_list_vec)
-        if ev_list_vec != 0:
-            Loadable.AddEventList(builder, ev_list_vec)
-        if blobs_vec != 0:
-            Loadable.AddBlobs(builder, blobs_vec)
-        if td_list_vec != 0:
-            Loadable.AddTensorDescList(builder, td_list_vec)
-        if reloc_list_vec != 0:
-            Loadable.AddRelocList(builder, reloc_list_vec)
-        if submit_list_vec != 0:
-            Loadable.AddSubmitList(builder, submit_list_vec)
+        Loadable.AddTaskList(builder, task_list_vec)
+        Loadable.AddMemoryList(builder, mem_list_vec)
+        Loadable.AddAddressList(builder, addr_list_vec)
+        Loadable.AddEventList(builder, ev_list_vec)
+        Loadable.AddBlobs(builder, blobs_vec)
+        Loadable.AddTensorDescList(builder, td_list_vec)
+        Loadable.AddRelocList(builder, reloc_list_vec)
+        Loadable.AddSubmitList(builder, submit_list_vec)
+
 
         root = Loadable.End(builder)
 
