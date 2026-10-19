@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eswin-runtime"
+version = "1.0.0"
+description = "Python bindings for Open ESWIN NPU Runtime (EIC7700X Dual-Die)"
+readme = "README.md"
+requires-python = ">=3.8"

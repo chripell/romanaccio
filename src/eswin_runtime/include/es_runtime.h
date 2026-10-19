@@ -251,6 +251,141 @@ int32_t es_sampler_sample(es_sampler_t *sampler, float *logits, size_t vocab_siz
 void es_sampler_accept(es_sampler_t *sampler, int32_t token_id);
 void es_sampler_reset(es_sampler_t *sampler);
 
+// =============================================================================
+// High-Level Model & Session APIs (Milestone 6)
+// =============================================================================
+
+/**
+ * @brief Returns the runtime version string.
+ */
+const char* es_version(void);
+
+typedef struct {
+    const char       *model_path;     /* Directory containing manifest.json or path to .model */
+    const char       *tokenizer_path; /* Path to tokenizer.json / vocab file (optional if in model dir) */
+    const char       *cache_dir;      /* Model cache directory (default ~/.cache/eswin/models if NULL) */
+    es_device_mode_t  device_mode;    /* Target device mode (default ES_DEVICE_DUAL_DIE_AUTO) */
+} es_model_config_t;
+
+typedef struct {
+    char     name[128];
+    char     architecture[64];
+    uint32_t vocab_size;
+    uint32_t hidden_size;
+    uint32_t num_layers;
+    uint32_t num_heads;
+    uint32_t num_kv_heads;
+    uint32_t max_seq_len;
+} es_model_info_t;
+
+/**
+ * @brief Loads an NPU model package and prepares execution resources.
+ *
+ * @param ctx Valid runtime context.
+ * @param config Model configuration structure.
+ * @param[out] out_model Pointer to receive the allocated model handle.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_model_load(es_context_t *ctx, const es_model_config_t *config, es_model_t **out_model);
+
+/**
+ * @brief Unloads a model and releases all associated resources.
+ *
+ * @param model Model handle to unload (safe if NULL).
+ */
+void es_model_unload(es_model_t *model);
+
+/**
+ * @brief Queries metadata and structural parameters of a loaded model.
+ *
+ * @param model Valid model handle.
+ * @param[out] info Pointer to receive model information.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_model_get_info(const es_model_t *model, es_model_info_t *info);
+
+/**
+ * @brief Obtains a reference to the model's internal tokenizer.
+ *
+ * @param model Valid model handle.
+ * @return Pointer to tokenizer handle, or NULL if unavailable.
+ */
+const es_tokenizer_t* es_model_get_tokenizer(const es_model_t *model);
+
+typedef struct {
+    size_t              max_seq_len;     /* Maximum sequence context window (default: 2048) */
+    int32_t             max_new_tokens;  /* Maximum tokens to generate per turn (default: 512) */
+    bool                enable_dual_die; /* Enable dual-die parallel execution */
+    es_sampler_params_t sampler_params;  /* Sampling parameters */
+} es_session_config_t;
+
+/**
+ * @brief Token generation callback.
+ *
+ * Invoked during autoregressive generation as each token piece is produced.
+ *
+ * @param token The sampled token ID.
+ * @param piece The decoded UTF-8 text piece for the token.
+ * @param user_data User-provided context pointer.
+ * @return true to continue generation, or false to halt/cancel early.
+ */
+typedef bool (*es_token_callback_t)(int32_t token, const char *piece, void *user_data);
+
+typedef struct {
+    int32_t prompt_tokens;
+    int32_t eval_tokens;
+    double  prompt_eval_ms;
+    double  eval_ms;
+    double  tokens_per_sec;
+} es_perf_stats_t;
+
+/**
+ * @brief Creates an autoregressive inference session for a loaded model.
+ *
+ * Allocates KV-cache, working scratch buffers, and initializes samplers.
+ *
+ * @param model Valid loaded model handle.
+ * @param config Session configuration (or NULL for defaults).
+ * @param[out] out_session Pointer to receive allocated session handle.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_session_create(es_model_t *model, const es_session_config_t *config, es_session_t **out_session);
+
+/**
+ * @brief Frees an inference session and its KV-cache.
+ *
+ * @param session Session handle to free (safe if NULL).
+ */
+void es_session_free(es_session_t *session);
+
+/**
+ * @brief Resets sequence position and clears KV-cache for a new conversation turn.
+ *
+ * @param session Valid session handle.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_session_reset(es_session_t *session);
+
+/**
+ * @brief Executes prompt prefill and autoregressive token generation.
+ *
+ * Streams generated tokens sequentially to the provided callback.
+ *
+ * @param session Valid session handle.
+ * @param prompt Input text prompt to encode and evaluate.
+ * @param callback Callback invoked for each generated token piece (optional).
+ * @param user_data Context pointer passed to the callback.
+ * @param[out] stats Optional pointer to receive performance telemetry.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_session_generate(
+    es_session_t *session,
+    const char *prompt,
+    es_token_callback_t callback,
+    void *user_data,
+    es_perf_stats_t *stats
+);
+
 #ifdef __cplusplus
 }
 #endif

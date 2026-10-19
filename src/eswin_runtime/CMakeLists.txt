@@ -53,9 +53,19 @@ target_link_libraries(test_tokenizer_sampler PRIVATE es_runtime ${CMAKE_DL_LIBS}
 add_executable(test_transformer_session tests/test_transformer_session.cpp)
 target_link_libraries(test_transformer_session PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 6 End-to-End Test Executable
+add_executable(test_runtime_e2e tests/test_runtime_e2e.cpp)
+target_link_libraries(test_runtime_e2e PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
+# Milestone 6 Interactive Chat Tool Executable
+add_executable(eswin-chat tools/eswin_chat.cpp)
+target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 enable_testing()
 add_test(NAME test_dma_alloc COMMAND test_dma_alloc)
 add_test(NAME test_dual_die_concurrency COMMAND test_dual_die_concurrency 20)
 add_test(NAME test_manifest COMMAND test_manifest)
 add_test(NAME test_tokenizer_sampler COMMAND test_tokenizer_sampler)
 add_test(NAME test_transformer_session COMMAND test_transformer_session)
+add_test(NAME test_runtime_e2e COMMAND test_runtime_e2e)
+

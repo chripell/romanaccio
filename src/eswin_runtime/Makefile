@@ -30,11 +30,13 @@ TEST_CONCUR    = $(BUILD_DIR)/test_dual_die_concurrency
 TEST_MANIFEST  = $(BUILD_DIR)/test_manifest
 TEST_NLP       = $(BUILD_DIR)/test_tokenizer_sampler
 TEST_SESSION   = $(BUILD_DIR)/test_transformer_session
+TEST_E2E       = $(BUILD_DIR)/test_runtime_e2e
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
+TOOL_CHAT      = $(BUILD_DIR)/eswin-chat
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TOOL_FETCH)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TOOL_FETCH) $(TOOL_CHAT)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -65,6 +67,11 @@ $(TOOL_FETCH): tools/eswin_fetch.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
+$(TOOL_CHAT): tools/eswin_chat.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
 $(TEST_NLP): $(TEST_DIR)/test_tokenizer_sampler.cpp $(OBJS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
@@ -75,7 +82,12 @@ $(TEST_SESSION): $(TEST_DIR)/test_transformer_session.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION)
+$(TEST_E2E): $(TEST_DIR)/test_runtime_e2e.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
@@ -86,6 +98,8 @@ test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION)
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_NLP)
 	@echo "\nRunning Milestone 5 LLM Session & KV-Cache test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_SESSION)
+	@echo "\nRunning Milestone 6 End-to-End C11 Integration test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_E2E)
 
 clean:
 	rm -rf $(BUILD_DIR)

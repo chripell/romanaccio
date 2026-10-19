@@ -407,6 +407,31 @@ During implementation and verification of Milestone 2 of the open `eswin_runtime
      - Concurrent Dual-Die Latency: **17.03 ms / step** (**117.41 FPS total**)
      - Scaling Efficiency: **2.00x linear throughput scaling** with zero cross-die lock contention or latency degradation.
 
+---
+
+## 20. Open ESWIN Runtime (libes_runtime.so): High-Level C11 ABI & Python Architecture
+
+During Milestone 6 implementation and verification of `eswin_runtime`:
+
+1. **Ergonomic C11 Interface Design**:
+   - The public header `include/es_runtime.h` provides an opaque handle architecture (`es_context_t`, `es_model_t`, `es_session_t`, `es_dma_buf_t`, `es_tokenizer_t`, `es_sampler_t`).
+   - Clean C linkage enables direct interop from C, C++, Rust, Python (`ctypes`/`cffi`), Go (`cgo`), and Zig without C++ ABI mangling risks.
+   - Built-in lifecycle management guarantees that unprivileged master processes can orchestrate complex multi-die NPU and DSP executions with automatic resource cleanups on exit or interrupt.
+
+2. **End-to-End Autoregressive LLM Generation**:
+   - The high-level `es_session_generate` function handles prompt tokenization, KV-cache allocation, prefill ingest, and autoregressive generation loops.
+   - Per-token streaming callback interface (`es_token_callback_t`) allows live streaming terminal output and UI updating.
+   - Cancellation token support enables clean interruption on `SIGINT` (Ctrl+C) without terminating process or corrupting KV-cache memory.
+
+3. **Interactive Terminal Chat REPL (`eswin-chat`)**:
+   - Built directly on the C11 ABI, `eswin-chat` delivers a lightweight, dependency-free interactive chat engine.
+   - Features real-time ANSI-color streaming, prompt evaluation time, generation latency, tokens/second telemetry, and interactive REPL commands (`/reset`, `/stats`, `/info`, `/help`).
+
+4. **Python Bindings (`eswin_runtime`)**:
+   - Implemented via `ctypes` foreign function interface with zero external binary compilation dependencies.
+   - Pythonic context managers (`with RuntimeContext() as ctx`, `with ctx.load_model(...) as model`, `with model.create_session(...) as session`) ensure leak-free operation in Python scripts, Jupyter notebooks, and Web API backends.
+
+
 
 
 

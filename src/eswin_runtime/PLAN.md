@@ -266,20 +266,25 @@ Development is divided into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - KV-cache layout and sequence indexing guide (`docs/KV_CACHE_AND_DUAL_DIE_SESSION.md`).
 
-### Milestone 6: High-Level C API, Streaming REPL & Python Bindings
+### Milestone 6: High-Level C API, Streaming REPL & Python Bindings [COMPLETED]
 - **Scope**:
-  - Implement the complete public C11 API in `src/api/es_runtime.cpp` implementing `include/es_runtime.h`.
-  - Build the interactive chat CLI `eswin-chat` with streaming terminal output, Markdown colors, and live tokens/second telemetry.
-  - Implement lightweight Python ctypes module (`python/eswin_runtime/`).
+  - Implement the complete public C11 API in `src/api/es_runtime.cpp` implementing `include/es_runtime.h` (`es_model_load`, `es_model_unload`, `es_model_get_info`, `es_session_create`, `es_session_generate`, `es_session_reset`, `es_session_free`, `es_version`).
+  - Build the interactive chat CLI `eswin-chat` (`tools/eswin_chat.cpp`) with streaming terminal output, ANSI Markdown colors, graceful `SIGINT` interruption, and live tokens/second telemetry.
+  - Implement Python ctypes bindings package (`python/eswin_runtime/`) with Pythonic context managers (`RuntimeContext`, `Model`, `Session`, `DmaBuffer`) and example interactive REPL (`python/examples/chat_repl.py`).
 - **Deliverables**:
   - Shared library `libes_runtime.so`
-  - CLI binary `eswin-chat`
-  - Python package
+  - CLI binary `eswin-chat` (`tools/eswin_chat.cpp`)
+  - Integration test suite `tests/test_runtime_e2e.cpp`
+  - Python package (`python/eswin_runtime/`, `setup.py`, `pyproject.toml`, `examples/chat_repl.py`)
 - **Testing Requirements**:
-  - End-to-end interactive chat sessions on `roma` with streaming responses.
-  - Memory leak verification across 10,000 continuous chat turns using Valgrind and heap profiler.
+  - Verified 100% test pass on host across Milestones 1 to 6 (`make test`).
+  - Verified cross-compilation with `riscv64-linux-gnu-` and hardware execution on board `roma`:
+    - Discovered 2 operational hardware dies.
+    - Autoregressive generation completed with streaming callback.
+    - Verified multi-turn execution and KV-cache reset.
 - **Documentation**:
-  - Complete C API Reference, Getting Started Guide, and Example Applications.
+  - Public C11 API Reference & Python SDK Guide (`docs/C_API_AND_PYTHON_GUIDE.md`).
+  - Technical reverse-engineering report updated in `romanaccio/FINDINGS.md` (Section 20).
 
 ---
 

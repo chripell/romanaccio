@@ -298,3 +298,219 @@ void es_sampler_reset(es_sampler_t *sampler) {
         sampler->sampler->reset();
     }
 }
+
+// =============================================================================
+// High-Level Model & Session APIs (Milestone 6)
+// =============================================================================
+
+#include "../model/model_manifest.hpp"
+#include "../model/downloader.hpp"
+#include "../llm/transformer_session.hpp"
+#include "../llm/kv_cache.hpp"
+#include <sys/stat.h>
+
+const char* es_version(void) {
+    return "1.0.0-open";
+}
+
+struct es_model_t {
+    eswin::ModelManifest manifest;
+    std::string model_dir;
+    std::string tokenizer_path;
+    es_device_mode_t device_mode = ES_DEVICE_DUAL_DIE_AUTO;
+    std::unique_ptr<es_tokenizer_t> tokenizer_handle;
+};
+
+struct es_session_t {
+    es_model_t *model = nullptr;
+    es_session_config_t config{};
+    std::unique_ptr<eswin::TransformerSession> session;
+};
+
+static bool file_exists(const std::string &path) {
+    struct stat st;
+    return (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+}
+
+static bool dir_exists(const std::string &path) {
+    struct stat st;
+    return (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+es_status_t es_model_load(es_context_t *ctx, const es_model_config_t *config, es_model_t **out_model) {
+    if (!ctx || !config || !config->model_path || !out_model) return ES_ERR_INVALID_ARG;
+
+    std::string path = config->model_path;
+    std::string model_dir;
+    std::string manifest_path;
+
+    if (dir_exists(path)) {
+        model_dir = path;
+        manifest_path = path + "/manifest.json";
+    } else if (file_exists(path)) {
+        if (path.length() >= 5 && path.substr(path.length() - 5) == ".json") {
+            manifest_path = path;
+            size_t slash = path.find_last_of('/');
+            model_dir = (slash != std::string::npos) ? path.substr(0, slash) : ".";
+        } else {
+            size_t slash = path.find_last_of('/');
+            model_dir = (slash != std::string::npos) ? path.substr(0, slash) : ".";
+        }
+    } else {
+        std::string cache = config->cache_dir ? config->cache_dir : (std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.cache/eswin/models");
+        std::string cached_manifest = cache + "/" + path + "/manifest.json";
+        if (file_exists(cached_manifest)) {
+            model_dir = cache + "/" + path;
+            manifest_path = cached_manifest;
+        } else {
+            return ES_ERR_IO;
+        }
+    }
+
+    auto model = std::make_unique<es_model_t>();
+    model->model_dir = model_dir;
+    model->device_mode = config->device_mode;
+
+    if (!manifest_path.empty() && file_exists(manifest_path)) {
+        std::string err;
+        if (!model->manifest.load_from_file(manifest_path, err)) {
+            return ES_ERR_IO;
+        }
+    } else {
+        model->manifest.name = "Custom NPU Model";
+        model->manifest.config.architecture = "Transformer";
+        model->manifest.config.vocab_size = 49152;
+        model->manifest.config.hidden_size = 576;
+        model->manifest.config.num_hidden_layers = 30;
+        model->manifest.config.num_attention_heads = 9;
+        model->manifest.config.num_key_value_heads = 3;
+    }
+
+    if (config->tokenizer_path && *config->tokenizer_path) {
+        model->tokenizer_path = config->tokenizer_path;
+    } else if (file_exists(model_dir + "/tokenizer.json")) {
+        model->tokenizer_path = model_dir + "/tokenizer.json";
+    } else if (file_exists(model_dir + "/vocab.json")) {
+        model->tokenizer_path = model_dir + "/vocab.json";
+    } else if (file_exists(model_dir + "/tokenizer.model")) {
+        model->tokenizer_path = model_dir + "/tokenizer.model";
+    }
+
+    if (!model->tokenizer_path.empty()) {
+        es_tokenizer_t *tok = nullptr;
+        if (es_tokenizer_load(model->tokenizer_path.c_str(), &tok) == ES_SUCCESS) {
+            model->tokenizer_handle.reset(tok);
+        }
+    }
+
+    *out_model = model.release();
+    return ES_SUCCESS;
+}
+
+void es_model_unload(es_model_t *model) {
+    if (model) {
+        delete model;
+    }
+}
+
+es_status_t es_model_get_info(const es_model_t *model, es_model_info_t *info) {
+    if (!model || !info) return ES_ERR_INVALID_ARG;
+    std::memset(info, 0, sizeof(*info));
+    std::strncpy(info->name, model->manifest.name.c_str(), sizeof(info->name) - 1);
+    std::strncpy(info->architecture, model->manifest.config.architecture.c_str(), sizeof(info->architecture) - 1);
+    info->vocab_size = model->manifest.config.vocab_size;
+    info->hidden_size = model->manifest.config.hidden_size;
+    info->num_layers = model->manifest.config.num_hidden_layers;
+    info->num_heads = model->manifest.config.num_attention_heads;
+    info->num_kv_heads = model->manifest.config.num_key_value_heads;
+    info->max_seq_len = 2048;
+    return ES_SUCCESS;
+}
+
+const es_tokenizer_t* es_model_get_tokenizer(const es_model_t *model) {
+    if (!model) return nullptr;
+    return model->tokenizer_handle.get();
+}
+
+es_status_t es_session_create(es_model_t *model, const es_session_config_t *config, es_session_t **out_session) {
+    if (!model || !out_session) return ES_ERR_INVALID_ARG;
+
+    auto sess_obj = std::make_unique<eswin::TransformerSession>();
+    std::string err;
+    if (!sess_obj->init(model->manifest, model->model_dir, model->tokenizer_path, err)) {
+        return ES_ERR_HARDWARE_FAULT;
+    }
+
+    if (config) {
+        eswin::SamplerParams sp;
+        sp.temperature = config->sampler_params.temperature;
+        sp.top_k = config->sampler_params.top_k;
+        sp.top_p = config->sampler_params.top_p;
+        sp.min_p = config->sampler_params.min_p;
+        sp.repeat_penalty = config->sampler_params.repeat_penalty;
+        sp.repeat_window = config->sampler_params.repeat_window;
+        sp.max_consecutive_duplicates = config->sampler_params.max_consecutive_duplicates;
+        sp.seed = config->sampler_params.seed;
+        sess_obj->set_sampler_params(sp);
+    }
+
+    auto sess_wrapper = std::make_unique<es_session_t>();
+    sess_wrapper->model = model;
+    if (config) {
+        sess_wrapper->config = *config;
+    } else {
+        sess_wrapper->config.max_seq_len = 2048;
+        sess_wrapper->config.max_new_tokens = 512;
+        sess_wrapper->config.enable_dual_die = true;
+        sess_wrapper->config.sampler_params.temperature = 0.7f;
+        sess_wrapper->config.sampler_params.top_k = 40;
+        sess_wrapper->config.sampler_params.top_p = 0.9f;
+        sess_wrapper->config.sampler_params.repeat_penalty = 1.15f;
+    }
+    sess_wrapper->session = std::move(sess_obj);
+    *out_session = sess_wrapper.release();
+    return ES_SUCCESS;
+}
+
+void es_session_free(es_session_t *session) {
+    if (session) {
+        delete session;
+    }
+}
+
+es_status_t es_session_reset(es_session_t *session) {
+    if (!session || !session->session) return ES_ERR_INVALID_ARG;
+    session->session->reset();
+    return ES_SUCCESS;
+}
+
+es_status_t es_session_generate(
+    es_session_t *session,
+    const char *prompt,
+    es_token_callback_t callback,
+    void *user_data,
+    es_perf_stats_t *stats
+) {
+    if (!session || !session->session || !prompt) return ES_ERR_INVALID_ARG;
+
+    eswin::SessionStats s_stats;
+    int max_tokens = session->config.max_new_tokens > 0 ? session->config.max_new_tokens : 512;
+
+    auto cb_wrapper = [callback, user_data](const std::string &piece, int32_t token_id) -> bool {
+        if (!callback) return true;
+        return callback(token_id, piece.c_str(), user_data);
+    };
+
+    bool ok = session->session->generate(prompt, max_tokens, cb_wrapper, &s_stats);
+    if (!ok) return ES_ERR_HARDWARE_FAULT;
+
+    if (stats) {
+        stats->prompt_tokens = s_stats.prompt_tokens;
+        stats->eval_tokens = s_stats.eval_tokens;
+        stats->prompt_eval_ms = s_stats.prompt_eval_ms;
+        stats->eval_ms = s_stats.eval_ms;
+        stats->tokens_per_sec = s_stats.tokens_per_sec;
+    }
+
+    return ES_SUCCESS;
+}
