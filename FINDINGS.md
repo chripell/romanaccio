@@ -360,6 +360,53 @@ During implementation and verification of Milestone 1 of the open `eswin_runtime
      - 128 MB allocation, write/verify, cache flush, SMMU prepare/unprepare across both Die 0 and Die 1: **770.8 ms**.
      - Zero kernel errors observed in `sudo dmesg`.
 
+---
+
+## 19. Multi-Die Process Isolation & NUMA Worker Architecture
+
+During implementation and verification of Milestone 2 of the open `eswin_runtime`:
+
+1. **Root Cause of Single-Process Multi-Die Deadlocks & Kernel Oops**:
+   - Analysis of `libedla_runtime.so` symbols and disassembly (`_ZN5eswin10submitSyncEP10NPU_TASK_Sj`, `_ZN5eswin13TaskScheduler10appendTaskEPNS_8_npuTaskEmPNS_10_npuStreamEb`) proved that the vendor NPU runtime relies heavily on thread-local context structures (`_ZN5eswin12esCtxDefaultE`) and shared static state inside `HWProcessorMgr`.
+   - When multiple threads in the same process submit tasks to different physical dies (`/dev/npu0` vs `/dev/npu1`), mutex contention and signal race conditions on `std::condition_variable` inside `submitSync` frequently cause queue stalls and driver frame teardown faults (`destroy_frame.part.0` kernel Oops).
+   - Solution: Full process isolation. A separate worker process (`WorkerDaemon`) is spawned per physical die, providing each NPU hardware engine with a completely independent address space, driver file descriptor table, and SDK scheduler instance.
+
+2. **DWARF-Verified Hardware Task Contract (`NPU_TASK_S`)**:
+   - The vendor task submission ioctl requires a strictly aligned 744-byte structure:
+     - `taskId` (`uint32_t`, offset 0, 4 bytes)
+     - `modelId` (`uint32_t`, offset 4, 4 bytes)
+     - `inputFdNum` (`uint8_t`, offset 8, 1 byte)
+     - `outputFdNum` (`uint8_t`, offset 9, 1 byte)
+     - `_pad0` (offset 10..15, 6 bytes alignment padding to 8-byte boundary)
+     - `inputFd` (array of 10 `DevBuf`, offset 16..335, 320 bytes)
+     - `outputFd` (array of 10 `DevBuf`, offset 336..655, 320 bytes)
+     - `callback` (`NPU_TaskCallback`, offset 656..663, 8 bytes)
+     - `callbackArg` (`void*`, offset 664..671, 8 bytes)
+     - `state` (`NPU_TASK_STATE_E`, offset 672..675, 4 bytes)
+     - `sdkPrivate` (`uint8_t[64]`, offset 676..739, 64 bytes)
+     - `_pad1` (offset 740..743, 4 bytes tail padding to 744 bytes)
+   - *Driver Bug Identified*: If `inputFd` is placed at any offset other than 16 (e.g. if callbacks precede buffer arrays), the kernel driver ioctl receives zeroed/corrupted descriptor arrays, logging:
+     `[NPU][DRIVER][ERROR](commit_new_io_tensor:544) commit_new_io_tensor 544 model 1 io_tensor_size 224 != win_arg->tensor_size 112`.
+   - All buffer descriptors must also be individually registered with `ES_NPU_Prepare(&dev_buf)` in the worker process before submission.
+
+3. **Cross-Process DMA Memory Sharing & Handle Translation**:
+   - In `libes_memory.so`, the 64-bit `memFd` returned by `ES_SYS_MemAlloc` encodes `(uint64_t(owner_pid) << 32) | uint32_t(dma_buf_fd)`.
+   - To pass DMA buffers allocated by the master process to child worker processes without memory copying, the worker calls `ES_SYS_RcvMemFd(snd_mem_fd, &rcvd_mem_fd)`.
+   - Internally, `ES_SYS_RcvMemFd` calls `pidfd_open(snd_pid)` followed by `pidfd_getfd(pidfd, snd_raw_fd)` to import the dma-buf file descriptor into the child process.
+   - *Security / Permission Finding*: Under Linux ptrace security controls, unprivileged processes cannot call `pidfd_getfd` on peer processes. To allow unprivileged execution as normal user `chri`, the master process issues `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` before spawning workers.
+
+4. **NUMA Affinity & Low-Latency IPC**:
+   - Each worker process automatically pins its execution thread to its respective NUMA node:
+     - Worker 0: Pinned to Cores 0..3 (NUMA Node 0)
+     - Worker 1: Pinned to Cores 4..7 (NUMA Node 1)
+   - Communication uses `socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)` with fixed binary framing (`IpcRequest` / `IpcResponse`). Round-trip IPC latency is under 15 microseconds (< 0.1% of inference time).
+
+5. **Hardware Benchmark Results (Board FML13V03 / YOLOv3)**:
+   - Measured on physical hardware using YOLOv3 (1 input tensor, 3 output tensors):
+     - Single Die Latency: **17.03 ms / step** (~58.7 FPS)
+     - Concurrent Dual-Die Latency: **17.03 ms / step** (**117.41 FPS total**)
+     - Scaling Efficiency: **2.00x linear throughput scaling** with zero cross-die lock contention or latency degradation.
+
 
 
 

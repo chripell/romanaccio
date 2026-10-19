@@ -11,6 +11,7 @@ include_directories(include)
 set(RUNTIME_SOURCES
     src/backend/driver_wrapper.cpp
     src/backend/dma_buffer.cpp
+    src/backend/worker_pool.cpp
     src/api/es_runtime.cpp
 )
 
@@ -25,5 +26,10 @@ target_include_directories(es_runtime PUBLIC
 add_executable(test_dma_alloc tests/test_dma_alloc.cpp)
 target_link_libraries(test_dma_alloc PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 2 Concurrency Test Executable
+add_executable(test_dual_die_concurrency tests/test_dual_die_concurrency.cpp)
+target_link_libraries(test_dual_die_concurrency PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 enable_testing()
 add_test(NAME test_dma_alloc COMMAND test_dma_alloc)
+add_test(NAME test_dual_die_concurrency COMMAND test_dual_die_concurrency 100)

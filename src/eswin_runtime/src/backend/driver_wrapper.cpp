@@ -80,6 +80,10 @@ bool EswinDriver::load_libraries() {
     m_pSyncStream     = (fn_ES_NPU_SynchronizeStream)dlsym(m_lib_npu, "ES_NPU_SynchronizeStream");
     m_pLoadModel      = (fn_ES_NPU_LoadModelFromFile)dlsym(m_lib_npu, "ES_NPU_LoadModelFromFile");
     m_pUnloadModel    = (fn_ES_NPU_UnloadModel)dlsym(m_lib_npu, "ES_NPU_UnloadModel");
+    m_pGetNumInputTensors  = (fn_ES_NPU_GetNumInputTensors)dlsym(m_lib_npu, "ES_NPU_GetNumInputTensors");
+    m_pGetNumOutputTensors = (fn_ES_NPU_GetNumOutputTensors)dlsym(m_lib_npu, "ES_NPU_GetNumOutputTensors");
+    m_pGetInputTensorDesc  = (fn_ES_NPU_GetInputTensorDesc)dlsym(m_lib_npu, "ES_NPU_GetInputTensorDesc");
+    m_pGetOutputTensorDesc = (fn_ES_NPU_GetOutputTensorDesc)dlsym(m_lib_npu, "ES_NPU_GetOutputTensorDesc");
     m_pPrepare        = (fn_ES_NPU_Prepare)dlsym(m_lib_npu, "ES_NPU_Prepare");
     m_pUnprepare      = (fn_ES_NPU_Unprepare)dlsym(m_lib_npu, "ES_NPU_Unprepare");
     m_pSubmit         = (fn_ES_NPU_Submit)dlsym(m_lib_npu, "ES_NPU_Submit");
@@ -91,6 +95,7 @@ bool EswinDriver::load_libraries() {
     m_pMmap           = (fn_ES_SYS_Mmap)dlsym(m_lib_mem, "ES_SYS_Mmap");
     m_pMunmap         = (fn_ES_SYS_Munmap)dlsym(m_lib_mem, "ES_SYS_Munmap");
     m_pMemFlushCache  = (fn_ES_SYS_MemFlushCache)dlsym(m_lib_mem, "ES_SYS_MemFlushCache");
+    m_pRcvMemFd       = (fn_ES_SYS_RcvMemFd)dlsym(m_lib_mem, "ES_SYS_RcvMemFd");
 
     // Resolve System functions if available
     if (m_lib_sys) {
@@ -193,6 +198,26 @@ int EswinDriver::unload_model(uint32_t model_id) {
     return m_pUnloadModel(model_id);
 }
 
+int EswinDriver::get_num_input_tensors(uint32_t model_id, uint32_t *num) {
+    if (!m_hardware_available || !m_pGetNumInputTensors) return -1;
+    return m_pGetNumInputTensors(model_id, num);
+}
+
+int EswinDriver::get_num_output_tensors(uint32_t model_id, uint32_t *num) {
+    if (!m_hardware_available || !m_pGetNumOutputTensors) return -1;
+    return m_pGetNumOutputTensors(model_id, num);
+}
+
+int EswinDriver::get_input_tensor_desc(uint32_t model_id, int32_t tensor_id, NpuTensorDesc *desc) {
+    if (!m_hardware_available || !m_pGetInputTensorDesc) return -1;
+    return m_pGetInputTensorDesc(model_id, tensor_id, desc);
+}
+
+int EswinDriver::get_output_tensor_desc(uint32_t model_id, int32_t tensor_id, NpuTensorDesc *desc) {
+    if (!m_hardware_available || !m_pGetOutputTensorDesc) return -1;
+    return m_pGetOutputTensorDesc(model_id, tensor_id, desc);
+}
+
 int EswinDriver::mem_alloc(uint64_t *mem_fd, size_t size, CacheMode cache_mode, const char *zone) {
     if (!m_hardware_available || !m_pMemAlloc) return -1;
     return m_pMemAlloc(mem_fd, static_cast<int>(cache_mode), "es_runtime", zone, size);
@@ -201,6 +226,11 @@ int EswinDriver::mem_alloc(uint64_t *mem_fd, size_t size, CacheMode cache_mode, 
 int EswinDriver::mem_free(uint64_t mem_fd) {
     if (!m_hardware_available || !m_pMemFree) return -1;
     return m_pMemFree(mem_fd);
+}
+
+int EswinDriver::mem_rcv_fd(uint64_t snd_mem_fd, uint64_t *rcvd_mem_fd) {
+    if (!m_hardware_available || !m_pRcvMemFd) return -1;
+    return m_pRcvMemFd(snd_mem_fd, rcvd_mem_fd);
 }
 
 void* EswinDriver::mem_mmap(uint64_t mem_fd, size_t size, CacheMode cache_mode) {

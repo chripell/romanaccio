@@ -148,6 +148,83 @@ size_t es_dma_get_size(es_dma_buf_t *buf);
  */
 es_status_t es_dma_flush_cache(es_dma_buf_t *buf);
 
+// =============================================================================
+// Multi-Die Process Isolation & Worker Pool APIs (Milestone 2)
+// =============================================================================
+
+typedef struct es_worker_pool_t es_worker_pool_t;
+
+/**
+ * @brief Creates a multi-process isolated worker pool pinned to NUMA nodes.
+ *
+ * Spawns isolated worker daemons for Die 0 (cores 0-3) and Die 1 (cores 4-7)
+ * to circumvent the vendor single-process driver limitation (0xA00F6046).
+ *
+ * @param ctx Valid runtime context.
+ * @param num_dies Number of NPU dies to manage (1 or 2).
+ * @param[out] pool Pointer to receive the allocated worker pool handle.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_worker_pool_create(es_context_t *ctx, uint16_t num_dies, es_worker_pool_t **pool);
+
+/**
+ * @brief Destroys the worker pool and terminates all worker daemon processes.
+ *
+ * @param pool Valid worker pool handle (safe if NULL).
+ */
+void es_worker_pool_destroy(es_worker_pool_t *pool);
+
+/**
+ * @brief Loads a compiled .model into the target die's worker process.
+ *
+ * @param pool Valid worker pool handle.
+ * @param die_id Target NPU die ID (0 or 1).
+ * @param model_path Path to the .model file on the filesystem.
+ * @param[out] model_id Assigned model identifier on that die.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_worker_pool_load_model(es_worker_pool_t *pool, uint16_t die_id, const char *model_path, uint32_t *model_id);
+
+/**
+ * @brief Unloads a model from the target die's worker process.
+ *
+ * @param pool Valid worker pool handle.
+ * @param die_id Target NPU die ID (0 or 1).
+ * @param model_id Model identifier to unload.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_worker_pool_unload_model(es_worker_pool_t *pool, uint16_t die_id, uint32_t model_id);
+
+/**
+ * @brief Prepares and maps a DMA buffer into the target die's SMMU page table.
+ *
+ * @param pool Valid worker pool handle.
+ * @param die_id Target NPU die ID (0 or 1).
+ * @param buf Valid DMA buffer handle.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_worker_pool_prepare_buffer(es_worker_pool_t *pool, uint16_t die_id, es_dma_buf_t *buf);
+
+/**
+ * @brief Submits a synchronous inference task to the target die worker process.
+ *
+ * @param pool Valid worker pool handle.
+ * @param die_id Target NPU die ID (0 or 1).
+ * @param model_id Loaded model ID.
+ * @param input_buf Input DMA buffer.
+ * @param output_buf Output DMA buffer.
+ * @param[out] elapsed_ns Optional pointer to receive hardware latency in nanoseconds.
+ * @return ES_SUCCESS on success.
+ */
+es_status_t es_worker_pool_submit_task(
+    es_worker_pool_t *pool,
+    uint16_t die_id,
+    uint32_t model_id,
+    es_dma_buf_t *input_buf,
+    es_dma_buf_t *output_buf,
+    uint64_t *elapsed_ns
+);
+
 #ifdef __cplusplus
 }
 #endif

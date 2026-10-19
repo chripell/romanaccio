@@ -13,15 +13,17 @@ TEST_DIR       = tests
 
 SRCS           = $(SRC_DIR)/backend/driver_wrapper.cpp \
                  $(SRC_DIR)/backend/dma_buffer.cpp \
+                 $(SRC_DIR)/backend/worker_pool.cpp \
                  $(SRC_DIR)/api/es_runtime.cpp
 
 OBJS           = $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(SRCS))
 TARGET_LIB     = $(BUILD_DIR)/libes_runtime.so
-TEST_BIN       = $(BUILD_DIR)/test_dma_alloc
+TEST_DMA       = $(BUILD_DIR)/test_dma_alloc
+TEST_CONCUR    = $(BUILD_DIR)/test_dual_die_concurrency
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_BIN)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -32,14 +34,21 @@ $(TARGET_LIB): $(OBJS)
 	$(CXX) -shared -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
 
-$(TEST_BIN): $(TEST_DIR)/test_dma_alloc.cpp $(OBJS)
+$(TEST_DMA): $(TEST_DIR)/test_dma_alloc.cpp $(OBJS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_BIN)
+$(TEST_CONCUR): $(TEST_DIR)/test_dual_die_concurrency.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR)
 	@echo "Running Milestone 1 DMA test suite..."
-	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_BIN)
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
+	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_CONCUR) 100
 
 clean:
 	rm -rf $(BUILD_DIR)
