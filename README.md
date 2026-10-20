@@ -19,8 +19,6 @@ romanaccio/
 │   ├── CONTEXT_WINDOW_AND_MEMORY.md  # 4K-32K context scaling, KV cache math & chunked prefill
 │   ├── RUNTIME_API.md                # Userspace NPU runtime API specification & multi-die caveats
 │   └── CPU_NPU_PROTOCOL.md           # Kernel ioctl catalog (eic7700_npu.ko) & SMMU DMA mapping
-├── etc/
-│   └── TranslateGemma-4B-IT/         # Google TranslateGemma 4B translation engine (PLAN.md)
 └── src/
     ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
     ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
@@ -72,7 +70,7 @@ A production-ready C11 and Python userspace runtime library (`libes_runtime.so`)
   Comprehensive feasibility assessment and dual-die pipelined execution plan for the 12-Billion parameter Gemma-4 model. Partitions 48 transformer layers (24 per die) and the 262k LM head across 22 GiB of MMZ VRAM with hybrid sliding-window attention management.
 - **YOLO11 Real-Time Vision (`src/yolov11/PLAN.md`)**:
   Ultralytics YOLO11 (n, s, m, l, x) acceleration roadmap utilizing the hardware CMAC, SDP (SiLU LUT), PDP (SPPF MaxPool), and RUBIK engines. Supports 130–180 FPS single-die inference and dual-die dual-camera concurrent 1080p60 streaming.
-- **TranslateGemma-4B-IT (`etc/TranslateGemma-4B-IT/PLAN.md`)**:
+- **TranslateGemma-4B-IT (`src/TranslateGemma-4B-IT/PLAN.md`)**:
   High-accuracy offline translation engine covering 55 languages. Ingests Google LiteRT (`.task` / `.tflite`) and Hugging Face weights, achieving 5.0–9.0 tokens/second on the dual-die pipeline.
 - **OpenAI Whisper Speech-to-Text (`src/whisper/PLAN.md`)**:
   Privacy-preserving, fully offline voice transcription and dictation. Maps 1D audio convolutions and encoder attention directly to hardware, reaching >15x real-time transcription speeds.
