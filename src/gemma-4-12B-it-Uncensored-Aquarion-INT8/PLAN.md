@@ -109,6 +109,12 @@ Gemma-4 presents several distinctive architectural features that differ from sta
   - **RMSNorm**: Gemma's scale factor is $(1.0 + \gamma)$. During compilation, fold the $+1.0$ offset directly into the static weight tensor before quantization: $\hat{\gamma} = 1.0 + \gamma$. This makes Gemma RMSNorm bit-compatible with the hardware SDP / DSP normalizer!
   - **GeLU Tanh**: The NPU's SDP (Single Data Point) engine contains a 256-entry piecewise-linear Look-Up Table (LUT). The compiler programs the SDP LUT with the sampled curve of $y = 0.5x(1 + \tanh(\sqrt{2/\pi}(x + 0.044715x^3)))$ over the dynamic range $[-6.0, +6.0]$, executing the non-linear activation in hardware at full systolic throughput.
 
+### 3.3 Context Window Scaling (4K–16K), Chunked Prefill & Output Size Decoupling
+- **Sliding Window Capped Memory**: The 40 sliding-attention layers are strictly bounded to a 1024-token rolling buffer. As context grows to 4,096, 8,192, or 16,384 tokens, the sliding layers **never exceed 320 MiB** of KV cache.
+- **Global Attention Scaling**: Only the 8 global attention layers grow linearly with context length ($16.38 \text{ KiB/token}$). At 16K context, global KV cache consumes only $256 \text{ MiB}$ total.
+- **Chunked Prefill**: Long prompts (e.g. 8K or 16K documents) are ingested in **1024-token chunks**, preventing $O(N^2)$ SPRAM memory spikes and bounding peak intermediate activation buffers to $<32 \text{ MiB}$.
+- **Decoupled Output Ceiling**: Replaces the legacy 1024-token limit with a **4096-token generation ceiling** (`--max-tokens 4096`), ensuring complete, untruncated narrative responses. Autoregressive token generation appends 1 token per step without requiring static preallocation.
+
 ---
 
 ## 4. Simulator-First Development Strategy

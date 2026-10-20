@@ -37,15 +37,39 @@ While 7B models achieve ~10.5 tokens/second (adequate for deliberate chatting) a
 |  |                                            |   (Hardware Pipeline) |                           |
 |  | - Layers 0 to 13 (.model blocks):  0.64 GiB|                       | - Layers 14 to 27: 0.64GB |
 |  | - LM Head Slice 0 (0..76031):      0.14 GiB|                       | - LM Head Slice 1: 0.14GB |
-|  | - Static KV Cache (4096 ctx):      0.18 GiB|                       | - Static KV Cache: 0.18GB |
+|  | - 16K KV Cache (16,384 ctx):       0.23 GiB|                       | - 16K KV Cache:    0.23GB |
 |  | ------------------------------------------ |                       | ------------------------- |
-|  | TOTAL MMZ COMMITTED: 0.96 GiB / 11.00 GiB  |                       | TOTAL MMZ: 0.96 / 11.00GB |
-|  | FREE MMZ HEADROOM:   10.04 GiB (91% FREE!) |                       | FREE MMZ:  10.04 GiB      |
+|  | TOTAL MMZ COMMITTED: 1.01 GiB / 11.00 GiB  |                       | TOTAL MMZ: 1.01 / 11.00GB |
+|  | FREE MMZ HEADROOM:   9.99 GiB (90.8% FREE!)|                       | FREE MMZ:   9.99 GiB      |
 |  +--------------------------------------------+                       +---------------------------+
 +---------------------------------------------------------------------------------------------------+
 ```
 
-With 91% of VRAM remaining free, the model can support huge context windows (8192+ tokens) or run alongside other models (e.g., YOLO11 + Whisper) simultaneously!
+With 90.8% of VRAM remaining free, the model effortlessly supports massive context windows up to **32,768 tokens (32K)** or can run concurrently with other vision/audio models!
+
+---
+
+## 3. Context Window (16K–32K), Chunked Prefill & Output Size Decoupling
+
+For real-world software engineering, a 1024-token context window is insufficient to ingest complex source files, build logs, and multi-file diffs.
+
+### 3.1 16K Context Window Memory Breakdown
+- Layer configuration: 28 layers, 2 KV heads, head dimension 128 (FP16).
+- Per token memory cost: $2 \times 28 \times 2 \times 128 \times 2 \text{ bytes} = 28.67 \text{ KiB/token}$.
+- At **16,384 tokens (16K)**: Total KV cache footprint is **only 458.8 MiB** (229.4 MiB per die).
+- At **32,768 tokens (32K)**: Total KV cache footprint is **only 917.5 MiB** (458.8 MiB per die).
+
+### 3.2 Chunked Prefill for Large Source Code Ingestion
+When feeding a 10,000+ line C/C++ or Python file into `roma-copilot`:
+1. The prompt is split into **1024-token tiles**.
+2. Each tile is processed in a fast feed-forward pass, populating the circular KV cache in hardware MMZ.
+3. Intermediate activation tensors stay below $32 \text{ MiB}$, completely eliminating memory spikes and preventing driver lockup.
+
+### 3.3 Decoupling Output Size ($L_{out}$) & Thinking Budget
+In `qwen2_fix`, the prompt response was hard-capped to `max_new_tokens = 1024`. When DeepSeek-R1 enters `<think>` mode, it routinely consumes 400–800 tokens on internal reasoning, leaving only a fragment of the budget for the actual answer.
+- **Configurable Output Ceiling**: Set default output budget to **4,096 tokens** (`--max-tokens 4096`).
+- **Dedicated Thinking Budget**: Allow up to 1,024 thinking tokens without subtracting from the user-facing response budget.
+- Because generation is autoregressive (appending 1 token per step), increasing the output ceiling to 4096 tokens costs zero additional pre-allocated memory.
 
 ---
 

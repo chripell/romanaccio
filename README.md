@@ -16,6 +16,7 @@ romanaccio/
 │   ├── NPU_OPERATIONS.md             # Hardware engine & 372 DSP kernels catalog, GPU profile
 │   ├── MODEL_FORMAT.md               # Reverse-engineered .model (NVDA FlatBuffers) specification
 │   ├── SYSTEM_CAPABILITIES_AND_MODELS.md # Compute envelope, latency benchmarks, model feasibility
+│   ├── CONTEXT_WINDOW_AND_MEMORY.md  # 4K-32K context scaling, KV cache math & chunked prefill
 │   ├── RUNTIME_API.md                # Userspace NPU runtime API specification & multi-die caveats
 │   └── CPU_NPU_PROTOCOL.md           # Kernel ioctl catalog (eic7700_npu.ko) & SMMU DMA mapping
 ├── etc/
@@ -33,7 +34,8 @@ romanaccio/
     ├── TranslateGemma-4B-IT/         # TranslateGemma 4B machine translation (PLAN.md)
     ├── whisper/                      # OpenAI Whisper edge speech-to-text (PLAN.md)
     ├── qwen2_vl/                     # Qwen2-VL-2B multimodal vision-language model (PLAN.md)
-    └── qwen2_5_coder/                # Qwen2.5-Coder-1.5B/7B high-speed copilot (PLAN.md)
+    ├── qwen2_5_coder/                # Qwen2.5-Coder-1.5B/7B high-speed copilot (PLAN.md)
+    └── rpg_uncensored/               # Stheno, Mistral-Nemo & Qwen2.5 uncensored RPG engine (PLAN.md)
 ```
 
 ---
@@ -77,7 +79,9 @@ A production-ready C11 and Python userspace runtime library (`libes_runtime.so`)
 - **Qwen2-VL-2B Multimodal Assistant (`src/qwen2_vl/PLAN.md`)**:
   Vision-Language model pairing SigLIP / ViT patch convolutions on Die 0 with our proven Qwen2 dual-die LLM engine for image analysis, visual document OCR, and UI reasoning.
 - **Qwen2.5-Coder-1.5B & DeepSeek-R1-Distill-1.5B (`src/qwen2_5_coder/PLAN.md`)**:
-  High-speed terminal copilot and interactive coding engine generating at 35–45 tokens/second with instant response times.
+  High-speed terminal copilot and interactive coding engine generating at 35–45 tokens/second with 16K–32K context support and chunked prefill.
+- **Uncensored RPG & Creative Writing Engine (`src/rpg_uncensored/PLAN.md`)**:
+  Dedicated roleplay stack supporting `Sao10K/L3.1-8B-Stheno-v3.3`, `Mistral-Nemo-12B-HERETIC`, and `Qwen2.5-7B-Instruct-abliterated`. Features 16K context window buffers, 4096-token narrative outputs, and an embedded OpenAI-compatible API server for direct connection to SillyTavern.
 
 ---
 
