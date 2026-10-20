@@ -276,3 +276,34 @@ Implemented in `src/eswin_compiler/backend/flatbuffer_emitter.py`:
 - `ModelReader.read_file(path)` / `ModelReader.read_bytes(buf)`: Parses any `.model` file into high-level dataclasses.
 - `ModelWriter.write_file(model, path)` / `ModelWriter.serialize(model)`: Serializes dataclasses back into a valid `.model` FlatBuffers package.
 - Full round-trip tested and verified against all vendor sample models in `src/eswin_compiler/tests/test_schema_roundtrip.py`.
+
+---
+
+## 5. Hardware Execution & Runtime Driver Requirements (Physical Silicon Verification)
+
+During physical silicon validation on the EIC7700X dual-die hardware (`roma`), several critical driver-level constraints were identified and documented:
+
+### 5.1 Blob Versioning Protocol (`libedla_runtime.so`)
+The vendor userspace runtime `libedla_runtime.so` parses FlatBuffers blob entries and checks their semantic version fields:
+- **Weight Blobs** (`interface = 0`): Must have `version = (0, 0, 0)`.
+- **KMD / UMD Task Descriptors** (`interface = 1` or `2`): Must have `version = (0, 0, 3)`.
+- If task blobs are stamped with `(0, 7, 0)` (matching the root loadable version), the runtime loader silently fails to parse the task graph, leading to CDMA/BDMA engine hangs waiting indefinitely on uninitialized queues.
+
+### 5.2 4KB Page Alignment for DMA Scratch Buffers
+Any system memory region allocated for DMA scratchpads (such as precision conversion buffer `conv1_cvtPrecision` with `flags = 1` / `ALLOC`):
+- Must have its allocated byte size rounded up to the nearest 4096-byte page boundary: `size = (raw_bytes + 4095) & ~4095`.
+- If unaligned, the kernel memory allocator (`eic7700_npu` driver ioctl `IOCTL_MEM_ALLOC`) fails or causes IOMMU page faults during hardware DMA.
+
+### 5.3 NVDLA CMAC FP16 Weight Tiling
+The NVDLA hardware convolution core expects FP16 weights packed into hardware atomic groups rather than standard flat row-major `[C_out, C_in, K_h, K_w]`:
+- Output channels are grouped into atomic groups of 8: `c_out_groups = ceil(C_out / 8)`.
+- Input channels are aligned to multiples of 4: `c_in_aligned = ceil(C_in / 4) * 4`.
+- Memory layout: Padded tensor of shape `(c_out_groups, 8, c_in_aligned, K_h, K_w)` transposed to `(c_out_groups, c_in_aligned, K_h, K_w, 8)`.
+- Flattening weights sequentially without this transformation causes hardware CMAC fetch hangs.
+
+### 5.4 Physical Silicon Parity Results
+A custom 2D convolution model (`test_compiler_e2e.model`) compiled directly from an EIR graph via `eswin_compiler` achieved:
+- **Die 0**: 0.18 ms average latency (**5,479 fps** throughput).
+- **Die 1**: 1.32 ms average latency (**758 fps** throughput).
+- **Numerical Parity**: Verified with `es_run_model -v -t 0.05` reporting **`Cosine similarity compare success!`** against PyTorch golden outputs.
+
