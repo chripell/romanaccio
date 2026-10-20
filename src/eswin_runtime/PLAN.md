@@ -169,7 +169,10 @@ es_status_t es_chat_generate(es_session_t *session, const char *prompt, const es
 
 ## 5. Incremental Step-by-Step Implementation Roadmap
 
-Development is divided into **6 small, independently verifiable milestones**:
+Development is structured into **11 independently verifiable milestones**:
+- **Phase I (Milestones 1–6)**: Core Hardware Abstraction, Multi-Die Isolation, Tokenization, Sampler, and Public C11/Python Runtime [COMPLETED]
+- **Phase II (Milestones 7–10)**: Multi-Layer Block Chaining, Zero-Copy Weights/Embeddings, Hardware MMZ KV-Cache, and Full E2E DeepSeek/Qwen2 Native Execution [PLANNED]
+- **Phase III (Milestone 11)**: Direct Kernel ioctl Mode Backend (Zero-Vendor-Blob Engine) [PLANNED]
 
 ### Milestone 1: Low-Level Hardware Abstraction & Contiguous Memory Manager [COMPLETED]
 - **Scope**:
@@ -285,6 +288,113 @@ Development is divided into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - Public C11 API Reference & Python SDK Guide (`docs/C_API_AND_PYTHON_GUIDE.md`).
   - Technical reverse-engineering report updated in `romanaccio/FINDINGS.md` (Section 20).
+
+### Milestone 7: Multi-Layer Block Chaining & Pipeline Engine (Dual-Die Sequential Graphs) [PLANNED]
+- **Motivation & Objectives**:
+  - `TransformerSession` in Milestone 5 implemented single-stage dual-die offload (specifically LM-head reduction). Large-scale models like DeepSeek-7B and Qwen2 consist of 28 to 32 sequential transformer layer block models across Die 0 and Die 1 (totaling 56+ hardware models).
+  - Implement a zero-copy pipeline execution engine capable of sequentially chaining $N$ layer block models per die, passing activation tensors directly between layer stages without CPU-side round-trips.
+- **Scope**:
+  - Extend `ModelManifest` to support multi-block model definitions:
+    - Lists of sequential block models per die (e.g. `block_models: ["modified_block_0_d0.model", ...]`).
+    - Topology descriptors for inter-die peer tensor communication.
+  - Implement `PipelineExecutor` (`src/backend/pipeline_executor.hpp`, `src/backend/pipeline_executor.cpp`):
+    - Allocate double-buffered (ping-pong) contiguous DMA activation buffers in `mmz_nid_0_part_0` and `mmz_nid_1_part_0`.
+    - Layer $i$ output DMA buffer maps directly as layer $i+1$ input DMA buffer.
+    - Asynchronous batch submission of layer tasks to `WorkerPool` with lockstep die synchronization barriers.
+  - Implement inter-die peer activation exchange:
+    - Coordinate tensor-parallel intermediate representations between Die 0 and Die 1 at each layer boundary using shared DMA regions.
+- **Deliverables**:
+  - `src/backend/pipeline_executor.hpp`, `src/backend/pipeline_executor.cpp`.
+  - Extended `TransformerSession` integrating `PipelineExecutor`.
+  - Unit/benchmark test `tests/test_layer_chaining.cpp`.
+- **Testing Requirements**:
+  - Execute 2-layer, 8-layer, and full 28-layer synthetic pipeline chains on `roma`.
+  - Measure per-layer activation handoff latency (target: $< 40\,\mu\text{s}$ per layer).
+  - Assert zero memory leaks and proper resource unwinding on worker interruption.
+- **Documentation**:
+  - Pipeline execution architecture guide (`docs/MULTI_LAYER_PIPELINE_GUIDE.md`).
+
+### Milestone 8: Zero-Copy Embedding & Weight Memory Management (`embedding.bin`, Safetensors, GGUF) [PLANNED]
+- **Motivation & Objectives**:
+  - Large language models require external embedding tables (e.g. 1.08 GB raw fp16 for DeepSeek-7B, 272 MB for Qwen2-0.5B). Currently, `TransformerSession` uses a fallback dummy constant (`0.01f`), producing uniform logits and gibberish sampling output if real weights are not mapped.
+  - Implement an ultra-fast zero-copy memory-mapped embedding and weight manager supporting raw binary tables (`embedding.bin`), Hugging Face `safetensors`, and GGUF.
+- **Scope**:
+  - Implement `EmbeddingTable` (`src/model/embedding_table.hpp`, `src/model/embedding_table.cpp`):
+    - Memory-map huge embedding files via `mmap(PROT_READ)` with `MAP_SHARED` / `MADV_WILLNEED` to eliminate multi-gigabyte heap allocations and enable sub-millisecond cold starts.
+    - Provide fast token-to-embedding vector lookups with boundary validation.
+    - Precision handling: support fp16, bf16, and fp32 embeddings, with auto-detection from file size vs. vocabulary/hidden dimensions.
+    - Optimized fp16-to-fp32 unpacking on RISC-V with vector extensions (`rvv`) where available, and clean portable scalar fallback.
+  - Implement standalone `SafetensorsLoader` (`src/model/safetensors_loader.hpp`, `src/model/safetensors_loader.cpp`):
+    - Zero-dependency parsing of Hugging Face `.safetensors` headers and tensor offset maps.
+- **Deliverables**:
+  - `src/model/embedding_table.hpp`, `src/model/embedding_table.cpp`.
+  - `src/model/safetensors_loader.hpp`, `src/model/safetensors_loader.cpp`.
+  - Unit test suite `tests/test_embedding_loader.cpp`.
+- **Testing Requirements**:
+  - Memory-map 1.08 GB DeepSeek `embedding.bin` in $< 5\,\text{ms}$ on `roma`.
+  - Verify embedding lookups against golden Hugging Face reference vectors.
+  - Verify error handling on corrupted, truncated, or size-mismatched embedding files.
+- **Documentation**:
+  - Weights format and memory mapping specification (`docs/WEIGHTS_AND_EMBEDDING_SPEC.md`).
+
+### Milestone 9: Hardware Contiguous MMZ Dynamic KV-Cache with Circular Address Offsetting [PLANNED]
+- **Motivation & Objectives**:
+  - In `TransformerSession`, KV caching is currently implemented as a host software buffer. The hardware NPU block models expect K and V caches directly mapped to contiguous physical DMA memory (`IN_K_CACHE_IDX`, `IN_V_CACHE_IDX`) with circular address offsets computed per sequence step.
+- **Scope**:
+  - Implement `HardwareKvCache` (`src/llm/hardware_kv_cache.hpp`, `src/llm/hardware_kv_cache.cpp`):
+    - Allocate physical DMA buffers for K and V caches per layer in MMZ (`mmz_nid_0_part_0` / `mmz_nid_1_part_0`).
+    - Bind physical memory descriptors (`memFd`, physical base address) into the task input/output structures passed to the NPU kernel.
+    - Implement circular sequence address offsets per token step (`calcKCacheOutputAddrOffset`, `calcVCacheOutputAddrOffset`) to allow context sliding up to 2048/4096 tokens.
+    - Support multi-turn conversation caching, slot recycling, and fast reset without reallocating physical memory.
+- **Deliverables**:
+  - `src/llm/hardware_kv_cache.hpp`, `src/llm/hardware_kv_cache.cpp`.
+  - Unit test suite `tests/test_hardware_kv_cache.cpp`.
+- **Testing Requirements**:
+  - Allocate and bind 28 layers of dual-die K and V caches in physical MMZ memory on `roma`.
+  - Verify sequential token position writes without overwriting or address misalignments.
+  - Verify multi-turn conversational context retention and prompt caching.
+- **Documentation**:
+  - Hardware KV cache layout and DMA address mapping guide (`docs/HARDWARE_KV_CACHE_GUIDE.md`).
+
+### Milestone 10: Full End-to-End DeepSeek & Qwen2 Native Execution in Open Runtime (`qwen2_v2`) [PLANNED]
+- **Motivation & Objectives**:
+  - Integrate Milestones 7, 8, and 9 to enable `qwen2_v2_openruntime` to run the complete 58-model `deepseek_7b_1k_int8_peer` hardware pipeline entirely through `libes_runtime.so`, replacing the legacy vendor `Qwen2Client` with clean, maintainable open-source code.
+- **Scope**:
+  - Parse vendor `config.json` or native `manifest.json` for `deepseek_7b_1k_int8_peer` and `qwen2_0_5b_int8`.
+  - Wire `TransformerSession` to execute the full 58-model chained pipeline through `es_session_generate`.
+  - Benchmark against `es_qwen2` (target: match or exceed 10.5 tokens/sec).
+  - Maintain full interactive REPL features:
+    - Real-time gray thinking token streaming (`[Thinking: ...]`) with automatic token capping.
+    - Token debug mode (`[#id:"piece"]`).
+    - Issue #47 loop-breaking sampler (sliding repetition penalty, anti-stutter, cyclic loop breaker).
+    - Comprehensive startup component card with validation and missing-piece warnings.
+- **Deliverables**:
+  - Fully functional `qwen2_v2` powered 100% by `libes_runtime.so`.
+  - End-to-end integration test `tests/test_deepseek_e2e.cpp`.
+  - Automated performance and perplexity regression script.
+- **Testing Requirements**:
+  - Coherent response generation for complex prompts (e.g. math reasoning, code generation) on board `roma`.
+  - Sustained generation speed $\ge 10.5$ tokens/sec on dual NPUs.
+  - Zero kernel driver faults, zero memory leaks, and zero deadlocks over 1,000 generated tokens.
+- **Documentation**:
+  - DeepSeek & Qwen2 Open Runtime deployment guide (`docs/DEEPSEEK_QWEN2_RUNTIME_GUIDE.md`).
+
+### Milestone 11: Direct Kernel Mode Backend (L0' Zero-Vendor-Blob Engine) [PLANNED]
+- **Motivation & Objectives**:
+  - Eliminate the last proprietary vendor userspace binary blob (`libedla_runtime.so.1.0` and `libes_memory.so`) by implementing direct kernel ioctls to `/dev/npu0` and `/dev/npu1` and standard Linux DMA-heap buffer allocation.
+- **Scope**:
+  - Reverse-engineer ioctl command opcodes (`_IOWR(...)`) for job submission and status polling targeting `/dev/npu0` and `/dev/npu1`.
+  - Implement direct DMA heap buffer allocation via Linux standard `/dev/dma_heap/reserved` or `/dev/dma_heap/system`, bypassing `libes_memory.so`.
+  - Firmware mailbox queue management and interrupt handling in userspace.
+  - Compile-time switch `ENABLE_DIRECT_KERNEL_MODE=ON` allowing completely blob-free execution.
+- **Deliverables**:
+  - `src/backend/direct_kernel_backend.hpp`, `src/backend/direct_kernel_backend.cpp`.
+  - Standalone unit test `tests/test_direct_kernel_mode.cpp`.
+- **Testing Requirements**:
+  - Submit and complete NPU hardware inference jobs directly via kernel ioctls on `roma` without loading any vendor `.so` libraries.
+  - Validate performance parity with vendor userspace runtime.
+- **Documentation**:
+  - Direct kernel ioctl specification and firmware mailbox protocol (`docs/DIRECT_KERNEL_IOCTL_SPEC.md`).
 
 ---
 
