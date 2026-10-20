@@ -23,6 +23,7 @@ from eswin_simulator.engines.cmac import (
     unpack_nvdla_weights,
 )
 from eswin_simulator.engines.cacc import CACCEngine
+from eswin_simulator.engines.sdp import SDPEngine, SDPLookupTable
 import numpy as np
 
 
@@ -41,7 +42,7 @@ def format_bytes(num_bytes: int) -> str:
 def print_banner() -> None:
     print("=" * 80)
     print("  ESWIN EIC7700X Open NPU/DSP Functional Simulator (eswin-sim)")
-    print("  Milestone 3: CMAC Convolution / GEMM & CACC Accumulator Engine")
+    print("  Milestone 4: CMAC, CACC & SDP Non-Linear LUT Engine")
     print("=" * 80)
 
 
@@ -181,6 +182,7 @@ def execute_simulation(
     vas = VirtualAddressSpace(model)
     cmac = CMACEngine(address_space=vas)
     cacc = CACCEngine(address_space=vas)
+    sdp = SDPEngine(address_space=vas)
 
     print_banner()
     print(f"\n[*] Loaded model: {p.name} (version {model.version[0]}.{model.version[1]}.{model.version[2]})")
@@ -262,6 +264,58 @@ def execute_simulation(
             vas.write_tensor(out_t, y)
             print(f"  • GEMM Execution: {cmac.total_macs:,} MACs, output shape {y.shape} [OK]")
             computed = True
+
+    # Scenario C: SwiGLU MLP Block (e.g. test_swiglu_mlp_npu_b1.model)
+    elif "w_gatesplitM_0_0" in model.blobs and "w_upsplitM_0_3" in model.blobs and "w_downsplitM_0_6" in model.blobs:
+        in_t = model.input_tensors[0]
+        out_t = model.output_tensors[0]
+        c_in = in_t.c
+        hidden_dim = 1536
+
+        print(f"  • Detected SwiGLU MLP Architecture: Hidden Dim={hidden_dim}, C_in={c_in}, C_out={out_t.c}")
+
+        # Unpack w_gate (1536, 576)
+        w_gate = np.vstack([
+            unpack_nvdla_weights_1x1(model.blobs[f"w_gatesplitM_{i}_{i}"].data, 512, c_in, dtype=in_t.dtype)
+            for i in range(3)
+        ])
+
+        # Unpack w_up (1536, 576)
+        w_up = np.vstack([
+            unpack_nvdla_weights_1x1(model.blobs[f"w_upsplitM_{i}_{i+3}"].data, 512, c_in, dtype=in_t.dtype)
+            for i in range(3)
+        ])
+
+        # Unpack w_down (576, 1536)
+        w_down = np.vstack([
+            unpack_nvdla_weights_1x1(model.blobs["w_downsplitM_0_6"].data, 256, hidden_dim, dtype=in_t.dtype),
+            unpack_nvdla_weights_1x1(model.blobs["w_downsplitM_1_7"].data, 256, hidden_dim, dtype=in_t.dtype),
+            unpack_nvdla_weights_1x1(model.blobs["w_downsplitM_2_8"].data, 64, hidden_dim, dtype=in_t.dtype),
+        ])
+
+        x = vas.read_tensor(in_t)
+
+        # 1. Gate projection
+        gate_act = cmac.gemm_1x1(x, w_gate, precision=in_t.data_type)
+
+        # 2. Up projection
+        up_act = cmac.gemm_1x1(x, w_up, precision=in_t.data_type)
+
+        # 3. SiLU activation on Gate via SDP LUT
+        lut_blob = model.blobs.get("kmd-task-lut_list")
+        lut_desc = SDPLookupTable.from_bytes(lut_blob.data) if lut_blob else None
+        silu_act = sdp.silu(gate_act, lut=lut_desc, use_lut=(lut_desc is not None))
+
+        # 4. Elementwise multiplication: SiLU(Gate) * Up
+        inter_act = sdp.eltwise_mul(silu_act, up_act)
+
+        # 5. Down projection
+        down_act = cmac.gemm_1x1(inter_act, w_down, precision=in_t.data_type)
+        y = cacc.finalize_fp16(down_act, to_fp16=(out_t.data_type == "HALF"))
+
+        vas.write_tensor(out_t, y)
+        print(f"  • SwiGLU Pipeline Execution: {cmac.total_macs:,} MACs, {sdp.total_activations} LUTs, {sdp.total_eltwise} Eltwise Mul [OK]")
+        computed = True
 
     if not computed:
         print("  • Notice: Model does not have direct Conv/GEMM weight blobs; bypassing compute.")

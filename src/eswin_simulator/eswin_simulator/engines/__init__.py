@@ -11,6 +11,7 @@ from eswin_simulator.engines.cmac import (
     unpack_nvdla_weights,
 )
 from eswin_simulator.engines.cacc import CACCEngine
+from eswin_simulator.engines.sdp import SDPEngine, SDPLookupTable
 
 __all__ = [
     "HardwareEngine",
@@ -18,6 +19,8 @@ __all__ = [
     "BDMATransferDesc",
     "CMACEngine",
     "CACCEngine",
+    "SDPEngine",
+    "SDPLookupTable",
     "unpack_nvdla_weights_conv2d",
     "unpack_nvdla_weights_1x1",
     "unpack_nvdla_weights",

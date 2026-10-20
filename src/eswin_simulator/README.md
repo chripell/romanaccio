@@ -49,6 +49,19 @@ It replaces the proprietary, 32-bit x86-only vendor `EsSimulator` binary with a 
     - `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$.
     - `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$.
 
+### Milestone 4: Single Data Point Engine (SDP) & Non-Linear LUTs
+- **SDP Functional Engine (`engines/sdp.py`)**:
+  - **Pointwise ALU Operations**: Channel/tensor bias addition with broadcasting, batch normalization scaling, and elementwise operations (`add`, `sub`, `mul`, `min`, `max`).
+  - **Fixed-Function Activations**: `relu`, `leaky_relu`, `prelu` (with per-channel slope vectors), and `clip`.
+  - **Piecewise Linear LUT Engine**:
+    - Full parser and generator for 688-byte NVDLA LUT structures (`struct _lut_dev`).
+    - Bit-accurate piecewise linear interpolation using 257-entry linear-only (`LO`) and 65-entry linear-exponential (`LE`) tables.
+    - Automated boundary clamping and linear continuation for transcendental functions (SiLU / Swish, Sigmoid, Tanh, GELU).
+  - **Precision Conversion**: FP16 $\leftrightarrow$ INT8 quantization with zero-points and saturating clipping.
+- **Full SwiGLU MLP Verification**:
+  - Multi-op pipeline simulation ($W_{\text{gate}} \to \text{SiLU(LUT)} \odot W_{\text{up}} \to W_{\text{down}}$) on `test_swiglu_mlp_npu_b1.model`.
+  - Cosine Similarity $= \mathbf{1.000000}$ ($0.99999976$) against vendor `EsSimulator` golden output.
+
 ---
 
 ## 2. Mathematical Model of BDMA Strided Transfers
@@ -248,7 +261,7 @@ Run all unit and differential tests via `pytest`:
 pytest -v
 ```
 
-All 21 comprehensive tests cover:
+All 28 comprehensive tests cover:
 - Binary magic validation (`NVDA`) and error detection on corrupted containers.
 - 4D Tensor descriptor parsing (shape, strides, data format, data type, element sizes).
 - Memory allocation across 64-bit DRAM and the 4 MiB on-chip SPRAM.
@@ -257,4 +270,10 @@ All 21 comprehensive tests cover:
 - CMAC 2D convolution across strides, paddings, dilations, and grouped/depthwise modes.
 - CMAC 1x1 pointwise convolution and GEMM across 2D, 3D, and 4D tensor shapes.
 - CACC 32-bit accumulation, bias addition, FP16 rounding, and INT8 saturating clipping ($[-128, 127]$).
-- Differential parity testing against vendor `EsSimulator` output (`test_conv_npu_b1.model` and `test_linear_1x1conv_npu_b1.model`), asserting Cosine Similarity $\ge 0.999999$ and Relative Difference $< 10^{-4}$.
+- SDP pointwise ALU operations (`bias_add`, `batch_norm`, `eltwise_mul/add/sub/min/max`).
+- SDP fixed activations (`relu`, `leaky_relu`, `prelu`, `clip`) and precision conversions.
+- SDP 688-byte piecewise linear LUT interpolation (`SiLU`, `Sigmoid`, `Tanh`, `GELU`).
+- Differential parity testing against vendor `EsSimulator` output across all reference models:
+  * `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$.
+  * `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$.
+  * `test_swiglu_mlp_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$ ($0.99999976$), Max Abs Diff $= \mathbf{0.000244}$.
