@@ -168,7 +168,7 @@ std::string DeepSeekTokenizer::build_prompt(const std::vector<ChatMessage> &mess
 
     // <｜User｜>帮我介绍一下上海迪士尼的游玩攻略<｜Assistant｜>
 
-    oss_prompt << "<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>" << messages.front().content;
+    oss_prompt << "<｜begin▁of▁sentence｜>" << messages.front().content;
 
     for (size_t i = 1; i < messages.size(); i += 1) {
         if (messages[i].role == ChatMessage::ROLE_USER) { // user

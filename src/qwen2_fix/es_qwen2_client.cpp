@@ -161,6 +161,8 @@ void Qwen2Client::init(const std::string& configPath)
         mTokenMask.emplace_back(std::make_shared<std::atomic<int32_t>>(0));
         mTokenScores.emplace_back(std::vector<TokenIdScore>(mConfig.vocabSize));
     }
+
+    initTokenFlags();
 }
 
 Qwen2Client::~Qwen2Client() { }
@@ -836,47 +838,39 @@ prob_data_t Qwen2Client::getTopK(int32_t idx, int32_t wordPosInVocab, const int3
         }
     }
     esCheckError(ES_NPU_SynchronizeStream(mStreams[idx]));
+    esCheckError(ES_SYS_MemFlushCache(mLogitsTask[idx].task.outputFd[0].memFd));
 
     if (mConfig.devPrivAttr[idx].perfEnable) {
         postStartTime = std::chrono::high_resolution_clock::now();
     }
 
-    // doSample
+    // Unified float32 logit sanitization, token guard masking, and repetition penalty
+    // for BOTH sampling (doSample=true) and greedy (doSample=false) modes
     uint16_t *logitData = (uint16_t*)mLogitsTask[idx].outputMapAddr[0];
-    if (mConfig.doSample) {
-        // logits to mTokenScores
+    int32_t activeTopK = mConfig.doSample ? std::max(1, mConfig.topK) : 1;
+
+    for (int32_t i = 0; i < mConfig.vocabSizePerDie; i++) {
+        float val = half_float::detail::half2float(logitData[i]);
+        if (std::isnan(val) || std::isinf(val)) {
+            val = -1e9f;
+        }
+        mTokenScores[idx][i] = TokenIdScore(i, val);
+    }
+
+    // Apply token sanitizer, <think>/</think> state guards, and frequency repetition penalty
+    repetitionPenalty(idx, mTokenScores[idx], outputIds, mConfig.repetitionPenalty);
+
+    if (mConfig.doSample && (mConfig.temperature != 1.0f) && (mConfig.temperature > 0.0f)) {
+        float invTemp = 1.0f / mConfig.temperature;
         for (int32_t i = 0; i < mConfig.vocabSizePerDie; i++) {
-            mTokenScores[idx][i] = TokenIdScore(i, half_float::detail::half2float(logitData[i]));
-        }
-
-        // repetition penalty
-        if (mConfig.repetitionPenalty != 1.0f) {
-            repetitionPenalty(idx, mTokenScores[idx], outputIds, mConfig.repetitionPenalty);
-        }
-
-        // adjust logits distribution
-        if (mConfig.doSample && (mConfig.temperature != 1.0f) && (mConfig.temperature != 0.0f)) {
-            float invTemp = 1.0 / mConfig.temperature;
-            for (int32_t i = 0; i < mConfig.vocabSizePerDie; i++) {
+            if (mTokenScores[idx][i].score > -1e8f) {
                 mTokenScores[idx][i].score *= invTemp;
             }
         }
-
-        // select topK
-        selectTopK(mTokenScores[idx], mConfig.topK, mConfig.vocabSizePerDie);
-    } else {
-        // repetition penalty
-        if (mConfig.repetitionPenalty != 1.0f) {
-            repetitionPenalty(idx, logitData, outputIds, mConfig.repetitionPenalty);
-        }
-
-        // topK=1
-        int16_t maxVal;
-        mTokenScores[idx][0].id = argmax((int16_t*)mLogitsTask[idx].outputMapAddr[0], mConfig.vocabSizePerDie, &maxVal);
-        mTokenScores[idx][0].score = half_float::detail::half2float(maxVal);
     }
 
-    esCheckError(ES_SYS_MemFlushCache(mLogitsTask[idx].task.outputFd[0].memFd));
+    // Select sorted topK per die (topK=1 for greedy mode)
+    selectTopK(mTokenScores[idx], activeTopK, mConfig.vocabSizePerDie);
 
     {
         // notify the status to other thread.
@@ -899,24 +893,31 @@ prob_data_t Qwen2Client::getTopK(int32_t idx, int32_t wordPosInVocab, const int3
     // only die0 calc postprocess
     if (idx == 0) {
         if (mConfig.doSample) {
-            // merge 2 die topKs and select new topK
+            // merge 2 die topKs and select new topK (sorted descending)
             for (int32_t i = 0; i < mConfig.devPrivAttr.size(); i++) {
-                for (int32_t j = 0; j < mConfig.topK; j++) {
-                    mTokenScores[idx][i * mConfig.topK + j] = mTokenScores[i][j];
-                    mTokenScores[idx][i * mConfig.topK + j].id += mConfig.devPrivAttr[i].vocabOffset;
+                for (int32_t j = 0; j < activeTopK; j++) {
+                    mTokenScores[idx][i * activeTopK + j] = mTokenScores[i][j];
+                    mTokenScores[idx][i * activeTopK + j].id += mConfig.devPrivAttr[i].vocabOffset;
                 }
             }
-            selectTopK(mTokenScores[idx], mConfig.topK, mConfig.topK * mConfig.devPrivAttr.size());
+            selectTopK(mTokenScores[idx], activeTopK, activeTopK * mConfig.devPrivAttr.size());
 
-            // softmax(mConfig.topK), then based on topP to get candidateNum
-            int32_t candidateNum = mConfig.topK;
-            if (mConfig.topP > 0 && mConfig.topP < 1.0f) {
-                softmaxInPlace(mTokenScores[idx], mConfig.topK);
-                candidateNum = samplingTopP(mTokenScores[idx], mConfig.topP, mConfig.topK);
+            // Convert topK logits to probabilities ONCE via softmax
+            softmaxInPlace(mTokenScores[idx], activeTopK);
+
+            // Apply Top-P (nucleus) filtering on sorted probabilities
+            int32_t candidateNum = activeTopK;
+            if (mConfig.topP > 0.0f && mConfig.topP < 1.0f) {
+                candidateNum = samplingTopP(mTokenScores[idx], mConfig.topP, activeTopK);
             }
 
-            // softmax(candidateNum)
-            softmaxInPlace(mTokenScores[idx], candidateNum);
+            // Apply Min-P relative threshold (drop noisy tail tokens < 15% of top-1 probability)
+            float minProbThreshold = mTokenScores[idx][0].score * 0.15f;
+            while (candidateNum > 1 && mTokenScores[idx][candidateNum - 1].score < minProbThreshold) {
+                candidateNum--;
+            }
+
+            // Pass true probabilities directly to discrete_distribution (do NOT call softmaxInPlace a second time!)
             std::vector<float> probs(candidateNum);
             for (int32_t i = 0; i < candidateNum; i++) {
                 probs[i] = mTokenScores[idx][i].score;
@@ -1236,12 +1237,49 @@ std::string Qwen2Client::generate(int32_t idx, bool master)
     bool inThinking = false;
     int thinkingCount = 0;
     bool thinkingLimitReached = false;
+    bool thinkingDone = false;
+    int forceThinkEndStep = 0; // 1 = feed newline, 2 = feed </think>, 3 = feed \n\n
     for (i = 0; i < maxAllowedLen; ++i) {
+        if (i >= (int32_t)mSentencePosInVocab.size()) {
+            // Multi-step clean conclusion of capped <think> block:
+            // Ensures KV-cache sees `.\n</think>\n\n` on BOTH dies before generating the final answer.
+            if (forceThinkEndStep == 1) {
+                forceThinkEndStep = 2;
+                wordPosInVocab = 198; // "\n"
+                outputIds.emplace_back(wordPosInVocab);
+                inputWord = "\n";
+                goto feed_token_to_npu;
+            } else if (forceThinkEndStep == 2) {
+                forceThinkEndStep = 3;
+                thinkingLimitReached = true;
+                inThinking = false;
+                thinkingDone = true;
+                wordPosInVocab = 151649; // "</think>"
+                if (master) {
+                    if (mConfig.showThinking) {
+                        std::cout << "\033[33m\n[Thinking limit of " << mConfig.maxThinkingTokens
+                                  << " tokens reached, concluding reasoning]\033[0m\n\n" << std::flush;
+                    } else {
+                        std::cout << "\r              \r\033[33m[Thinking limit reached]\033[0m\n\n" << std::flush;
+                    }
+                    if (mConfig.showTokens) {
+                        std::cout << "\033[90m[#151649:</think>][#271:\"\\n\\n\"]\033[0m\n\n" << std::flush;
+                    }
+                }
+                outputIds.emplace_back(wordPosInVocab);
+                inputWord = "</think>";
+                goto feed_token_to_npu;
+            } else if (forceThinkEndStep == 3) {
+                forceThinkEndStep = 0;
+                wordPosInVocab = 271; // "\n\n"
+            }
+        }
+
         inputWord = mTokenizer->decode(std::vector<int32_t>(1, wordPosInVocab));
 
         // stop to generate
         if (i >= mSentencePosInVocab.size()) {
-            if (wordPosInVocab == 151643 || wordPosInVocab == 151645) { // <|endoftext|> or <|im_end|>
+            if (wordPosInVocab == 151643 || wordPosInVocab == 151645 || wordPosInVocab == 151647) { // <|endoftext|> or <|im_end|> or <|EOT|>
                 ES_LOG_MSG("Encountered EOS token ID %d, generation finished.\n", wordPosInVocab);
                 endFlag = true;
             }
@@ -1274,14 +1312,17 @@ std::string Qwen2Client::generate(int32_t idx, bool master)
         // Skip the original input sentence and print response one by one.
         if (i >= mSentencePosInVocab.size()) {
             outputIds.emplace_back(wordPosInVocab);
-            if (master) {
-                bool isThinkStart = (wordPosInVocab == 151648 || inputWord == "<think>" || inputWord.find("<think>") != std::string::npos);
-                bool isThinkEnd   = (wordPosInVocab == 151649 || inputWord == "</think>" || inputWord.find("</think>") != std::string::npos);
 
-                if (isThinkStart) {
-                    inThinking = true;
-                    thinkingCount = 0;
-                    thinkingLimitReached = false;
+            // Track thinking state across BOTH threads so Die 0 and Die 1 stay in lockstep
+            bool isThinkStart = (!thinkingDone && !inThinking &&
+                                 (wordPosInVocab == 151648 || inputWord == "<think>" || inputWord.find("<think>") != std::string::npos));
+            bool isThinkEnd   = (wordPosInVocab == 151649 || inputWord == "</think>" || inputWord.find("</think>") != std::string::npos);
+
+            if (isThinkStart) {
+                inThinking = true;
+                thinkingCount = 0;
+                thinkingLimitReached = false;
+                if (master) {
                     if (mConfig.showTokens) {
                         std::cout << "\033[90m[#" << wordPosInVocab << ":<think>]\033[0m" << std::flush;
                     }
@@ -1290,37 +1331,50 @@ std::string Qwen2Client::generate(int32_t idx, bool master)
                     } else {
                         std::cout << "\033[90m[Thinking...]\033[0m" << std::flush;
                     }
-                } else if (isThinkEnd) {
-                    if (inThinking) {
-                        inThinking = false;
+                }
+            } else if (isThinkEnd) {
+                if (inThinking) {
+                    inThinking = false;
+                    thinkingDone = true;
+                    if (master) {
                         if (mConfig.showThinking) {
                             std::cout << "\033[90m]\n\n\033[0m" << std::flush;
                         } else {
                             std::cout << "\r              \r" << std::flush;
                         }
                     }
+                }
+                if (master && mConfig.showTokens) {
+                    std::cout << "\033[90m[#" << wordPosInVocab << ":</think>]\033[0m\n\n" << std::flush;
+                }
+            } else if (inThinking) {
+                thinkingCount++;
+                if (master && mConfig.showThinking) {
                     if (mConfig.showTokens) {
-                        std::cout << "\033[90m[#" << wordPosInVocab << ":</think>]\033[0m\n\n" << std::flush;
+                        std::cout << "\033[90m[#" << wordPosInVocab << ":\"" << inputWord << "\"]\033[0m" << std::flush;
+                    } else {
+                        std::cout << "\033[90m" << inputWord << "\033[0m" << std::flush;
                     }
-                } else if (inThinking) {
-                    thinkingCount++;
-                    if (mConfig.maxThinkingTokens > 0 && thinkingCount >= mConfig.maxThinkingTokens && !thinkingLimitReached) {
-                        thinkingLimitReached = true;
-                        inThinking = false;
-                        if (mConfig.showThinking) {
-                            std::cout << "\033[33m\n[Thinking limit of " << mConfig.maxThinkingTokens
-                                      << " tokens reached, concluding reasoning]\n\n\033[0m" << std::flush;
-                        } else {
-                            std::cout << "\033[33m\n[Thinking limit reached]\n\033[0m" << std::flush;
-                        }
-                    } else if (mConfig.showThinking) {
-                        if (mConfig.showTokens) {
-                            std::cout << "\033[90m[#" << wordPosInVocab << ":\"" << inputWord << "\"]\033[0m" << std::flush;
-                        } else {
-                            std::cout << "\033[90m" << inputWord << "\033[0m" << std::flush;
-                        }
+                }
+                if (mConfig.maxThinkingTokens > 0 && thinkingCount >= mConfig.maxThinkingTokens && !thinkingLimitReached) {
+                    // Conclude reasoning at the end of the current sentence/line (or within +32 tokens max)
+                    bool atSentenceBoundary = (inputWord.find('.') != std::string::npos ||
+                                               inputWord.find('!') != std::string::npos ||
+                                               inputWord.find('?') != std::string::npos ||
+                                               inputWord.find('\n') != std::string::npos);
+                    bool hardCapReached = (thinkingCount >= mConfig.maxThinkingTokens + 32);
+                    if (atSentenceBoundary || hardCapReached) {
+                        bool endsWithNewline = (!inputWord.empty() && inputWord.back() == '\n');
+                        forceThinkEndStep = endsWithNewline ? 2 : 1;
                     }
-                } else {
+                }
+            } else {
+                thinkingDone = true;
+                // Suppress redundant leading whitespace right after forced </think>\n\n
+                bool skipPrint = (outputIds.size() >= mSentencePosInVocab.size() + 2 &&
+                                  outputIds[outputIds.size() - 2] == 151649 &&
+                                  wordPosInVocab == 271);
+                if (master && !skipPrint) {
                     if (mConfig.showTokens) {
                         std::cout << "[#" << wordPosInVocab << ":\"" << inputWord << "\"]" << std::flush;
                     } else {
@@ -1346,6 +1400,8 @@ std::string Qwen2Client::generate(int32_t idx, bool master)
                 break;
             }
         }
+
+feed_token_to_npu:
 
         if (lineLength >= mConfig.responseLineLen) {
             if (mConfig.language == "zh") {
@@ -1433,6 +1489,219 @@ std::map<int32_t, std::string> Qwen2Client::getOptionalRolePrompts()
     return mConfig.rolePrompts;
 }
 
+static constexpr uint8_t TOK_FLAG_FORBIDDEN      = 0x01;
+static constexpr uint8_t TOK_FLAG_CJK_OR_EMOJI   = 0x02;
+static constexpr uint8_t TOK_FLAG_MATH_OR_QUOTE  = 0x04;
+static constexpr uint8_t TOK_FLAG_EXEMPT_PENALTY = 0x08;
+static constexpr uint8_t TOK_FLAG_HAS_NEWLINE    = 0x10;
+static constexpr uint8_t TOK_FLAG_HAS_BOLD       = 0x20;
+static constexpr uint8_t TOK_FLAG_CLOSING_BOLD   = 0x40;
+static constexpr uint8_t TOK_FLAG_SENTENCE_END   = 0x80;
+
+static bool isValidUtf8AndClassify(const std::string& s, bool& hasCjkOrEmoji)
+{
+    hasCjkOrEmoji = false;
+    size_t i = 0;
+    while (i < s.size()) {
+        uint8_t b0 = static_cast<uint8_t>(s[i]);
+        if (b0 < 0x80) {
+            if (b0 < 0x20 && b0 != '\n' && b0 != '\r' && b0 != '\t') {
+                return false;
+            }
+            i += 1;
+        } else if ((b0 >> 5) == 0x06) {
+            if (i + 1 >= s.size()) return false;
+            uint8_t b1 = static_cast<uint8_t>(s[i + 1]);
+            if ((b1 & 0xC0) != 0x80 || b0 < 0xC2) return false;
+            // Allow Latin-1 / Latin-Extended-A (0xC2..0xC5), flag other scripts
+            if (b0 > 0xC5) hasCjkOrEmoji = true;
+            i += 2;
+        } else if ((b0 >> 4) == 0x0E) {
+            if (i + 2 >= s.size()) return false;
+            uint8_t b1 = static_cast<uint8_t>(s[i + 1]);
+            uint8_t b2 = static_cast<uint8_t>(s[i + 2]);
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) return false;
+            // Reject U+FFFD replacement character (EF BF BD)
+            if (b0 == 0xEF && b1 == 0xBF && b2 == 0xBD) return false;
+            // Allow common English typography in General Punctuation (E2 80 93..A6: – — ‘ ’ “ ” • …)
+            bool isGeneralPunct = (b0 == 0xE2 && b1 == 0x80 &&
+                                   (b2 == 0x93 || b2 == 0x94 || b2 == 0x98 || b2 == 0x99 ||
+                                    b2 == 0x9C || b2 == 0x9D || b2 == 0xA2 || b2 == 0xA6));
+            if (!isGeneralPunct) {
+                hasCjkOrEmoji = true;
+            }
+            i += 3;
+        } else if ((b0 >> 3) == 0x1E) {
+            if (i + 3 >= s.size()) return false;
+            uint8_t b1 = static_cast<uint8_t>(s[i + 1]);
+            uint8_t b2 = static_cast<uint8_t>(s[i + 2]);
+            uint8_t b3 = static_cast<uint8_t>(s[i + 3]);
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 || b0 > 0xF4) return false;
+            hasCjkOrEmoji = true;
+            i += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Qwen2Client::initTokenFlags()
+{
+    mTokenFlags.assign(mConfig.vocabSize, 0);
+    mBoldTokens.clear();
+    mClosingBoldTokens.clear();
+    mNoSpaceBoldTokens.clear();
+    mOpenParenTokens.clear();
+    mCloseParenTokens.clear();
+    if (!mTokenizer) return;
+
+    static const std::unordered_set<std::string> exemptWords = {
+        "the", "The", "a", "A", "an", "An", "and", "or", "of", "to", "in", "In",
+        "is", "are", "was", "were", "be", "been", "being", "that", "which", "who",
+        "for", "with", "on", "as", "by", "at", "from", "this", "This", "it", "It",
+        "they", "They", "their", "Their", "them", "have", "has", "had", "can", "could",
+        "will", "would", "may", "might", "while", "While", "both", "Both", "more", "most",
+        "than", "not", "but", "But", "also", "such", "other", "some", "into", "between",
+        "these", "those", "its", "one", "two"
+    };
+
+    static const std::unordered_set<std::string> exemptPunct = {
+        ".", ",", ":", ";", "!", "?", "-", "--", "—", "–", " -",
+        "\n", "\n\n", ".\n", ".\n\n", ":\n", ":\n\n",
+        "**", " **", ":**", "**\n", "**\n\n", "**:", "**:\n",
+        "*", " *", "###", "####", "##", " ###", " ####"
+    };
+
+    static const std::vector<std::string> glitchSubstrings = {
+        "${", "}$", "^{", "_{", "(($", "(${", "=?", "!!", "..", ",,", "*(", "*)",
+        "—\"", ".\"", "\".", "\",", ".'", "'.", "\"]", "].", "))))", "(((",
+        "():", "->", "<-", "=>", "<=", ">=", "!=", "==", "::", "//", "/*", "*/",
+        "||", "&&", "<<", ">>", "()", "[]", "{}", "(>", "<)", "(-", "-)", "(+", "+)",
+        "[[", "]]", "([", "])", "(?", "?)", "):", "?:", ":?", "&:", "-lg",
+        ".!", "!.", "?!", "!?", "):.", ").?", "):,", ".*", ":*"
+    };
+
+    int32_t baseLimit = std::min(mConfig.vocabSize, 151643);
+    for (int32_t id = 0; id < baseLimit; ++id) {
+        std::string s = mTokenizer->decode(std::vector<int32_t>(1, id));
+        if (s.empty()) {
+            mTokenFlags[id] |= TOK_FLAG_FORBIDDEN;
+            continue;
+        }
+
+        bool hasCjkOrEmoji = false;
+        if (!isValidUtf8AndClassify(s, hasCjkOrEmoji)) {
+            mTokenFlags[id] |= TOK_FLAG_FORBIDDEN;
+            continue;
+        }
+        if (hasCjkOrEmoji) {
+            mTokenFlags[id] |= TOK_FLAG_CJK_OR_EMOJI;
+        }
+
+        for (const auto& sub : glitchSubstrings) {
+            if (s.find(sub) != std::string::npos) {
+                mTokenFlags[id] |= TOK_FLAG_FORBIDDEN;
+                break;
+            }
+        }
+
+        if (s.find('$') != std::string::npos || s.find('^') != std::string::npos ||
+            s.find('{') != std::string::npos || s.find('}') != std::string::npos ||
+            s.find('[') != std::string::npos || s.find(']') != std::string::npos ||
+            s.find('\\') != std::string::npos || s.find('"') != std::string::npos ||
+            s.find('<') != std::string::npos || s.find('>') != std::string::npos ||
+            s.find('=') != std::string::npos || s.find('|') != std::string::npos ||
+            s.find('~') != std::string::npos || s.find('`') != std::string::npos ||
+            s.find('_') != std::string::npos || s.find('&') != std::string::npos ||
+            s.find('@') != std::string::npos) {
+            mTokenFlags[id] |= TOK_FLAG_MATH_OR_QUOTE;
+        }
+
+        if (s.find('(') != std::string::npos) {
+            mOpenParenTokens.push_back(id);
+            if (s[0] == '(') {
+                // Tokens starting with '(' without a leading space (e.g. "(er", "(x)") are code/word-suffix fragments
+                mTokenFlags[id] |= TOK_FLAG_MATH_OR_QUOTE;
+            }
+        }
+        if (s.find(')') != std::string::npos) {
+            mCloseParenTokens.push_back(id);
+        }
+
+        if (s.find('\n') != std::string::npos) {
+            mTokenFlags[id] |= TOK_FLAG_HAS_NEWLINE;
+            mTokenFlags[id] |= TOK_FLAG_SENTENCE_END;
+        } else if (s.find('.') != std::string::npos || s.find('!') != std::string::npos ||
+                   s.find('?') != std::string::npos || s.find(';') != std::string::npos) {
+            mTokenFlags[id] |= TOK_FLAG_SENTENCE_END;
+        }
+
+        if (s.find("**") != std::string::npos) {
+            mTokenFlags[id] |= TOK_FLAG_HAS_BOLD;
+            mBoldTokens.push_back(id);
+            if (!s.empty() && (s[0] == ':' || (s.size() >= 3 && s.substr(0, 2) == "**" && (s[2] == ':' || s[2] == '\n' || s[2] == '.' || s[2] == ',')))) {
+                mTokenFlags[id] |= TOK_FLAG_CLOSING_BOLD;
+                mClosingBoldTokens.push_back(id);
+            } else if (s == "**") {
+                mNoSpaceBoldTokens.push_back(id);
+            }
+        }
+
+        // Check if token is a whitelisted punctuation/markdown token, pure number, or common function word
+        bool allDigits = true;
+        std::string trimmed;
+        for (unsigned char c : s) {
+            if (!std::isspace(c)) trimmed.push_back(static_cast<char>(c));
+            if (!std::isdigit(c) && !std::isspace(c) && c != '.') {
+                allDigits = false;
+            }
+        }
+        if (exemptPunct.count(s) > 0 || (!trimmed.empty() && allDigits) || exemptWords.count(trimmed) > 0) {
+            mTokenFlags[id] |= TOK_FLAG_EXEMPT_PENALTY;
+        }
+    }
+
+    // Special control & padding tokens (151643 .. vocabSize - 1)
+    // 151643 = EOS (<|endoftext|> / <｜end▁of▁sentence｜>)
+    // 151644 = <｜User｜> (forbidden)
+    // 151645 = <｜Assistant｜> in DeepSeek (forbidden) or <|im_end|> in Qwen2 (EOS)
+    // 151646 = <｜begin▁of▁sentence｜> (forbidden)
+    // 151647 = <|EOT|> (EOS)
+    // 151648 = <think>, 151649 = </think> (handled by state machine)
+    if (151644 < mConfig.vocabSize) mTokenFlags[151644] |= TOK_FLAG_FORBIDDEN;
+    if (mConfig.modelName == "deepseek_r1_distill_qwen" && 151645 < mConfig.vocabSize) {
+        mTokenFlags[151645] |= TOK_FLAG_FORBIDDEN;
+    }
+    if (151646 < mConfig.vocabSize) mTokenFlags[151646] |= TOK_FLAG_FORBIDDEN;
+    for (int32_t id = 151650; id < mConfig.vocabSize; ++id) {
+        mTokenFlags[id] |= TOK_FLAG_FORBIDDEN;
+    }
+}
+
+void Qwen2Client::analyzePromptFlags(const std::string& prompt)
+{
+    bool hasCjk = false;
+    isValidUtf8AndClassify(prompt, hasCjk);
+    mPromptAllowCjk = hasCjk || (mConfig.language == "zh");
+
+    std::string lower = prompt;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    mPromptAllowMath = false;
+    static const std::vector<std::string> mathOrCodeKeywords = {
+        "code", "program", "python", "c++", "java", "rust", "script", "function",
+        "json", "equation", "solve", "calculate", "math", "formula", "latex",
+        "+", "=", "*", "/", "^", "$", "{", "}", "quote"
+    };
+    for (const auto& kw : mathOrCodeKeywords) {
+        if (lower.find(kw) != std::string::npos) {
+            mPromptAllowMath = true;
+            break;
+        }
+    }
+}
+
 std::string Qwen2Client::genResponse(const std::string& rolePrompt, const std::string& prompts)
 {
     std::vector<ChatMessage> messages;
@@ -1442,6 +1711,7 @@ std::string Qwen2Client::genResponse(const std::string& rolePrompt, const std::s
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
+    analyzePromptFlags(prompts);
     mSentencePosInVocab = mTokenizer->encode_messages(messages, mConfig.responseMaxLen);
     {
         std::unique_lock<std::mutex> syncLock(mTaskMutex);
@@ -1467,58 +1737,243 @@ std::string Qwen2Client::genResponse(const std::string& rolePrompt, const std::s
 
 void Qwen2Client::repetitionPenalty(int32_t idx, uint16_t* logitData, const std::vector<int32_t>& outputIds, float penalty)
 {
-    if (penalty != 1.0f) {
-        // Use sliding window for repetition penalty to avoid penalizing all common grammatical tokens
-        int32_t windowSize = mConfig.repeatWindow > 0 ? mConfig.repeatWindow : 64;
-        size_t startPos = outputIds.size() > (size_t)windowSize ? outputIds.size() - windowSize : 0;
-        std::unordered_set<int> uniqueOutputIds(outputIds.begin() + startPos, outputIds.end());
-
-        int32_t vocabOffset = mConfig.devPrivAttr[idx].vocabOffset;
-        int32_t vocabEnd = vocabOffset + mConfig.vocabSizePerDie;
-
-        for (auto ids : uniqueOutputIds) {
-            // Out of range check: ids must be in [vocabOffset, vocabEnd)
-            if (ids < vocabOffset || ids >= vocabEnd) {
-                continue;
-            }
-
-            int32_t localIdx = ids - vocabOffset;
-            float tmp = half_float::detail::half2float(logitData[localIdx]);
-            if (tmp > 0) {
-                tmp /= penalty;
-            } else {
-                tmp *= penalty;
-            }
-            logitData[localIdx] = half_float::detail::float2half<std::round_to_nearest>(tmp);
-        }
-    }
+    (void)idx;
+    (void)logitData;
+    (void)outputIds;
+    (void)penalty;
 }
 
 void Qwen2Client::repetitionPenalty(int32_t idx, std::vector<TokenIdScore> &tokenScores, const std::vector<int32_t>& outputIds, float penalty)
 {
-    if (penalty != 1.0f) {
-        // Use sliding window for repetition penalty
+    int32_t vocabOffset = mConfig.devPrivAttr[idx].vocabOffset;
+    int32_t vocabEnd = vocabOffset + mConfig.vocabSizePerDie;
+    size_t promptLen = mSentencePosInVocab.size();
+
+    auto maskGlobalToken = [&](int32_t globalId) {
+        if (globalId >= vocabOffset && globalId < vocabEnd) {
+            tokenScores[globalId - vocabOffset].score = -1e9f;
+        }
+    };
+
+    // 1. Apply precomputed vocabulary sanitizer flags (forbidden glitch tokens, CJK/emoji leakage, math/quote symbols)
+    uint8_t disallowMask = TOK_FLAG_FORBIDDEN;
+    if (!mPromptAllowCjk)  disallowMask |= TOK_FLAG_CJK_OR_EMOJI;
+    if (!mPromptAllowMath) disallowMask |= TOK_FLAG_MATH_OR_QUOTE;
+
+    if (mTokenFlags.size() >= (size_t)vocabEnd) {
+        for (int32_t localIdx = 0; localIdx < mConfig.vocabSizePerDie; ++localIdx) {
+            if (mTokenFlags[vocabOffset + localIdx] & disallowMask) {
+                tokenScores[localIdx].score = -1e9f;
+            }
+        }
+    }
+
+    // 2. Enforce strict <think> (151648) and </think> (151649) state transitions
+    size_t genLen = outputIds.size() > promptLen ? (outputIds.size() - promptLen) : 0;
+    bool isFirstGenToken = (genLen == 0);
+    bool sawThinkStart = false;
+    bool sawThinkEnd = false;
+    size_t thinkStartPos = promptLen;
+    for (size_t k = promptLen; k < outputIds.size(); ++k) {
+        if (outputIds[k] == 151648 && !sawThinkStart) {
+            sawThinkStart = true;
+            thinkStartPos = k;
+        }
+        if (outputIds[k] == 151649) {
+            sawThinkEnd = true;
+        }
+    }
+    bool currentlyInThink = (sawThinkStart && !sawThinkEnd);
+
+    // <think> (151648) is ONLY valid as the very first generated token (and only if maxThinkingTokens > 0)
+    if (!isFirstGenToken || mConfig.maxThinkingTokens <= 0) {
+        maskGlobalToken(151648);
+    }
+
+    if (!currentlyInThink) {
+        // Never allow </think> outside an active <think> block
+        maskGlobalToken(151649);
+    } else {
+        // While inside <think>, require closing with </think> before emitting EOS
+        maskGlobalToken(151643);
+        maskGlobalToken(151645);
+        maskGlobalToken(151647);
+
+        size_t thinkingTokensSoFar = outputIds.size() > (thinkStartPos + 1) ? (outputIds.size() - (thinkStartPos + 1)) : 0;
+        if (thinkingTokensSoFar == 0) {
+            // Immediately after <think> (151648), prevent the `<think>\n\n</think>` bypass sequence
+            // by masking "\n\n" (271) and "</think>" (151649) so the model emits "\n" (198) and thinks.
+            maskGlobalToken(271);
+            maskGlobalToken(151649);
+        } else if (mConfig.maxThinkingTokens > 0 && (int32_t)thinkingTokensSoFar < std::min(24, mConfig.maxThinkingTokens)) {
+            // Require at least 24 tokens of chain-of-thought reasoning before allowing </think>
+            maskGlobalToken(151649);
+        }
+    }
+
+    // 3. Frequency-based repetition penalty on content tokens only (never penalize punctuation/markdown/stopwords)
+    if (penalty > 1.0f && genLen > 0) {
         int32_t windowSize = mConfig.repeatWindow > 0 ? mConfig.repeatWindow : 64;
-        size_t startPos = outputIds.size() > (size_t)windowSize ? outputIds.size() - windowSize : 0;
-        std::unordered_set<int> uniqueOutputIds(outputIds.begin() + startPos, outputIds.end());
+        size_t windowStart = outputIds.size() > (size_t)windowSize ? outputIds.size() - windowSize : 0;
+        size_t startPos = std::max(promptLen, windowStart);
 
-        int32_t vocabOffset = mConfig.devPrivAttr[idx].vocabOffset;
-        int32_t vocabEnd = vocabOffset + mConfig.vocabSizePerDie;
+        std::unordered_map<int32_t, int32_t> tokenCounts;
+        for (size_t k = startPos; k < outputIds.size(); ++k) {
+            tokenCounts[outputIds[k]]++;
+        }
 
-        for (auto ids : uniqueOutputIds) {
-            // Out of range check: ids must be in [vocabOffset, vocabEnd)
-            if (ids < vocabOffset || ids >= vocabEnd) {
+        int32_t prevToken = outputIds.back();
+        float stepPenalty = (penalty - 1.0f) * 3.5f; // e.g. 0.35 logit points per extra repeat for penalty=1.10
+
+        for (const auto& kv : tokenCounts) {
+            int32_t id = kv.first;
+            int32_t count = kv.second;
+            if (id < vocabOffset || id >= vocabEnd) continue;
+
+            // Never penalize structural/markdown/punctuation/function-word tokens unless immediately repeating
+            bool isExempt = (id < (int32_t)mTokenFlags.size()) && ((mTokenFlags[id] & TOK_FLAG_EXEMPT_PENALTY) != 0);
+            if (isExempt) {
+                if (id == prevToken && id != 198 && id != 271) {
+                    tokenScores[id - vocabOffset].score -= 1.5f;
+                }
                 continue;
             }
 
-            int32_t localIdx = ids - vocabOffset;
-            float tmp = half_float::detail::half2float(tokenScores[localIdx].score);
-            if (tmp > 0) {
-                tmp /= penalty;
-            } else {
-                tmp *= penalty;
+            // Immediate back-to-back repeat of a content word (e.g. "the the", "I I")
+            if (id == prevToken) {
+                tokenScores[id - vocabOffset].score -= 4.0f;
+            } else if (count >= 2) {
+                // Gentle additive frequency penalty starting from 2nd occurrence in window
+                tokenScores[id - vocabOffset].score -= stepPenalty * static_cast<float>(count - 1);
             }
-            tokenScores[localIdx].score = half_float::detail::float2half<std::round_to_nearest>(tmp);
+        }
+    }
+
+    // 4. Per-line Markdown `**` pairing & comma-splice run-on guard
+    if (genLen > 0) {
+        size_t lineStart = promptLen;
+        size_t sentenceStart = promptLen;
+        for (size_t k = promptLen; k < outputIds.size(); ++k) {
+            int32_t id = outputIds[k];
+            if (id == 151648 || id == 151649) {
+                lineStart = k + 1;
+                sentenceStart = k + 1;
+                continue;
+            }
+            if (id >= 0 && id < (int32_t)mTokenFlags.size()) {
+                uint8_t flags = mTokenFlags[id];
+                if (flags & TOK_FLAG_HAS_NEWLINE) {
+                    lineStart = k + 1;
+                    sentenceStart = k + 1;
+                } else if (flags & TOK_FLAG_SENTENCE_END) {
+                    sentenceStart = k + 1;
+                }
+            }
+        }
+
+        int32_t boldCountOnLine = 0;
+        int32_t openParenCountOnLine = 0;
+        int32_t closeParenCountOnLine = 0;
+        for (size_t k = lineStart; k < outputIds.size(); ++k) {
+            int32_t id = outputIds[k];
+            if (id >= 0 && id < (int32_t)mTokenFlags.size() && (mTokenFlags[id] & TOK_FLAG_HAS_BOLD)) {
+                boldCountOnLine++;
+            }
+            if (id == 7 || id == 320) { // "(" or " ("
+                openParenCountOnLine++;
+            }
+            if (id == 8 || id == 568 || id == 701 || id == 2590) { // ")", ").", "),", "):\n"
+                closeParenCountOnLine++;
+            }
+        }
+
+        int32_t prevToken = outputIds.back();
+        if (currentlyInThink || prevToken == 11) {
+            // Never emit markdown bold `**` inside <think> or immediately after a comma `,` (#11 -> `,**` glitch)
+            for (int32_t bId : mBoldTokens) {
+                maskGlobalToken(bId);
+            }
+        } else if (boldCountOnLine == 0) {
+            // No bold span is open on this line: disallow closing-only bold tokens (`:**`, `**\n`, `**:`)
+            for (int32_t bId : mClosingBoldTokens) {
+                maskGlobalToken(bId);
+            }
+            // Only allow opening a bold span at the beginning of a line (bullet/numbered header, <= 3 tokens from lineStart)
+            if (outputIds.size() - lineStart > 3) {
+                for (int32_t bId : mBoldTokens) {
+                    maskGlobalToken(bId);
+                }
+            }
+        } else if (boldCountOnLine >= 2) {
+            // A bold header (e.g. `- **Behavior**:`) has already opened and closed on this line;
+            // mask further `**` tokens until the next newline to prevent self-attention bold contagion
+            for (int32_t bId : mBoldTokens) {
+                maskGlobalToken(bId);
+            }
+        }
+
+        // Prevent parenthetical citation contagion (`(?,`, `([`) in prose mode:
+        // Allow at most 1 parenthetical per line, and never immediately after `(`
+        if (!mPromptAllowMath && (openParenCountOnLine >= 1 || prevToken == 7 || prevToken == 320)) {
+            for (int32_t pId : mOpenParenTokens) {
+                maskGlobalToken(pId);
+            }
+        }
+        // Disallow unmatched closing parenthesis `)` when no `(` is currently open on this line
+        if (!mPromptAllowMath && openParenCountOnLine <= closeParenCountOnLine) {
+            for (int32_t cId : mCloseParenTokens) {
+                maskGlobalToken(cId);
+            }
+        }
+        // Immediately after `(` or ` (`, never allow `?`, `:`, `,`, `.`, `;`, `!`
+        if (prevToken == 7 || prevToken == 320) {
+            maskGlobalToken(30);  // "?"
+            maskGlobalToken(949); // " ?"
+            maskGlobalToken(25);  // ":"
+            maskGlobalToken(11);  // ","
+            maskGlobalToken(13);  // "."
+            maskGlobalToken(26);  // ";"
+            maskGlobalToken(0);   // "!"
+        }
+
+        // Prevent endless comma-splice run-on sentences (where the model chains 20+ clauses with `,`)
+        int32_t commasInSentence = 0;
+        for (size_t k = sentenceStart; k < outputIds.size(); ++k) {
+            if (outputIds[k] == 11) {
+                commasInSentence++;
+            }
+        }
+        if (commasInSentence >= 3 && 11 >= vocabOffset && 11 < vocabEnd) {
+            if (commasInSentence >= 6) {
+                maskGlobalToken(11);
+            } else {
+                tokenScores[11 - vocabOffset].score -= 2.5f * static_cast<float>(commasInSentence - 2);
+            }
+        }
+    }
+
+    // 5. Proactive anti-stutter & cyclic n-gram loop suppression on generated tokens
+    if (genLen >= 2) {
+        int32_t last1 = outputIds.back();
+        int32_t last2 = outputIds[outputIds.size() - 2];
+        if (last1 == last2) {
+            maskGlobalToken(last1);
+        }
+    }
+    for (size_t period = 2; period <= 12; ++period) {
+        if (genLen >= 2 * period) {
+            bool repeating = true;
+            size_t base = outputIds.size() - period;
+            for (size_t p = 0; p < period; ++p) {
+                if (outputIds[base - period + p] != outputIds[base + p]) {
+                    repeating = false;
+                    break;
+                }
+            }
+            if (repeating) {
+                // Demote the token that would start the 3rd consecutive repeat of this cycle
+                maskGlobalToken(outputIds[base]);
+            }
         }
     }
 }
@@ -1526,12 +1981,15 @@ void Qwen2Client::repetitionPenalty(int32_t idx, std::vector<TokenIdScore> &toke
 void Qwen2Client::selectTopK(std::vector<TokenIdScore> &tokenScores, int32_t topK, int32_t numTokens)
 {
     if (numTokens > topK) {
-        std::nth_element(tokenScores.data(), tokenScores.data() + topK, tokenScores.data() + numTokens, std::greater<TokenIdScore>());
+        std::partial_sort(tokenScores.data(), tokenScores.data() + topK, tokenScores.data() + numTokens, std::greater<TokenIdScore>());
+    } else {
+        std::sort(tokenScores.data(), tokenScores.data() + numTokens, std::greater<TokenIdScore>());
     }
 }
 
 void Qwen2Client::softmaxInPlace(std::vector<TokenIdScore> &tokenScores, int32_t numTokens)
 {
+    if (numTokens <= 0) return;
     float maxScore = std::max_element(tokenScores.data(), tokenScores.data() + numTokens)->score;
     float sum = 0.f;
     for (int32_t i = 0; i < numTokens; i++) {
@@ -1539,33 +1997,23 @@ void Qwen2Client::softmaxInPlace(std::vector<TokenIdScore> &tokenScores, int32_t
         tokenScores[i].score = s;
         sum += s;
     }
-    float invSum = 1.f / sum;
-    for (int32_t i = 0; i < numTokens; i++) {
-        tokenScores[i].score *= invSum;
+    if (sum > 0.f) {
+        float invSum = 1.f / sum;
+        for (int32_t i = 0; i < numTokens; i++) {
+            tokenScores[i].score *= invSum;
+        }
     }
 }
 
 int32_t Qwen2Client::samplingTopP(std::vector<TokenIdScore> &tokenScores, float topP, int32_t numTokens)
 {
-    TokenIdScore *first = tokenScores.data();
-    TokenIdScore *last = tokenScores.data() + numTokens;
-    while (first + 1 < last) {
-        float pivotScore = (last - 1)->score;
-        TokenIdScore *mid =
-            std::partition(first, last - 1, [pivotScore](const TokenIdScore &x) { return x.score > pivotScore; });
-        std::swap(*mid, *(last - 1));
-
-        float prefixSum =
-            std::accumulate(first, mid, 0.f, [](float sum, const TokenIdScore &x) { return sum + x.score; });
-        if (prefixSum >= topP) {
-            last = mid;
-        } else if (prefixSum + mid->score < topP) {
-            first = mid + 1;
-            topP -= prefixSum + mid->score;
-        } else {
-            return mid + 1 - first;
+    // tokenScores[0 .. numTokens-1] is already sorted in descending order by selectTopK
+    float cumSum = 0.0f;
+    for (int32_t i = 0; i < numTokens; i++) {
+        cumSum += tokenScores[i].score;
+        if (cumSum >= topP) {
+            return i + 1;
         }
     }
-
-    return last - first;
+    return numTokens;
 }

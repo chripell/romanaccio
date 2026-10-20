@@ -71,6 +71,7 @@ struct GenerationContext {
     bool show_tokens = false;
     int  max_thinking_tokens = 128;
     bool in_thinking = false;
+    bool thinking_done = false;
     int  thinking_count = 0;
     int  total_count = 0;
     bool thinking_limit_reached = false;
@@ -86,7 +87,9 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
     std::string str = piece ? piece : "";
 
     // Detect thinking tags (Qwen2 / DeepSeek-R1: 151648 = <think>, 151649 = </think>)
-    bool is_think_start = (token == 151648 || str == "<think>" || str.find("<think>") != std::string::npos);
+    // Only allow entering <think> once at the start of the response
+    bool is_think_start = (!ctx->thinking_done && !ctx->in_thinking &&
+                           (token == 151648 || str == "<think>" || str.find("<think>") != std::string::npos));
     bool is_think_end   = (token == 151649 || str == "</think>" || str.find("</think>") != std::string::npos);
 
     if (is_think_start) {
@@ -107,6 +110,7 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
     if (is_think_end) {
         if (ctx->in_thinking) {
             ctx->in_thinking = false;
+            ctx->thinking_done = true;
             if (ctx->show_thinking) {
                 std::cout << COLOR_GRAY << "]\n\n" << COLOR_RESET << std::flush;
             } else {
@@ -124,6 +128,7 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
         if (ctx->max_thinking_tokens > 0 && ctx->thinking_count >= ctx->max_thinking_tokens && !ctx->thinking_limit_reached) {
             ctx->thinking_limit_reached = true;
             ctx->in_thinking = false;
+            ctx->thinking_done = true;
             if (ctx->show_thinking) {
                 std::cout << COLOR_YELLOW << "\n[Thinking limit of " << ctx->max_thinking_tokens
                           << " tokens reached, concluding reasoning]\n\n" << COLOR_RESET << std::flush;
@@ -150,6 +155,8 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
         }
         return true;
     }
+
+    ctx->thinking_done = true;
 
     // Normal generation outside thinking mode
     if (ctx->show_tokens) {
@@ -564,6 +571,7 @@ int main(int argc, char *argv[]) {
         g_interrupt_flag.store(false);
         g_in_generation.store(true);
         gen_ctx.in_thinking = false;
+        gen_ctx.thinking_done = false;
         gen_ctx.thinking_count = 0;
         gen_ctx.total_count = 0;
         gen_ctx.thinking_limit_reached = false;

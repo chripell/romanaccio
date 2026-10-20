@@ -185,6 +185,8 @@ class Qwen2Client
     // Model loading and initialization
     ES_S32 loadConfig(const std::string& configPath);
     ES_S32 loadEmbedding();
+    void initTokenFlags();
+    void analyzePromptFlags(const std::string& prompt);
     ES_S32 prepareTensorBuffer(NPU_TENSOR_S &tensor, ES_DEV_BUF_S &devBuf, void **pAddr, uint16_t devId, bool cache);
     ES_S32 prepareKVCacheBuffers(uint32_t modelId, MODEL_TASK_S &modelTask, uint16_t devId);
     prob_data_t getTopK(int32_t idx, int32_t wordPosInVocab, const int32_t& maskVal, const std::vector<int32_t>& outputIds);
@@ -221,6 +223,14 @@ class Qwen2Client
     // token mask for all device.
     std::vector<std::shared_ptr<std::atomic<int32_t>>> mTokenMask;
     std::vector<std::vector<TokenIdScore>> mTokenScores;
+    std::vector<uint8_t> mTokenFlags;
+    std::vector<int32_t> mBoldTokens;
+    std::vector<int32_t> mClosingBoldTokens;
+    std::vector<int32_t> mNoSpaceBoldTokens;
+    std::vector<int32_t> mOpenParenTokens;
+    std::vector<int32_t> mCloseParenTokens;
+    bool mPromptAllowCjk = false;
+    bool mPromptAllowMath = false;
 
     // sync for post process
     std::mutex mPostSyncMutex;
