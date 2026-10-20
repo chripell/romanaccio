@@ -4,14 +4,15 @@ CROSS_COMPILE ?=
 CXX            = $(CROSS_COMPILE)g++
 CC             = $(CROSS_COMPILE)gcc
 
-CXXFLAGS      += -std=c++17 -O2 -Wall -Wextra -fPIC -pthread -Iinclude
-LDFLAGS       += -ldl -pthread
+CXXFLAGS      += -std=c++17 -O3 -fopenmp -Wall -Wextra -fPIC -pthread -Iinclude
+LDFLAGS       += -fopenmp -ldl -pthread
 
 BUILD_DIR      = build
 SRC_DIR        = src
 TEST_DIR       = tests
 
 SRCS           = $(SRC_DIR)/backend/driver_wrapper.cpp \
+                 $(SRC_DIR)/backend/dsp_driver.cpp \
                  $(SRC_DIR)/backend/dma_buffer.cpp \
                  $(SRC_DIR)/backend/worker_pool.cpp \
                  $(SRC_DIR)/model/sha256.cpp \

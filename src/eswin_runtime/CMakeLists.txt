@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(eswin_runtime VERSION 0.1.0 LANGUAGES C CXX)
 
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -29,6 +33,7 @@ add_library(es_runtime SHARED ${RUNTIME_SOURCES})
 target_link_libraries(es_runtime PRIVATE ${CMAKE_DL_LIBS} pthread)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(es_runtime PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_options(es_runtime PRIVATE ${OpenMP_CXX_FLAGS})
 endif()
 target_include_directories(es_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

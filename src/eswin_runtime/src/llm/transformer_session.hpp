@@ -97,6 +97,7 @@ private:
     std::vector<float>             m_v_buf;
     std::vector<float>             m_att_out_buf;
     std::vector<float>             m_mlp_act_buf;
+    std::vector<float>             m_scores_buf;
 
     // Fast contiguous KV cache for transformer layers
     std::vector<float>             m_k_cache_flat;

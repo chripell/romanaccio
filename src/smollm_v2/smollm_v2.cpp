@@ -189,6 +189,7 @@ int main(int argc, char *argv[]) {
     float repeat_penalty = 1.15f;
     int32_t max_tokens = 512;
     es_device_mode_t dev_mode = ES_DEVICE_DUAL_DIE_AUTO;
+    bool use_chatml = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -208,6 +209,8 @@ int main(int argc, char *argv[]) {
             if (++i < argc) max_tokens = std::stoi(argv[i]);
         } else if (arg == "--single-die") {
             dev_mode = ES_DEVICE_DIE0;
+        } else if (arg == "--chatml") {
+            use_chatml = true;
         } else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]\n\n"
                       << "Options:\n"
@@ -219,6 +222,7 @@ int main(int argc, char *argv[]) {
                       << "  --repeat-penalty <float>  Repetition penalty (default: 1.15)\n"
                       << "  --max-tokens <int>        Max tokens per turn (default: 512)\n"
                       << "  --single-die              Run on single die (Die 0)\n"
+                      << "  --chatml                  Format prompts with ChatML tags (<|im_start|>...)\n"
                       << "  -h, --help                Show this help\n";
             return 0;
         }
@@ -307,7 +311,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        std::string prompt = format_chatml(line);
+        std::string prompt = use_chatml ? format_chatml(line) : line;
 
         std::cout << COLOR_CYAN << COLOR_BOLD << "SmolLM > " << COLOR_RESET;
 

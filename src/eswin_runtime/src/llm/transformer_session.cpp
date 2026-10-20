@@ -5,7 +5,43 @@
 #include <iostream>
 #include <fstream>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace eswin {
+
+// -----------------------------------------------------------------------------
+// Portable Half-Precision Types
+// -----------------------------------------------------------------------------
+#if defined(__riscv) || defined(__riscv__) || defined(__FLT16_MANT_DIG__)
+typedef _Float16 es_fp16_t;
+static inline es_fp16_t f32_to_f16(float f) { return static_cast<es_fp16_t>(f); }
+static inline float f16_to_f32(es_fp16_t h) { return static_cast<float>(h); }
+#else
+typedef uint16_t es_fp16_t;
+static inline es_fp16_t f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = (x >> 13) & 0x3ff;
+    if (exp <= 0) return static_cast<es_fp16_t>(sign);
+    if (exp >= 31) return static_cast<es_fp16_t>(sign | 0x7c00);
+    return static_cast<es_fp16_t>(sign | (exp << 10) | mant);
+}
+static inline float f16_to_f32(es_fp16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    int32_t exp = (h >> 10) & 0x1f;
+    uint32_t mant = (h & 0x3ff) << 13;
+    if (exp == 0) return 0.0f;
+    exp = exp - 15 + 127;
+    uint32_t x = sign | (exp << 23) | mant;
+    float f;
+    std::memcpy(&f, &x, sizeof(f));
+    return f;
+}
+#endif
 
 TransformerSession::TransformerSession() = default;
 
@@ -32,10 +68,16 @@ bool TransformerSession::init(
         const auto *tok_desc = manifest.find_file_by_role("tokenizer");
         if (tok_desc && !tok_desc->name.empty() && std::ifstream(model_dir + "/" + tok_desc->name).good()) {
             tok_file = model_dir + "/" + tok_desc->name;
+        } else if (std::ifstream(model_dir + "/tokenizer.bin").good()) {
+            tok_file = model_dir + "/tokenizer.bin";
         } else if (std::ifstream(model_dir + "/tokenizer.json").good()) {
             tok_file = model_dir + "/tokenizer.json";
         } else if (std::ifstream(model_dir + "/qwen.tiktoken").good()) {
             tok_file = model_dir + "/qwen.tiktoken";
+        } else if (std::ifstream("./tokenizer.bin").good()) {
+            tok_file = "./tokenizer.bin";
+        } else if (std::ifstream("./tokenizer.json").good()) {
+            tok_file = "./tokenizer.json";
         } else if (std::ifstream("./qwen.tiktoken").good()) {
             tok_file = "./qwen.tiktoken";
         }
@@ -75,8 +117,8 @@ bool TransformerSession::init(
                 m_model_d0 = info0.model_id;
                 m_model_d1 = info1.model_id;
 
-                size_t in_bytes = manifest.config.hidden_size * sizeof(float);
-                size_t out_bytes = (manifest.config.vocab_size / 2) * sizeof(float);
+                size_t in_bytes = manifest.config.hidden_size * sizeof(es_fp16_t);
+                size_t out_bytes = (manifest.config.vocab_size / 2) * sizeof(es_fp16_t);
 
                 m_d0_in = std::make_unique<DmaBuffer>(in_bytes, CacheMode::NoCache, "mmz_nid_0_part_0");
                 m_d0_out = std::make_unique<DmaBuffer>(out_bytes, CacheMode::NoCache, "mmz_nid_0_part_0");
@@ -119,10 +161,25 @@ bool TransformerSession::init(
         size_t embed_elems = static_cast<size_t>(manifest.config.vocab_size) * manifest.config.hidden_size;
         m_embed.assign(embed_elems, 0.01f);
         m_lm_head_weights.assign(embed_elems, 0.01f);
+        m_scores_buf.assign(static_cast<size_t>(manifest.config.num_attention_heads) * m_max_seq, 0.0f);
     }
 
     reset();
     return true;
+}
+
+static std::vector<float> transpose_weight_matrix(const std::vector<float> &src, int n_matrices, int rows, int cols) {
+    std::vector<float> dst(src.size());
+    for (int m = 0; m < n_matrices; ++m) {
+        const float *src_m = src.data() + m * rows * cols;
+        float *dst_m = dst.data() + m * cols * rows;
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                dst_m[c * rows + r] = src_m[r * cols + c];
+            }
+        }
+    }
+    return dst;
 }
 
 bool TransformerSession::load_weights(const std::string &bin_path) {
@@ -177,6 +234,16 @@ bool TransformerSession::load_weights(const std::string &bin_path) {
 
     if (!f) return false;
 
+    // Transpose all weight matrices for contiguous row-major SIMD inner products
+    int kv_dim = n_kv_heads * head_dim;
+    m_wq = transpose_weight_matrix(m_wq, n_layers, dim, dim);
+    m_wk = transpose_weight_matrix(m_wk, n_layers, dim, kv_dim);
+    m_wv = transpose_weight_matrix(m_wv, n_layers, dim, kv_dim);
+    m_wo = transpose_weight_matrix(m_wo, n_layers, dim, dim);
+    m_w_gate = transpose_weight_matrix(m_w_gate, n_layers, dim, hidden_dim);
+    m_w_up = transpose_weight_matrix(m_w_up, n_layers, dim, hidden_dim);
+    m_w_down = transpose_weight_matrix(m_w_down, n_layers, hidden_dim, dim);
+
     m_max_seq = seq_len > 0 ? seq_len : 2048;
     size_t kv_size = static_cast<size_t>(n_layers) * m_max_seq * (n_kv_heads * head_dim);
     m_k_cache_flat.assign(kv_size, 0.0f);
@@ -191,6 +258,7 @@ bool TransformerSession::load_weights(const std::string &bin_path) {
     m_mlp_act_buf.resize(hidden_dim);
     m_hidden_state.resize(dim);
     m_logits.resize(vocab_size);
+    m_scores_buf.assign(static_cast<size_t>(n_heads) * m_max_seq, 0.0f);
 
     m_has_weights = true;
     return true;
@@ -252,34 +320,63 @@ void TransformerSession::reset() {
 
 void TransformerSession::forward_lm_head_dual_die(const float *hidden_state, float *out_logits) {
     size_t half_vocab = m_manifest.config.vocab_size / 2;
+    size_t hidden_size = m_manifest.config.hidden_size;
 
     if (m_npu_dual_die && m_worker_pool) {
-        // Copy hidden state to both die inputs
-        size_t in_bytes = m_manifest.config.hidden_size * sizeof(float);
-        std::memcpy(m_d0_in->data(), hidden_state, in_bytes);
-        std::memcpy(m_d1_in->data(), hidden_state, in_bytes);
+        // Convert input hidden state (FP32) to FP16 for hardware NPU inputs
+        es_fp16_t *d0_in = reinterpret_cast<es_fp16_t*>(m_d0_in->data());
+        es_fp16_t *d1_in = reinterpret_cast<es_fp16_t*>(m_d1_in->data());
+        for (size_t i = 0; i < hidden_size; ++i) {
+            es_fp16_t val = f32_to_f16(hidden_state[i]);
+            d0_in[i] = val;
+            d1_in[i] = val;
+        }
 
-        // Submit tasks in parallel
+        // Submit tasks in parallel across both NPU dies
         std::vector<DmaBuffer*> in0 = { m_d0_in.get() };
         std::vector<DmaBuffer*> out0 = { m_d0_out.get() };
         std::vector<DmaBuffer*> in1 = { m_d1_in.get() };
         std::vector<DmaBuffer*> out1 = { m_d1_out.get() };
 
+#if defined(_OPENMP)
+        #pragma omp parallel sections
+        {
+            #pragma omp section
+            {
+                m_worker_pool->submit_task(0, m_model_d0, in0, out0);
+            }
+            #pragma omp section
+            {
+                m_worker_pool->submit_task(1, m_model_d1, in1, out1);
+            }
+        }
+#else
         m_worker_pool->submit_task(0, m_model_d0, in0, out0);
         m_worker_pool->submit_task(1, m_model_d1, in1, out1);
+#endif
 
-        // Gather logits
-        size_t out_bytes = half_vocab * sizeof(float);
-        std::memcpy(out_logits, m_d0_out->data(), out_bytes);
-        std::memcpy(out_logits + half_vocab, m_d1_out->data(), out_bytes);
+        // Convert output logits from FP16 to FP32 float
+        const es_fp16_t *d0_out = reinterpret_cast<const es_fp16_t*>(m_d0_out->data());
+        const es_fp16_t *d1_out = reinterpret_cast<const es_fp16_t*>(m_d1_out->data());
+
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (size_t i = 0; i < half_vocab; ++i) {
+            out_logits[i] = f16_to_f32(d0_out[i]);
+            out_logits[half_vocab + i] = f16_to_f32(d1_out[i]);
+        }
     } else {
-        // Host fallback matrix multiplication: logits = hidden_state @ lm_head.T
-        uint32_t hidden_size = m_manifest.config.hidden_size;
+        // Host fallback matrix multiplication: logits = hidden_state @ lm_head.T (tied embeddings)
         uint32_t vocab_size = m_manifest.config.vocab_size;
+        const float *weights = m_lm_head_weights.empty() ? m_embed.data() : m_lm_head_weights.data();
 
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
         for (uint32_t v = 0; v < vocab_size; ++v) {
             float sum = 0.0f;
-            const float *w_row = m_lm_head_weights.data() + static_cast<size_t>(v) * hidden_size;
+            const float *w_row = weights + static_cast<size_t>(v) * hidden_size;
             for (uint32_t d = 0; d < hidden_size; ++d) {
                 sum += hidden_state[d] * w_row[d];
             }
@@ -312,27 +409,30 @@ int32_t TransformerSession::step(int32_t token_id, int pos) {
             // Attention RMSNorm
             rmsnorm(m_x_norm_buf.data(), m_x_buf.data(), m_rms_att.data() + static_cast<size_t>(L) * dim, dim);
 
-            // Q, K, V matrix projections
+            // Q, K, V matrix projections: y = x @ W (using transposed row-major weights)
             const float *wq_l = m_wq.data() + static_cast<size_t>(L) * dim * dim;
-            const float *wk_l = m_wk.data() + static_cast<size_t>(L) * dim * kv_dim;
-            const float *wv_l = m_wv.data() + static_cast<size_t>(L) * dim * kv_dim;
+            const float *wk_l = m_wk.data() + static_cast<size_t>(L) * kv_dim * dim;
+            const float *wv_l = m_wv.data() + static_cast<size_t>(L) * kv_dim * dim;
 
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < dim; ++i) {
+                const float *w_row = wq_l + i * dim;
                 float sum = 0.0f;
                 for (int j = 0; j < dim; ++j) {
-                    sum += m_x_norm_buf[j] * wq_l[j * dim + i];
+                    sum += m_x_norm_buf[j] * w_row[j];
                 }
                 m_q_buf[i] = sum;
             }
 
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < kv_dim; ++i) {
+                const float *wk_row = wk_l + i * dim;
+                const float *wv_row = wv_l + i * dim;
                 float sum_k = 0.0f;
                 float sum_v = 0.0f;
                 for (int j = 0; j < dim; ++j) {
-                    sum_k += m_x_norm_buf[j] * wk_l[j * kv_dim + i];
-                    sum_v += m_x_norm_buf[j] * wv_l[j * kv_dim + i];
+                    sum_k += m_x_norm_buf[j] * wk_row[j];
+                    sum_v += m_x_norm_buf[j] * wv_row[j];
                 }
                 m_k_buf[i] = sum_k;
                 m_v_buf[i] = sum_v;
@@ -351,13 +451,13 @@ int32_t TransformerSession::step(int32_t token_id, int pos) {
             std::fill(m_att_out_buf.begin(), m_att_out_buf.end(), 0.0f);
             int group_ratio = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
 
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (int h = 0; h < n_heads; ++h) {
                 int kv_h = h / group_ratio;
                 const float *q_head = m_q_buf.data() + h * head_dim;
                 float *out_head = m_att_out_buf.data() + h * head_dim;
 
-                std::vector<float> scores(pos + 1);
+                float *scores = m_scores_buf.data() + h * m_max_seq;
                 float max_s = -1e9f;
                 for (int t = 0; t <= pos; ++t) {
                     const float *k_head = m_k_cache_flat.data() + (static_cast<size_t>(L) * m_max_seq + t) * kv_dim + kv_h * head_dim;
@@ -385,13 +485,14 @@ int32_t TransformerSession::step(int32_t token_id, int pos) {
                 }
             }
 
-            // Output projection + residual
+            // Output projection + residual: x += att_out @ wo
             const float *wo_l = m_wo.data() + static_cast<size_t>(L) * dim * dim;
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < dim; ++i) {
+                const float *wo_row = wo_l + i * dim;
                 float sum = 0.0f;
                 for (int j = 0; j < dim; ++j) {
-                    sum += m_att_out_buf[j] * wo_l[j * dim + i];
+                    sum += m_att_out_buf[j] * wo_row[j];
                 }
                 m_x_buf[i] += sum;
             }
@@ -400,28 +501,31 @@ int32_t TransformerSession::step(int32_t token_id, int pos) {
             rmsnorm(m_x_norm_buf.data(), m_x_buf.data(), m_rms_ffn.data() + static_cast<size_t>(L) * dim, dim);
 
             // SwiGLU MLP: DownProj(SiLU(Gate) * Up)
-            const float *w_gate_l = m_w_gate.data() + static_cast<size_t>(L) * dim * hidden_dim;
-            const float *w_up_l = m_w_up.data() + static_cast<size_t>(L) * dim * hidden_dim;
-            const float *w_down_l = m_w_down.data() + static_cast<size_t>(L) * hidden_dim * dim;
+            const float *w_gate_l = m_w_gate.data() + static_cast<size_t>(L) * hidden_dim * dim;
+            const float *w_up_l = m_w_up.data() + static_cast<size_t>(L) * hidden_dim * dim;
+            const float *w_down_l = m_w_down.data() + static_cast<size_t>(L) * dim * hidden_dim;
 
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < hidden_dim; ++i) {
+                const float *wg_row = w_gate_l + i * dim;
+                const float *wu_row = w_up_l + i * dim;
                 float g = 0.0f;
                 float u = 0.0f;
                 for (int j = 0; j < dim; ++j) {
-                    g += m_x_norm_buf[j] * w_gate_l[j * hidden_dim + i];
-                    u += m_x_norm_buf[j] * w_up_l[j * hidden_dim + i];
+                    g += m_x_norm_buf[j] * wg_row[j];
+                    u += m_x_norm_buf[j] * wu_row[j];
                 }
                 float silu = g / (1.0f + std::exp(-g));
                 m_mlp_act_buf[i] = silu * u;
             }
 
-            // Down projection + residual
-            #pragma omp parallel for
+            // Down projection + residual: x += mlp_act @ w_down
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < dim; ++i) {
+                const float *wd_row = w_down_l + i * hidden_dim;
                 float sum = 0.0f;
                 for (int j = 0; j < hidden_dim; ++j) {
-                    sum += m_mlp_act_buf[j] * w_down_l[j * dim + i];
+                    sum += m_mlp_act_buf[j] * wd_row[j];
                 }
                 m_x_buf[i] += sum;
             }

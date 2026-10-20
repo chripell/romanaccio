@@ -30,6 +30,68 @@ static std::string base64_decode(const std::string &in) {
     return out;
 }
 
+static std::string decode_gpt2_bytes(const std::string &piece) {
+    if (piece.size() >= 3 && piece.front() == '<' && piece.back() == '>') {
+        return piece;
+    }
+
+    static const std::unordered_map<std::string, uint8_t> gpt2_map = []() {
+        std::vector<int> bs;
+        for (int b = '!'; b <= '~'; ++b) bs.push_back(b);
+        for (int b = 161; b <= 172; ++b) bs.push_back(b);
+        for (int b = 174; b <= 255; ++b) bs.push_back(b);
+
+        std::vector<int> cs = bs;
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+                bs.push_back(b);
+                cs.push_back(256 + n);
+                n++;
+            }
+        }
+
+        std::unordered_map<std::string, uint8_t> m;
+        for (size_t i = 0; i < bs.size(); ++i) {
+            int c = cs[i];
+            std::string utf8;
+            if (c < 128) {
+                utf8 += static_cast<char>(c);
+            } else {
+                utf8 += static_cast<char>(0xC0 | (c >> 6));
+                utf8 += static_cast<char>(0x80 | (c & 0x3F));
+            }
+            m[utf8] = static_cast<uint8_t>(bs[i]);
+        }
+        return m;
+    }();
+
+    std::string decoded;
+    decoded.reserve(piece.size());
+    size_t i = 0;
+    while (i < piece.size()) {
+        if (i + 1 < piece.size()) {
+            std::string two = piece.substr(i, 2);
+            auto it2 = gpt2_map.find(two);
+            if (it2 != gpt2_map.end()) {
+                decoded.push_back(static_cast<char>(it2->second));
+                i += 2;
+                continue;
+            }
+        }
+        std::string one = piece.substr(i, 1);
+        auto it1 = gpt2_map.find(one);
+        if (it1 != gpt2_map.end()) {
+            decoded.push_back(static_cast<char>(it1->second));
+            i += 1;
+        } else {
+            decoded.push_back(piece[i]);
+            i += 1;
+        }
+    }
+    return decoded;
+}
+
 void Tokenizer::add_token(int32_t id, const std::string &piece) {
     if (id < 0) return;
     if (static_cast<size_t>(id) >= m_id_to_piece.size()) {
@@ -58,7 +120,7 @@ bool Tokenizer::load_json(const std::string &json_str, std::string &err) {
         if (model.has("vocab") && model["vocab"].is_object()) {
             for (const auto &pair : model["vocab"].as_object()) {
                 int32_t id = pair.second.as_int(-1);
-                if (id >= 0) add_token(id, pair.first);
+                if (id >= 0) add_token(id, decode_gpt2_bytes(pair.first));
             }
         }
     }
