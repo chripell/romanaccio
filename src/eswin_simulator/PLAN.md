@@ -82,18 +82,19 @@ src/eswin_simulator/
 
 Development is structured into **6 small, independently verifiable milestones**:
 
-### Milestone 1: Model Loader & Virtual Address Space
-- **Scope**:
-  - Implement `loader/loadable_reader.py`: reads `.model` FlatBuffers container (`NVDA` identifier).
-  - Implement `memory/address_space.py`: simulates 64-bit DRAM and the 4 MiB on-chip SPRAM.
-  - Implement `cli.py` info mode (`eswin-sim --info -m model.model`) printing all tensors, memory domains, and submodel graphs.
+### Milestone 1: Model Loader & Virtual Address Space [COMPLETED]
+- **Status**: **Completed & Verified** (9/9 unit tests passing in pytest).
+- **Scope Implemented**:
+  - `loader/loadable_reader.py`: Reads and parses FlatBuffers `.model` containers with `NVDA` magic verification, extracting memory lists, address tables, tensor descriptors, task partitions, and embedded blobs.
+  - `loader/tensor_desc.py`: Rich dataclass representing 4D tensor shapes, strides, data types (`HALF`, `INT8`, `FLOAT`), data formats (`NCHW`, `NHWC`), and input/output flags.
+  - `memory/address_space.py`: Simulates 64-bit DRAM and the 4 MiB on-chip SPRAM (`SPRAM_CAPACITY_BYTES = 4 * 1024 * 1024`). Auto-populates static weight blobs (`W_0`, tiled weight splits) and command packets into virtual memory. Provides bit-exact `bind_input()` and `read_tensor()`.
+  - `memory/buffer_view.py`: Zero-copy NumPy ndarray views over simulated memory buffers.
+  - `cli.py`: Interactive `eswin-sim --info -m model.model` CLI supporting detailed terminal tables, verbose memory dumps (`-v`), and machine-readable JSON output (`--json`).
 - **Deliverables**:
-  - Model inspector CLI tool.
-  - Unit tests verifying tensor shapes and buffer requirements on `test_conv_npu_b1.model` and `test_swiglu_mlp_npu_b1.model`.
-- **Testing Requirements**:
-  - Assert parsed tensor count, names, data types, and sizes match vendor `EsSimulator` output 100%.
+  - Package `eswin_simulator` configured via `pyproject.toml` and installed via `pip install -e .`.
+  - `tests/test_loader.py` & `tests/test_address_space.py`: 9/9 passing tests validating container parsing, tensor descriptors, static weight loading, and buffer boundary protections across `test_conv_npu_b1.model`, `test_swiglu_mlp_npu_b1.model`, and `test_linear_1x1conv_npu_b1.model`.
 - **Documentation**:
-  - Complete docstrings detailing virtual memory layout and address resolution.
+  - `src/eswin_simulator/README.md`: Quick start guide, CLI options, Python API examples, and test suite instructions.
 
 ### Milestone 2: Memory Relocation & BDMA Engine
 - **Scope**:

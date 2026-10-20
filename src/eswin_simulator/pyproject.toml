@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eswin_simulator"
+version = "0.1.0"
+description = "Open-Source Cross-Platform Functional Simulator for ESWIN EIC7700X NPU/DSP Loadables"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flatbuffers>=2.0.0",
+    "numpy>=1.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+eswin-sim = "eswin_simulator.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

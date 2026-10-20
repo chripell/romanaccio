@@ -1,0 +1,207 @@
+// loadable.fbs - ESWIN NPU Loadable Model Schema
+// FlatBuffers schema for EIC7700X NPU compiled models (.model)
+namespace eswin.loadable;
+
+enum Interface : uint {
+    NONE = 0,
+    UMD = 1,
+    KMD = 2
+}
+
+enum MemoryDomain : ubyte {
+    SYSTEM = 0,
+    SRAM = 1
+}
+
+enum MemoryFlags : ushort {
+    NONE = 0,
+    ALLOC = 1,
+    SET = 2,
+    INPUT = 4,
+    OUTPUT = 8,
+    CACHE = 16,
+    NO_CACHE = 32
+}
+
+enum EventType : ubyte {
+    EVENTTYPE0 = 0,
+    EVENTTYPE1 = 1,
+    EVENTTYPE2 = 2
+}
+
+enum EventOp : ubyte {
+    WAIT = 0,
+    SIGNAL = 1
+}
+
+enum DataFormat : ubyte {
+    UNKNOWN = 0,
+    NCHW = 1,
+    NHWC = 2
+}
+
+enum DataType : ubyte {
+    UNKNOWN = 0,
+    FLOAT = 1,
+    HALF = 2,
+    INT16 = 3,
+    INT8 = 4
+}
+
+enum DataCategory : ubyte {
+    IMAGE = 0,
+    WEIGHT = 1,
+    FEATURE = 2,
+    PLANAR = 3,
+    BIAS = 4
+}
+
+enum PixelMapping : ubyte {
+    PITCH_LINEAR = 0,
+    INVALID_PIXEL_MAP = 1
+}
+
+enum PixelFormat : ubyte {
+    R8 = 0,
+    R10 = 1,
+    R12 = 2,
+    R16 = 3,
+    R16_I = 4,
+    R16_F = 5,
+    A16B16G16R16 = 6,
+    X16B16G16R16 = 7,
+    A16B16G16R16_F = 8,
+    A16Y16U16V16 = 9,
+    V16U16Y16A16 = 10,
+    A16Y16U16V16_F = 11,
+    A8B8G8R8 = 12,
+    A8R8G8B8 = 13,
+    B8G8R8A8 = 14,
+    R8G8B8A8 = 15,
+    X8B8G8R8 = 16,
+    X8R8G8B8 = 17,
+    B8G8R8X8 = 18,
+    R8G8B8X8 = 19,
+    A2B10G10R10 = 20,
+    A2R10G10B10 = 21,
+    B10G10R10A2 = 22,
+    R10G10B10A2 = 23,
+    A2Y10U10V10 = 24,
+    V10U10Y10A2 = 25,
+    A8Y8U8V8 = 26,
+    V8U8Y8A8 = 27,
+    Y8_U8V8_N444 = 28,
+    Y8_V8U8_N444 = 29,
+    Y10_U10V10_N444 = 30,
+    Y10_V10U10_N444 = 31,
+    Y12_U12V12_N444 = 32,
+    Y12_V12U12_N444 = 33,
+    Y16_U16V16_N444 = 34,
+    Y16_V16U16_N444 = 35,
+    FEATURE = 36,
+    FEATURE_X8 = 37
+}
+
+struct Version {
+    major: ubyte;
+    minor: ubyte;
+    sub_minor: ubyte;
+}
+
+table Blob {
+    name: string;
+    size: ulong;
+    interface: Interface = NONE;
+    sub_interface: uint = 0;
+    version: Version;
+    data: [ubyte];
+}
+
+table MemoryListEntry {
+    id: ushort;
+    domain: MemoryDomain = SYSTEM;
+    flags: MemoryFlags = NONE;
+    size: ulong;
+    alignment: uint;
+    contents: [string];
+    offsets: [ulong];
+    bind_id: ushort;
+    tensor_desc_id: ushort;
+}
+
+table EventListEntry {
+    id: ushort;
+    type: EventType = EVENTTYPE0;
+    target: ushort;
+    val: uint;
+    op: EventOp = WAIT;
+}
+
+table SubModelListEntry {
+    id: ushort;
+    kmd_id: short;
+    interface: Interface = NONE;
+    address_list: [ushort];
+}
+
+table AddressListEntry {
+    id: ushort;
+    mem_id: ushort;
+    offset: ulong;
+    size: ulong;
+}
+
+table SubmitListEntry {
+    id: ushort;
+    task_id: [ushort];
+}
+
+table TensorDescListEntry {
+    name: string;
+    id: ushort;
+    mem_id: ushort;
+    size: ulong;
+    offset: ulong;
+    data_format: DataFormat = UNKNOWN;
+    data_type: DataType = UNKNOWN;
+    data_category: DataCategory = IMAGE;
+    pixel_format: PixelFormat = R8;
+    pixel_mapping: PixelMapping = PITCH_LINEAR;
+    n: int;
+    c: int;
+    h: int;
+    w: int;
+    stride_0: uint;
+    stride_1: uint;
+    stride_2: uint;
+    stride_3: uint;
+    stride_4: uint;
+    stride_5: uint;
+    stride_6: uint;
+    stride_7: uint;
+}
+
+table RelocListEntry {
+    address_id: ushort;
+    write_id: ushort;
+    offset: ulong;
+    interface: uint;
+    sub_interface: uint;
+    reloc_type: ubyte;
+}
+
+table Loadable {
+    version: Version;
+    task_list: [SubModelListEntry];
+    memory_list: [MemoryListEntry];
+    address_list: [AddressListEntry];
+    event_list: [EventListEntry];
+    blobs: [Blob];
+    tensor_desc_list: [TensorDescListEntry];
+    reloc_list: [RelocListEntry];
+    submit_list: [SubmitListEntry];
+}
+
+root_type Loadable;
+file_identifier "NVDA";
+file_extension "model";
