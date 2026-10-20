@@ -93,10 +93,6 @@ The SmolLM-135M runtime requires the following model files under `src/smollm/mod
    ```
    Place the resulting `.model` files into `src/smollm/models/`.
 
-> [!NOTE]
-> **Local Workspace Note (`deep` + `romanaccio`)**:
-> If working alongside the local development repository `deep`, `src/smollm/models/` contains symbolic links pointing back to `deep/models/smollm/`, allowing immediate execution without re-downloading or duplicating files.
-
 ### 3.2 Qwen2-0.5B and DeepSeek-7B Models
 For testing `src/qwen2_fix/`, download the pre-quantized vendor NPU packages or place the vendor models into:
 - `/opt/eswin/data/npu/` (on the target board)

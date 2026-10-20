@@ -1,5 +1,6 @@
 """Unit tests for ONNXImporter."""
 
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -19,14 +20,15 @@ class TestONNXImporter(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.deep_dir = Path("/home/chri/aixigua/deep")
-        cls.artifacts_dir = cls.deep_dir / "artifacts"
+        test_data_dir = os.environ.get("ESWIN_TEST_DATA", "")
+        cls.artifacts_dir = Path(test_data_dir) if test_data_dir else Path(__file__).resolve().parent / "data"
         cls.conv_onnx = cls.artifacts_dir / "test_conv.onnx"
         cls.swiglu_onnx = cls.artifacts_dir / "test_swiglu_mlp.onnx"
 
     def test_import_conv_onnx(self):
         """Test importing simple Conv2D model."""
-        self.assertTrue(self.conv_onnx.exists(), f"Missing {self.conv_onnx}")
+        if not self.conv_onnx.exists():
+            self.skipTest(f"Test model not present at {self.conv_onnx}")
 
         importer = ONNXImporter()
         graph = importer.import_model(self.conv_onnx)

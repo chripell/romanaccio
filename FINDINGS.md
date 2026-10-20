@@ -155,7 +155,7 @@ From reverse-engineering `libedla_runtime.so.1.0` and native C++ testing:
 
 ## 10. SmolLM-135M End-to-End Compilation & Execution Guide
 
-A comprehensive, self-contained guide has been generated in [SMOLLM_GUIDE.md](file:///home/chri/aixigua/deep/artifacts/SMOLLM_GUIDE.md):
+A comprehensive, self-contained guide has been generated in [SMOLLM_GUIDE.md](src/smollm/SMOLLM_GUIDE.md):
 - **Model Architecture**: 135M params, 30 layers, 576 hidden dim, 9 Q heads, 3 KV heads, 1536 intermediate SwiGLU dim, 49,152 vocab.
 - **Conversion Pipeline**: ONNX 4D representation (`[1, C, 1, 1]`), Linear-to-1x1 Conv mappings, multi-output QKV splitting.
 - **Dual-Die LM Head Partitioning**: 24,576 tokens per die, achieving **~0.9 ms** combined parallel latency (~1,100 FPS).
@@ -165,7 +165,7 @@ A comprehensive, self-contained guide has been generated in [SMOLLM_GUIDE.md](fi
 
 ## 11. Root Cause Resolution for Framework Issue #47 (DeepSeek/Qwen2)
 
-Fixes and fixed source code are organized in [src/qwen2_fix/](file:///home/chri/aixigua/deep/src/qwen2_fix/):
+Fixes and fixed source code are organized in [src/qwen2_fix/](src/qwen2_fix/):
 1. **Off-by-One Heap Corruption in `repetitionPenalty`**: Fixed `ids > (vocabOffset + vocabSizePerDie)` to strict range checking `ids < vocabOffset || ids >= vocabEnd`.
 2. **Greedy Repetition Loop ("Wait... Wait... Wait...")**:
    - Replaced unbounded global token history with a **sliding window** (`repeat_window = 64`).
@@ -183,7 +183,7 @@ Fixes and fixed source code are organized in [src/qwen2_fix/](file:///home/chri/
 
 We implemented an end-to-end standalone interactive chat runtime in `src/smollm/`:
 1. **Model Weights & Vocabulary Extraction (`export_smollm.py`)**:
-   - Extracted all 30 layers of raw FP32 weights from `goal/SmolLM-135M.onnx` into `models/smollm_135m.bin` (514 MB).
+   - Extracted all 30 layers of raw FP32 weights from `SmolLM-135M.onnx` into `models/smollm_135m.bin` (514 MB).
    - Inverted GPT-2 byte mapping to clean UTF-8 tokens into `models/tokenizer.bin` (517 KB, 49,152 vocabulary).
 2. **Native C++17 Engine (`smollm_chat.cpp` & `Makefile`)**:
    - Zero external library dependencies; builds in seconds with `g++ -O3 -fopenmp -std=c++17 -ldl`.
@@ -201,31 +201,31 @@ We implemented an end-to-end standalone interactive chat runtime in `src/smollm/
 
 To support open-source tooling re-implementation, comprehensive technical findings have been structured into dedicated documentation:
 
-1. [findings/NPU_OPERATIONS.md](file:///home/chri/aixigua/deep/findings/NPU_OPERATIONS.md):
+1. [findings/NPU_OPERATIONS.md](findings/NPU_OPERATIONS.md):
    - **Hardware Engines**: Full operational breakdown of NVDLA-derived CDMA, CSC, CMAC, CACC, SDP, PDP, CDP, RUBIK, BDMA, and HAE 2D engine.
    - **DSP Kernel Catalog**: Complete taxonomy of all **372 compiled DSP kernel plugins** (`rootfs-esssim/home/eswin/dsp_kernels/`) across LLM (RMSNorm, RoPE, Softmax, MHA), mathematical, indexing, and vision operators.
    - **GPU Profile**: Hardware specifications and offload suitability for Imagination AXM-8-256 (0.25 TFLOPS FP32, 1.0 TOPS INT8, OpenCL 3.0 / Vulkan 1.3).
    - **Operator Mapping Matrix**: Lowering decisions for ONNX operators to NPU CMAC/SDP vs DSP kernels vs CPU.
 
-2. [findings/MODEL_FORMAT.md](file:///home/chri/aixigua/deep/findings/MODEL_FORMAT.md):
+2. [findings/MODEL_FORMAT.md](findings/MODEL_FORMAT.md):
    - **Container Specification**: Reverse-engineered schema for `.model` offline loadables (`NVDA` magic FlatBuffers).
    - **Table Definitions**: MemoryList, TensorDescList, SubModelList (KMD hardware commands vs UMD DSP invocations), AddressList, EventList, RelocEntries, and weight Blobs.
 
-3. [findings/SYSTEM_CAPABILITIES_AND_MODELS.md](file:///home/chri/aixigua/deep/findings/SYSTEM_CAPABILITIES_AND_MODELS.md):
+3. [findings/SYSTEM_CAPABILITIES_AND_MODELS.md](findings/SYSTEM_CAPABILITIES_AND_MODELS.md):
    - **Performance Envelope**: 19.99 TOPS INT8 / 9.98 TFLOPS FP16, DDR4-3200 memory bandwidth limits, and 22 GB MMZ allocation.
    - **Empirical Latency Measurements**: Real hardware benchmarks for YOLOv3 (15.9 ms), SwiGLU MLP (0.28 ms), QKV attention (0.19 ms), and LM Head (0.9 ms).
    - **Model Feasibility Analysis & Rankings**: In-depth evaluation of SmolLM2 (135M/360M/1.7B), Qwen2.5 (0.5B/1.5B/3B), Llama-3.2 (1B/3B), Gemma-2-2B (soft-capping & SWA handling), Whisper (speech-to-text), and YOLOv8/v11.
 
-4. [findings/RUNTIME_API.md](file:///home/chri/aixigua/deep/findings/RUNTIME_API.md):
+4. [findings/RUNTIME_API.md](findings/RUNTIME_API.md):
    - **API Reference**: Complete lifecycle documentation for `libedla_runtime.so` and `libes_memory.so` (contexts, streams, tasks, contiguous memory allocation).
    - **Driver Constraints**: Diagnostic explanation of `ES_NPU_ERROR_DEV_MULTI_SET` (`0xa00f6046`), single-process device binding limitations, and multi-process architecture recommendations.
 
-5. [findings/CPU_NPU_PROTOCOL.md](file:///home/chri/aixigua/deep/findings/CPU_NPU_PROTOCOL.md):
+5. [findings/CPU_NPU_PROTOCOL.md](findings/CPU_NPU_PROTOCOL.md):
    - **Hardware Interface**: Device nodes (`/dev/npu*`, `/dev/dma_heap/*`, `/dev/eswin_ipc_misc_dev*`).
    - **Kernel ioctl Catalog**: Decoding of all 13 ioctl commands (`0xc0046e03` through `0xc0046e11`) in `eic7700_npu.ko`.
    - **SMMU Address Translation**: Flow of physical DMA-BUFs to IOVA page tables via `NPU_IOCTL_PREPARE_DMA`.
 
-6. [findings/SDP_LUT_TABLES.md](file:///home/chri/aixigua/deep/findings/SDP_LUT_TABLES.md):
+6. [findings/SDP_LUT_TABLES.md](findings/SDP_LUT_TABLES.md):
    - **SDP Piecewise Linear Interpolation**: Theory and hardware math of Single Data Point activation units.
    - **Binary Specification**: 688-byte `struct _lut_dev` layout, LE/LO interpolation tables, and Sigmoid/SiLU parameter generation.
 

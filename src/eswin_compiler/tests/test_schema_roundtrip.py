@@ -4,6 +4,7 @@ Verifies that vendor .model files can be parsed into high-level dataclasses
 and re-serialized into valid .model binaries with 100% semantic parity.
 """
 
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -30,15 +31,15 @@ class TestSchemaRoundTrip(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Locate artifacts directory
-        cls.deep_dir = Path("/home/chri/aixigua/deep")
-        cls.artifacts_dir = cls.deep_dir / "artifacts"
+        # Locate test artifacts directory
+        test_data_dir = os.environ.get("ESWIN_TEST_DATA", "")
+        cls.artifacts_dir = Path(test_data_dir) if test_data_dir else Path(__file__).resolve().parent / "data"
         cls.conv_model_path = cls.artifacts_dir / "test_conv_npu_b1.model"
         cls.swiglu_model_path = cls.artifacts_dir / "test_swiglu_mlp_npu_b1.model"
-        cls.smollm_model_path = cls.deep_dir / "models" / "smollm" / "smollm_lm_head_d0_npu_b1.model"
+        cls.smollm_model_path = cls.artifacts_dir / "smollm_lm_head_d0_npu_b1.model"
 
     def _assert_models_equal(self, m1: LoadableModel, m2: LoadableModel, name: str = ""):
-        """Helper to assert deep semantic equivalence between two LoadableModels."""
+        """Helper to assert structural and semantic equivalence between two LoadableModels."""
         # 1. Version
         self.assertEqual(m1.version.major, m2.version.major, f"{name}: version.major mismatch")
         self.assertEqual(m1.version.minor, m2.version.minor, f"{name}: version.minor mismatch")
@@ -128,7 +129,8 @@ class TestSchemaRoundTrip(unittest.TestCase):
 
     def test_conv_model_roundtrip(self):
         """Test parsing and re-serializing test_conv_npu_b1.model."""
-        self.assertTrue(self.conv_model_path.exists(), f"Missing {self.conv_model_path}")
+        if not self.conv_model_path.exists():
+            self.skipTest(f"Test model not present at {self.conv_model_path}")
 
         # 1. Read original model
         orig_model = ModelReader.read_file(self.conv_model_path)
@@ -151,7 +153,8 @@ class TestSchemaRoundTrip(unittest.TestCase):
 
     def test_swiglu_mlp_roundtrip(self):
         """Test parsing and re-serializing test_swiglu_mlp_npu_b1.model."""
-        self.assertTrue(self.swiglu_model_path.exists(), f"Missing {self.swiglu_model_path}")
+        if not self.swiglu_model_path.exists():
+            self.skipTest(f"Test model not present at {self.swiglu_model_path}")
 
         orig_model = ModelReader.read_file(self.swiglu_model_path)
         self.assertEqual(str(orig_model.version), "0.7.0")

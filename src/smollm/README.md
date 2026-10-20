@@ -121,21 +121,14 @@ In `smollm_chat`, this is completely resolved through a two-tiered mitigation:
 
 Due to GitHub file size limits, large binary weights (`*.bin`) and compiled NPU loadables (`*.model`) are excluded from git.
 
-### 6.1 Option A: Local Companion Workspace (`deep`)
-If you are developing alongside the local companion workspace `deep`, the files are automatically symlinked from `deep/models/smollm/`:
-- `models/smollm_135m.bin -> ../../../../deep/models/smollm/smollm_135m.bin`
-- `models/smollm_lm_head_d0_npu_b1.model -> ../../../../deep/models/smollm/smollm_lm_head_d0_npu_b1.model`
-- `models/smollm_lm_head_d1_npu_b1.model -> ../../../../deep/models/smollm/smollm_lm_head_d1_npu_b1.model`
-- `models/tokenizer.bin -> ../../../../deep/models/smollm/tokenizer.bin`
-
-### 6.2 Option B: Download & Export from Upstream
+### Download & Export from Upstream
 1. Download the SmolLM-135M ONNX model from Hugging Face:
    - [HuggingFaceTB/SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M)
 2. Export weights and vocabulary into `models/`:
    ```bash
    python3 export_smollm.py
    ```
-   This reads `goal/SmolLM-135M.onnx` (or your downloaded ONNX path) and produces:
+   This reads your downloaded ONNX model (e.g. `SmolLM-135M.onnx`) and produces:
    - `models/smollm_135m.bin` (514 MB)
    - `models/tokenizer.bin` (517 KB)
 3. For NPU LM Head offloading, compile the dual-die models using `EsAAC` as described in [SMOLLM_GUIDE.md](SMOLLM_GUIDE.md).
