@@ -11,6 +11,6 @@ add_executable(qwen2_v2 qwen2_v2.cpp)
 target_link_libraries(qwen2_v2 PRIVATE es_runtime pthread ${CMAKE_DL_LIBS})
 
 set_target_properties(qwen2_v2 PROPERTIES
-    BUILD_RPATH "$ORIGIN/../eswin_runtime/build:$ORIGIN"
-    INSTALL_RPATH "$ORIGIN/../eswin_runtime/build:$ORIGIN"
+    BUILD_RPATH "$ORIGIN:$ORIGIN/../eswin_runtime/build"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/../eswin_runtime/build"
 )
