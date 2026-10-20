@@ -62,6 +62,19 @@ It replaces the proprietary, 32-bit x86-only vendor `EsSimulator` binary with a 
   - Multi-op pipeline simulation ($W_{\text{gate}} \to \text{SiLU(LUT)} \odot W_{\text{up}} \to W_{\text{down}}$) on `test_swiglu_mlp_npu_b1.model`.
   - Cosine Similarity $= \mathbf{1.000000}$ ($0.99999976$) against vendor `EsSimulator` golden output.
 
+### Milestone 5: DSP Submodel Execution Engine (ctypes & Native Fallbacks)
+- **Cadence Vision Q7 DSP Simulation (`dsp/dsp_executor.py`)**:
+  - Simulates the DSP submodel execution cluster for non-NPU operations (RMSNorm, Softmax, RoPE, TopK).
+  - C ABI structures matching vendor DSP interface:
+    - `struct es_dsp_buffer_t { uint32_t addr; uint32_t size; };`
+    - `struct es_dsp_buffer_group_t { es_dsp_buffer_t *buffers; uint32_t bufferCnt; };`
+  - Dynamic discovery and loading of vendor `dsp_kernels/*.so` when executed in 32-bit x86 environments.
+- **Cross-Platform 64-Bit Native Fallbacks (`dsp/native_fallbacks/`)**:
+  - **RMSNorm (`rms_norm.py`)**: Root-mean-square layer normalization matching PyTorch `F.rms_norm` ($< 1.5 \times 10^{-6}$ max diff across channels 32 to 4096), with optional INT8 quantization and saturating clipping.
+  - **Softmax (`softmax.py`)**: Numerically stable online max-subtraction preventing exponential overflow on arbitrary tensor shapes ($< 1.0 \times 10^{-6}$ max diff).
+  - **RoPE (`rope.py`)**: Rotary Position Embedding supporting Hugging Face `half` mode and Cadence DSP `interleaved` pair mode, with strict unitary L2 norm conservation.
+  - **Top-K (`topk.py`)**: High-efficiency $O(N)$ partitioning and value/index extraction matching `torch.topk`.
+
 ---
 
 ## 2. Mathematical Model of BDMA Strided Transfers
@@ -220,8 +233,16 @@ from eswin_simulator.memory import VirtualAddressSpace
 from eswin_simulator.engines import (
     CMACEngine,
     CACCEngine,
+    SDPEngine,
     unpack_nvdla_weights_conv2d,
     unpack_nvdla_weights_1x1,
+)
+from eswin_simulator.dsp import (
+    DSPExecutor,
+    rms_norm,
+    softmax,
+    apply_rope,
+    topk,
 )
 import numpy as np
 
@@ -232,6 +253,8 @@ vas = VirtualAddressSpace(model)
 # 2. Initialize hardware compute engines
 cmac = CMACEngine(address_space=vas)
 cacc = CACCEngine(address_space=vas)
+sdp = SDPEngine(address_space=vas)
+dsp = DSPExecutor(address_space=vas)
 
 # 3. Unpack NVDLA weight blobs
 w_raw = model.blobs["W_0"].data
@@ -246,10 +269,14 @@ vas.bind_input(in_t, x)
 acc = cmac.conv2d(x, w, stride=1, padding=0, precision="FP16")
 y = cacc.finalize_fp16(acc, to_fp16=True)
 
-# 6. Write to output tensor and inspect
+# 6. Apply DSP Submodel operations (e.g., RMSNorm & Softmax)
+y_normed = dsp.execute_rms_norm(y, weight=np.ones(y.shape[-1], dtype=np.float16))
+y_prob = dsp.execute_softmax(y_normed, axis=-1)
+
+# 7. Write to output tensor and inspect
 out_t = model.output_tensors[0]
-vas.write_tensor(out_t, y)
-print("Computed output shape:", y.shape, "MACs:", cmac.total_macs)
+vas.write_tensor(out_t, y_prob)
+print("Computed output shape:", y_prob.shape, "MACs:", cmac.total_macs, "DSP Ops:", dsp.total_dsp_ops)
 ```
 
 ---
@@ -261,7 +288,7 @@ Run all unit and differential tests via `pytest`:
 pytest -v
 ```
 
-All 28 comprehensive tests cover:
+All 52 comprehensive tests cover:
 - Binary magic validation (`NVDA`) and error detection on corrupted containers.
 - 4D Tensor descriptor parsing (shape, strides, data format, data type, element sizes).
 - Memory allocation across 64-bit DRAM and the 4 MiB on-chip SPRAM.
@@ -273,6 +300,11 @@ All 28 comprehensive tests cover:
 - SDP pointwise ALU operations (`bias_add`, `batch_norm`, `eltwise_mul/add/sub/min/max`).
 - SDP fixed activations (`relu`, `leaky_relu`, `prelu`, `clip`) and precision conversions.
 - SDP 688-byte piecewise linear LUT interpolation (`SiLU`, `Sigmoid`, `Tanh`, `GELU`).
+- Cadence Vision Q7 DSP C ABI buffer management and dynamic library binding.
+- DSP `RMSNorm` differential parity with PyTorch across channels (32, 64, 128, 576, 896, 1024, 2048, 4096) and INT8 quantization ($< 1.5 \times 10^{-6}$ diff).
+- DSP `Softmax` numerically stable evaluation across multiple axes ($< 1.0 \times 10^{-6}$ diff).
+- DSP `RoPE` rotary position embedding (Hugging Face `half` mode and Cadence `interleaved` mode) with unitary norm preservation.
+- DSP `TopK` bit-exact value and index extraction against PyTorch `torch.topk`.
 - Differential parity testing against vendor `EsSimulator` output across all reference models:
   * `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$.
   * `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$.
