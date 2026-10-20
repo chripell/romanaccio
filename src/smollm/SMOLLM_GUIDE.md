@@ -47,6 +47,15 @@ When writing native C/C++ applications or Python bindings for `libedla_runtime.s
 ### 2.3 Peer-to-Peer Cross-Die Models
 Models compiled with peer cross-die communication (`_peer` suffix) contain DSP firmware routines that perform synchronous cross-die mailbox handshakes. Loading a peer model on Die 0 without concurrently loading and starting Die 1 causes the DSP power controller to hang indefinitely.
 
+### 2.4 Multi-Die Thread Binding Requirement (`0xa00f6046`)
+`libedla_runtime.so.1.0` maintains thread-local device context. Calling `ES_NPU_SetDevice(0)` and subsequently calling `ES_NPU_SetDevice(1)` on the same thread fails with `0xa00f6046` (`ES_NPU_ERROR_DEV_MULTI_SET`). Dual-die execution must assign each die to a dedicated POSIX thread pinned to its respective NUMA node / CPU cluster (Die 0 $\to$ cores 0..3, Die 1 $\to$ cores 4..7).
+
+### 2.5 FP16 DMA Data Layout and Cache Invalidation
+The hardware `.model` kernels compiled via `EsAAC` operate strictly on FP16 activations. For SmolLM-135M:
+- Input shape: `[1, 576, 1, 1]` in FP16 (1,152 bytes).
+- Output shape: `[1, 24576, 1, 1]` in FP16 (49,152 bytes per die).
+All DMA memory allocated via `/lib/libes_memory.so.1.0` in `SYS_CACHE_MODE_CACHED` mode must have its CPU cache lines flushed before submission (`ES_SYS_MemFlushCache(inputFd.memFd)`) and invalidated before CPU reading (`ES_SYS_MemFlushCache(outputFd.memFd)`). Failure to flush causes DMA data corruption.
+
 ---
 
 ## 3. Step-by-Step Compilation Pipeline

@@ -98,10 +98,16 @@ The SmolLM-135M vocabulary has 49,152 tokens. In the LM Head projection ($576 \t
 - **Die 0 (`/dev/npu0`)**: Computes logits for vocabulary slice `0 .. 24575` using `smollm_lm_head_d0_npu_b1.model`.
 - **Die 1 (`/dev/npu1`)**: Computes logits for vocabulary slice `24576 .. 49151` using `smollm_lm_head_d1_npu_b1.model`.
 
-Both dies execute concurrently in under **0.9 ms**, offloading 49,152 matrix multiplications from the CPU cores on every generated token.
+Both dies execute concurrently in under **1.1 ms**, offloading 49,152 matrix multiplications from the CPU cores on every generated token.
 
-### 4.2 Automatic Fallback
-The C++ runtime uses `dlopen` to detect `/lib/libedla_runtime.so.1.0` and `/lib/libes_sys.so.1` at runtime:
+### 4.2 Engineering Architecture & Key Discoveries
+1. **Thread-Level Device Isolation**: The vendor EDLA runtime (`libedla_runtime.so.1.0`) binds device state to the calling thread. Calling `ES_NPU_SetDevice` for both Die 0 and Die 1 on a single thread returns error `0xa00f6046` (`ES_NPU_ERROR_DEV_MULTI_SET`). `smollm_chat` spawns dedicated, NUMA-pinned worker threads (`DieWorker`): Die 0 is bound to CPU cores 0–3, and Die 1 to CPU cores 4–7.
+2. **Half-Precision (FP16) DMA Contract**: The compiled `.model` kernels expect FP16 activations. The input tensor is shaped `[1, 576, 1, 1]` (1,152 bytes) and each output tensor is `[1, 24576, 1, 1]` (49,152 bytes). Native `_Float16` conversions are performed directly on the RISC-V cores.
+3. **Cache Invalidation (`ES_SYS_MemFlushCache`)**: Memory allocated via `/lib/libes_memory.so.1.0` in cached mode requires flushing CPU L1/L2 lines before NPU DMA execution and invalidating caches before host CPU reading.
+4. **Contiguous Row-Major SIMD Optimization**: The 30-layer Transformer weights are transposed once at load time to ensure stride-1 sequential memory access for all inner products. Combined with preallocated attention scratch buffers, generation speed reaches **~11–13.5 tokens/s** (a 12× speedup over unaligned column traversals).
+
+### 4.3 Automatic Fallback
+The C++ runtime uses `dlopen` to detect `/lib/libedla_runtime.so.1.0` and `/lib/libes_memory.so.1.0` at runtime:
 - **On RISC-V board (`roma`)**: If dual NPUs are available, it automatically maps unified shared memory (`mmz_nid_0_part_0` and `mmz_nid_1_part_0`) and enables dual-die offload.
 - **On host x86_64 or without NPUs**: It automatically falls back to an OpenMP-parallelized CPU projection without requiring separate builds or libraries.
 

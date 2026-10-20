@@ -186,12 +186,14 @@ We implemented an end-to-end standalone interactive chat runtime in `src/smollm/
    - Extracted all 30 layers of raw FP32 weights from `SmolLM-135M.onnx` into `models/smollm_135m.bin` (514 MB).
    - Inverted GPT-2 byte mapping to clean UTF-8 tokens into `models/tokenizer.bin` (517 KB, 49,152 vocabulary).
 2. **Native C++17 Engine (`smollm_chat.cpp` & `Makefile`)**:
-   - Zero external library dependencies; builds in seconds with `g++ -O3 -fopenmp -std=c++17 -ldl`.
+   - Zero external library dependencies; builds in seconds with `g++ -O3 -fopenmp -std=c++17 -ldl -pthread`.
    - Full autoregressive Transformer inference loop with dynamic KV caching, RoPE rotary positional embeddings, and SwiGLU FFN.
-   - Dynamic `dlopen` probing for `/lib/libedla_runtime.so.1.0` and `/lib/libes_sys.so.1` for Dual-Die NPU offloading with automatic fallback to high-speed OpenMP CPU execution.
-   - Dual-Die LM Head offloading: partitions $576 \to 49152$ logits projection across Die 0 (`smollm_lm_head_d0_npu_b1.model`) and Die 1 (`smollm_lm_head_d1_npu_b1.model`) in ~0.9 ms.
-   - Integrated Issue #47 fix: sliding-window repetition penalty (window=64, penalty=1.15) and consecutive duplicate loop break detector.
-   - Interactive chat REPL with streaming generation output, colors, and live tokens/second metrics.
+   - Dynamic `dlopen` probing for `/lib/libedla_runtime.so.1.0` and `/lib/libes_memory.so.1.0` for Dual-Die NPU offloading with automatic fallback to high-speed OpenMP CPU execution.
+   - **Thread-Isolated Dual-Die Offload**: Spawns dedicated, NUMA-pinned worker threads (`DieWorker` on CPU 0..3 and CPU 4..7) to bypass vendor `0xa00f6046` (`ES_NPU_ERROR_DEV_MULTI_SET`) device binding constraints.
+   - **FP16 DMA Contract & Cache Invalidation**: Feeds `[1, 576, 1, 1]` FP16 (`_Float16`) activations and reads `[1, 24576, 1, 1]` FP16 logits with `ES_SYS_MemFlushCache` DMA coherence, verified to match CPU FP32 dot products ($mean\ diff \approx 0.006$).
+   - **Contiguous Row-Major SIMD Optimization**: Transposes 30-layer weights at startup to ensure stride-1 sequential memory access, achieving **~11–13.5 tokens/s** generation speed.
+   - Integrated Issue #47 fix: sliding-window repetition penalty (window=64, penalty=1.15), 2-token alternating stutter mitigation, and consecutive duplicate loop break detector.
+   - Interactive chat REPL with streaming generation output, colors, startup diagnostics card, and live tokens/second metrics.
 3. **Reference Python Engine (`smollm_chat.py`)**:
    - Validated end-to-end inference accuracy: generates coherent, factual answers at ~40 tokens/s on host and runs interactively.
 
