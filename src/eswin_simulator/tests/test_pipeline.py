@@ -208,3 +208,41 @@ class TestEndToEndPipeline:
         assert rep.passed
         assert rep.cosine_similarity > 0.99999
         assert rep.max_abs_diff < 0.001
+
+    def test_golden_qkv_proj_differential_with_comparator(self):
+        """Verifies test_qkv_proj_npu_b1.model against vendor EsSimulator golden output."""
+        model_path = Path("/home/chri/aixigua/deep/artifacts/test_qkv_proj_npu_b1.model")
+        golden_dir = Path("/home/chri/aixigua/deep/artifacts/scratch/golden_qkv")
+
+        if not (model_path.exists() and golden_dir.exists() and (golden_dir / "es_q_golden.bin").exists()):
+            pytest.skip("Golden QKV artifacts not present")
+
+        model = LoadableModel.from_file(str(model_path))
+        vas = VirtualAddressSpace(model)
+        cmac = CMACEngine(vas)
+        cacc = CACCEngine(vas)
+
+        x = np.fromfile(str(golden_dir / "in_qkv.bin"), dtype=np.float16).reshape(1, 576, 1, 1)
+
+        wq = unpack_nvdla_weights_1x1(model.blobs["wq_0"].data, c_out=576, c_in=576, dtype=np.float16)
+        wk = unpack_nvdla_weights_1x1(model.blobs["wk_1"].data, c_out=192, c_in=576, dtype=np.float16)
+        wv = unpack_nvdla_weights_1x1(model.blobs["wv_2"].data, c_out=192, c_in=576, dtype=np.float16)
+
+        q_sim = cacc.finalize_fp16(cmac.gemm_1x1(x, wq, precision="FP16"), to_fp16=True)
+        k_sim = cacc.finalize_fp16(cmac.gemm_1x1(x, wk, precision="FP16"), to_fp16=True)
+        v_sim = cacc.finalize_fp16(cmac.gemm_1x1(x, wv, precision="FP16"), to_fp16=True)
+
+        q_gold = np.fromfile(str(golden_dir / "es_q_golden.bin"), dtype=np.float16).reshape(1, 576, 1, 1)
+        k_gold = np.fromfile(str(golden_dir / "es_k_golden.bin"), dtype=np.float16).reshape(1, 192, 1, 1)
+        v_gold = np.fromfile(str(golden_dir / "es_v_golden.bin"), dtype=np.float16).reshape(1, 192, 1, 1)
+
+        rep_q = TensorComparator.compare(q_sim, q_gold, tolerance=1e-3, cos_threshold=0.9999)
+        rep_k = TensorComparator.compare(k_sim, k_gold, tolerance=1e-3, cos_threshold=0.9999)
+        rep_v = TensorComparator.compare(v_sim, v_gold, tolerance=1e-3, cos_threshold=0.9999)
+
+        assert rep_q.passed
+        assert rep_k.passed
+        assert rep_v.passed
+        assert rep_q.cosine_similarity > 0.99999
+        assert rep_k.cosine_similarity > 0.99999
+        assert rep_v.cosine_similarity > 0.99999
