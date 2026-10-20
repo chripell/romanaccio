@@ -237,6 +237,11 @@ void es_tokenizer_free(es_tokenizer_t *tokenizer) {
     }
 }
 
+size_t es_tokenizer_vocab_size(const es_tokenizer_t *tokenizer) {
+    if (!tokenizer || !tokenizer->tokenizer) return 0;
+    return tokenizer->tokenizer->vocab_size();
+}
+
 int32_t es_tokenizer_encode(const es_tokenizer_t *tokenizer, const char *text, int32_t *out_tokens, size_t max_tokens) {
     if (!tokenizer || !tokenizer->tokenizer || !text || !out_tokens || max_tokens == 0) return -1;
     auto tokens = tokenizer->tokenizer->encode(text);
@@ -388,12 +393,25 @@ es_status_t es_model_load(es_context_t *ctx, const es_model_config_t *config, es
 
     if (config->tokenizer_path && *config->tokenizer_path) {
         model->tokenizer_path = config->tokenizer_path;
-    } else if (file_exists(model_dir + "/tokenizer.json")) {
-        model->tokenizer_path = model_dir + "/tokenizer.json";
-    } else if (file_exists(model_dir + "/vocab.json")) {
-        model->tokenizer_path = model_dir + "/vocab.json";
-    } else if (file_exists(model_dir + "/tokenizer.model")) {
-        model->tokenizer_path = model_dir + "/tokenizer.model";
+    } else {
+        const auto *tok_desc = model->manifest.find_file_by_role("tokenizer");
+        if (tok_desc && !tok_desc->name.empty() && file_exists(model_dir + "/" + tok_desc->name)) {
+            model->tokenizer_path = model_dir + "/" + tok_desc->name;
+        } else if (file_exists(model_dir + "/tokenizer.json")) {
+            model->tokenizer_path = model_dir + "/tokenizer.json";
+        } else if (file_exists(model_dir + "/qwen.tiktoken")) {
+            model->tokenizer_path = model_dir + "/qwen.tiktoken";
+        } else if (file_exists(model_dir + "/vocab.json")) {
+            model->tokenizer_path = model_dir + "/vocab.json";
+        } else if (file_exists(model_dir + "/tokenizer.model")) {
+            model->tokenizer_path = model_dir + "/tokenizer.model";
+        } else if (file_exists("./qwen.tiktoken")) {
+            model->tokenizer_path = "./qwen.tiktoken";
+        } else if (file_exists("../qwen2_fix/deepseek_7b_1k_int8_peer/qwen.tiktoken")) {
+            model->tokenizer_path = "../qwen2_fix/deepseek_7b_1k_int8_peer/qwen.tiktoken";
+        } else if (file_exists("/opt/eswin/sample-code/npu_sample/qwen_sample/src/qwen2_0_5b_1k_int8/qwen.tiktoken")) {
+            model->tokenizer_path = "/opt/eswin/sample-code/npu_sample/qwen_sample/src/qwen2_0_5b_1k_int8/qwen.tiktoken";
+        }
     }
 
     if (!model->tokenizer_path.empty()) {

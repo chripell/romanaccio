@@ -136,6 +136,31 @@ bool Tokenizer::load_tiktoken(const std::string &tiktoken_path, std::string &err
         add_token(rank, piece);
     }
 
+    // Add standard Qwen / DeepSeek special tokens if not already registered
+    const std::vector<std::pair<int32_t, std::string>> qwen_specials = {
+        {151643, "<|endoftext|>"},
+        {151644, "<|im_start|>"},
+        {151645, "<|im_end|>"},
+        {151646, "<|object_ref_start|>"},
+        {151647, "<|object_ref_end|>"},
+        {151648, "<think>"},
+        {151649, "</think>"},
+        {151650, "<|box_start|>"},
+        {151651, "<|box_end|>"},
+        {151652, "<|quad_start|>"},
+        {151653, "<|quad_end|>"},
+        {151654, "<|vision_start|>"},
+        {151655, "<|vision_end|>"},
+        {151656, "<|vision_pad|>"},
+        {151657, "<|image_pad|>"},
+        {151658, "<|video_pad|>"}
+    };
+    for (const auto &sp : qwen_specials) {
+        if (static_cast<size_t>(sp.first) >= m_id_to_piece.size() || m_id_to_piece[sp.first].empty()) {
+            add_token(sp.first, sp.second);
+        }
+    }
+
     return !m_id_to_piece.empty();
 }
 

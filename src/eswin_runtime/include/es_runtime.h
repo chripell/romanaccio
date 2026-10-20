@@ -242,6 +242,7 @@ typedef struct {
 
 es_status_t es_tokenizer_load(const char *filepath, es_tokenizer_t **out_tokenizer);
 void es_tokenizer_free(es_tokenizer_t *tokenizer);
+size_t es_tokenizer_vocab_size(const es_tokenizer_t *tokenizer);
 int32_t es_tokenizer_encode(const es_tokenizer_t *tokenizer, const char *text, int32_t *out_tokens, size_t max_tokens);
 int32_t es_tokenizer_decode(const es_tokenizer_t *tokenizer, const int32_t *tokens, size_t num_tokens, char *out_text, size_t max_len);
 

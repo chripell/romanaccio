@@ -56,11 +56,17 @@ make clean && make CROSS_COMPILE=riscv64-linux-gnu-
 
 ### C++ Interactive REPL
 ```bash
-# Run with default dual-die acceleration
+# Run with default dual-die acceleration (thinking visible by default)
 ./qwen2_v2
 
-# Custom sampling options
-./qwen2_v2 --model /path/to/model_dir --temp 0.6 --top-p 0.9 --repeat-penalty 1.15
+# Custom sampling and thinking controls
+./qwen2_v2 --max-thinking-tokens 128 --max-tokens 256
+
+# Hide thinking tokens (clean answer only)
+./qwen2_v2 --hide-thinking
+
+# Debug mode: inspect all generated token IDs and pieces
+./qwen2_v2 --show-tokens
 ```
 
 ### Python Interactive REPL
@@ -68,7 +74,13 @@ make clean && make CROSS_COMPILE=riscv64-linux-gnu-
 python3 qwen2_v2.py --temp 0.6
 ```
 
-### Interactive Commands
+### Interactive REPL Commands
+- `/thinking on|off`: Toggle real-time streaming of thinking tokens.
+- `/tokens on|off`: Toggle raw token ID debug mode (`[#id:"piece"]`).
+- `/max-thinking <N>`: Adjust maximum thinking tokens allowed per turn (default: 128).
+- `/max-tokens <N>`: Adjust maximum generated tokens (default: 256).
 - `/reset`: Flushes conversation history and clears the KV-cache.
+- `/stats`: Displays latency, prompt tokens, generation tokens, and tokens/sec throughput for the last turn.
+- `/help`: Displays available commands.
 - `/exit` or `/quit`: Cleanly exits and shuts down NPU worker daemons.
 - `Ctrl+C`: Halts active token generation gracefully without killing the REPL.

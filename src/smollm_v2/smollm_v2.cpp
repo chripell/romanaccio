@@ -41,15 +41,16 @@ static void sigint_handler(int sig) {
 }
 
 static bool token_callback(int32_t token, const char *piece, void *user_data) {
-    (void)token;
     (void)user_data;
 
     if (g_interrupt_flag.load()) {
         return false;
     }
 
-    if (piece) {
+    if (piece && piece[0] != '\0') {
         std::cout << piece << std::flush;
+    } else {
+        std::cout << "[#" << token << "]" << std::flush;
     }
     return true;
 }

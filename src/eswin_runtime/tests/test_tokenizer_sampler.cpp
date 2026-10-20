@@ -1,6 +1,7 @@
 #include "../src/nlp/sampler.hpp"
 #include "../src/nlp/tokenizer.hpp"
 #include <iostream>
+#include <fstream>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -127,6 +128,23 @@ static void test_tokenizer_synthetic() {
     std::cout << "    ChatML formatting verified." << std::endl;
 
     std::cout << "\033[1;32m[PASS]\033[0m Tokenizer implementation verified." << std::endl;
+
+    // Test TikToken if file exists
+    std::string tiktoken_path = "../qwen2_fix/deepseek_7b_1k_int8_peer/qwen.tiktoken";
+    if (!std::ifstream(tiktoken_path).good()) {
+        tiktoken_path = "qwen.tiktoken";
+    }
+    if (std::ifstream(tiktoken_path).good()) {
+        eswin::Tokenizer tok_tik;
+        std::string tik_err;
+        TEST_ASSERT(tok_tik.load_tiktoken(tiktoken_path, tik_err), "Failed to load tiktoken: " + tik_err);
+        TEST_ASSERT(tok_tik.vocab_size() >= 151659, "TikToken vocab size mismatch");
+        TEST_ASSERT(tok_tik.decode_token(151648) == "<think>", "Token 151648 decode mismatch: " + tok_tik.decode_token(151648));
+        TEST_ASSERT(tok_tik.decode_token(151649) == "</think>", "Token 151649 decode mismatch: " + tok_tik.decode_token(151649));
+        TEST_ASSERT(tok_tik.decode_token(151644) == "<|im_start|>", "Token 151644 decode mismatch: " + tok_tik.decode_token(151644));
+        TEST_ASSERT(tok_tik.decode_token(151645) == "<|im_end|>", "Token 151645 decode mismatch: " + tok_tik.decode_token(151645));
+        std::cout << "    TikToken special tokens (<think>, </think>, <|im_start|>, <|im_end|>) verified." << std::endl;
+    }
 }
 
 int main() {

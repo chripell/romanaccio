@@ -27,8 +27,21 @@ bool TransformerSession::init(
     m_manifest = manifest;
 
     // 1. Initialize tokenizer
-    if (!tokenizer_path.empty()) {
-        if (!m_tokenizer.load(tokenizer_path, err)) {
+    std::string tok_file = tokenizer_path;
+    if (tok_file.empty()) {
+        const auto *tok_desc = manifest.find_file_by_role("tokenizer");
+        if (tok_desc && !tok_desc->name.empty() && std::ifstream(model_dir + "/" + tok_desc->name).good()) {
+            tok_file = model_dir + "/" + tok_desc->name;
+        } else if (std::ifstream(model_dir + "/tokenizer.json").good()) {
+            tok_file = model_dir + "/tokenizer.json";
+        } else if (std::ifstream(model_dir + "/qwen.tiktoken").good()) {
+            tok_file = model_dir + "/qwen.tiktoken";
+        } else if (std::ifstream("./qwen.tiktoken").good()) {
+            tok_file = "./qwen.tiktoken";
+        }
+    }
+    if (!tok_file.empty()) {
+        if (!m_tokenizer.load(tok_file, err)) {
             return false;
         }
         m_tokenizer.set_special_tokens(manifest.config.bos_token_id, manifest.config.eos_token_id);

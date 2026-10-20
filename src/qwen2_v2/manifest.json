@@ -15,5 +15,10 @@
     "bos_token_id": 151643,
     "eos_token_id": 151645
   },
-  "files": []
+  "files": [
+    {
+      "name": "qwen.tiktoken",
+      "role": "tokenizer"
+    }
+  ]
 }
