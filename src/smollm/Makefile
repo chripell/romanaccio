@@ -1,6 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -O3 -std=c++17 -fopenmp -Wall -Wextra
-LDFLAGS ?= -fopenmp -lm -ldl
+LDFLAGS ?= -fopenmp -lm -ldl -pthread
 
 TARGET = smollm_chat
 
