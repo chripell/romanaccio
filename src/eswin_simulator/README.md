@@ -6,7 +6,7 @@ It replaces the proprietary, 32-bit x86-only vendor `EsSimulator` binary with a 
 
 ---
 
-## 1. Features & Milestone 1 Deliverables
+## 1. Features & Implemented Milestones
 
 ### Milestone 1: Model Loader & Virtual Address Space Inspector
 - **Universal `.model` Reader**: Full FlatBuffers (`NVDA` identifier) parsing of loadables across all model topologies (vision CNNs, transformer blocks, split dual-die LM heads).
@@ -17,6 +17,47 @@ It replaces the proprietary, 32-bit x86-only vendor `EsSimulator` binary with a 
   - Memory utilization breakdown (DRAM vs on-chip SPRAM footprint).
   - Submodel task topology (UMD vs KMD tasks) and relocation tables.
   - Machine-readable `--json` output format for toolchain automation and continuous integration.
+
+### Milestone 2: Dynamic Relocations, BDMA Engine & Tensor File I/O
+- **Dynamic Relocation Resolver**: Walks `RelocEntry` records and patches simulated 64-bit IOVA addresses (split into lower and upper 32-bit words) directly into hardware surface descriptors and command streams.
+- **Bridge DMA (BDMA) Simulation Engine**:
+  - Full functional simulation of multi-dimensional strided memory copies between DRAM and on-chip SPRAM.
+  - High-throughput contiguous 1D linear copies, 2D pitch-strided sub-matrix extractions, and 3D planar volume transfers.
+- **Tensor File I/O Integration**:
+  - Ingestion of raw `.bin` tensor inputs (`--input=<ifmap.bin>`).
+  - Output tensor generation and dumping to disk (`--output=<ofmap.bin>`).
+  - Zero-copy tensor read/write buffers.
+
+---
+
+## 2. Mathematical Model of BDMA Strided Transfers
+
+The Bridge DMA (BDMA) hardware engine transfers multi-dimensional tensor data between SYSTEM memory (DRAM) and the 4 MiB on-chip SPRAM (`SRAM`).
+
+### 2.1 Coordinate Mapping & Address Derivation
+For a tensor volume parameterized by:
+- $\text{surf\_repeat} \in [1, S]$ (typically channels $C$ or batch $N$)
+- $\text{line\_repeat} \in [1, H]$ (lines per surface, typically height $H$)
+- $\text{line\_size} \in [1, W \times \text{element\_size}]$ (contiguous payload bytes per line)
+
+The source and destination byte addresses for surface index $s$ and line index $l$ are given by:
+
+$$\text{Addr}_{\text{src}}(s, l) = \text{Base}_{\text{src}} + s \times \text{stride}_{\text{src\_surf}} + l \times \text{stride}_{\text{src\_line}}$$
+
+$$\text{Addr}_{\text{dst}}(s, l) = \text{Base}_{\text{dst}} + s \times \text{stride}_{\text{dst\_surf}} + l \times \text{stride}_{\text{dst\_line}}$$
+
+Where:
+- $\text{stride}_{\text{line}}$: Pitch distance in bytes between consecutive row starts (allows skipping padding bytes between rows).
+- $\text{stride}_{\text{surf}}$: Distance in bytes between consecutive planar feature map surfaces.
+
+### 2.2 Relocation Address Patching
+When allocating virtual DMA memory regions, the base 64-bit address is split into two 32-bit little-endian fields matching hardware registers:
+
+$$\text{Addr}_{\text{lo}} = \text{IOVA} \ \& \ \text{0xFFFFFFFF} \quad (\text{reloc\_type} = 1)$$
+
+$$\text{Addr}_{\text{hi}} = (\text{IOVA} \gg 32) \ \& \ \text{0xFFFFFFFF} \quad (\text{reloc\_type} = 2)$$
+
+These values are written directly at byte offset `offset` inside the command descriptor buffer `write_id`.
 
 ---
 

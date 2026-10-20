@@ -96,19 +96,21 @@ Development is structured into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - `src/eswin_simulator/README.md`: Quick start guide, CLI options, Python API examples, and test suite instructions.
 
-### Milestone 2: Memory Relocation & BDMA Engine
-- **Scope**:
-  - Implement dynamic relocation resolver: parses `RelocEntry` records and maps symbolic addresses to simulated virtual addresses.
-  - Implement `engines/bdma.py`: executes BDMA commands (DRAM $\leftrightarrow$ SPRAM transfers, line strides, surface strides).
-  - Implement tensor I/O: loading input `.bin` files into virtual memory and dumping output `.bin` files.
+### Milestone 2: Memory Relocation & BDMA Engine [COMPLETED]
+- **Status**: **Completed & Verified** (14/14 unit tests passing in pytest).
+- **Scope Implemented**:
+  - `memory/address_space.py`:
+    - Dynamic relocation resolver parsing `RelocEntry` records: patches 64-bit IOVA addresses (splitting into lower and upper 32-bit little-endian words via `reloc_type` 1 and 2) directly into command/surface descriptors.
+    - 64-bit virtual memory address translation: `read_vaddr_bytes()` and `write_vaddr_bytes()` with automatic DRAM / SPRAM region detection.
+    - Tensor binary file I/O: `load_input_file()` and `dump_output_file()` with multi-file loading (`load_inputs()`, `dump_outputs()`).
+  - `engines/base_engine.py`: Abstract `HardwareEngine` base class for all accelerator sub-engines.
+  - `engines/bdma.py`: Full Bridge DMA simulation engine supporting 1D contiguous transfers, 2D pitch-strided matrix copies, and 3D planar volume transfers between DRAM and on-chip 4 MiB SPRAM.
+  - `cli.py`: Updated CLI supporting `--input <ifmap.bin>` and `--output <ofmap.bin>` execution modes matching vendor `EsSimulator` syntax.
 - **Deliverables**:
-  - `memory/address_space.py` relocation logic.
-  - `engines/bdma.py`.
-- **Testing Requirements**:
-  - Unit tests performing multi-dimensional strided tensor copies between DRAM and SPRAM.
-  - Assert that dumped output byte buffers match source data bit-for-bit.
+  - Extended `VirtualAddressSpace`, `BDMAEngine`, and `cli.py`.
+  - `tests/test_bdma.py`: 5 comprehensive tests validating relocation bit-accuracy, 1D/2D/3D strided BDMA transfers, and tensor binary file round-trip I/O.
 - **Documentation**:
-  - Mathematical description of BDMA surface stride and line stride calculations.
+  - Mathematical description of BDMA surface stride and line stride calculations in `src/eswin_simulator/README.md`.
 
 ### Milestone 3: NPU Convolution & GEMM Functional Engine (CMAC + CACC)
 - **Scope**:

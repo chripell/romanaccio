@@ -33,7 +33,7 @@ def format_bytes(num_bytes: int) -> str:
 def print_banner() -> None:
     print("=" * 80)
     print("  ESWIN EIC7700X Open NPU/DSP Functional Simulator (eswin-sim)")
-    print("  Milestone 1: Model Loader & Virtual Address Space Inspector")
+    print("  Milestone 2: Relocation Resolver, BDMA Engine & Tensor I/O")
     print("=" * 80)
 
 
@@ -151,6 +151,63 @@ def inspect_model(model_path: str, as_json: bool = False, verbose: bool = False)
     return 0
 
 
+def execute_io_simulation(model_path: str, input_arg: str, output_arg: str) -> int:
+    """Executes Milestone 2 tensor file ingestion and output dumping."""
+    p = Path(model_path)
+    if not p.is_file():
+        print(f"[-] Error: Model file not found: {model_path}", file=sys.stderr)
+        return 1
+
+    try:
+        model = LoadableModel.from_file(p)
+    except Exception as e:
+        print(f"[-] Error loading model file {model_path}: {e}", file=sys.stderr)
+        return 1
+
+    vas = VirtualAddressSpace(model)
+    print_banner()
+    print(f"\n[*] Loaded model: {p.name} (version {model.version[0]}.{model.version[1]}.{model.version[2]})")
+    print(f"[+] Applied {vas.relocations_applied} relocations into command/surface memory.")
+
+    # Parse comma-separated inputs
+    input_paths = [Path(s.strip()) for s in input_arg.split(",") if s.strip()]
+    if not input_paths:
+        print("[-] Error: No input file paths provided.", file=sys.stderr)
+        return 1
+
+    print(f"\n[Tensor Ingestion]")
+    for idx, in_file in enumerate(input_paths):
+        if idx >= len(model.input_tensors):
+            print(f"[!] Warning: Extra input file {in_file} ignored (model only has {len(model.input_tensors)} inputs).")
+            break
+        t = model.input_tensors[idx]
+        try:
+            bytes_loaded = vas.load_input_file(t, in_file)
+            print(f"  • Ingested {in_file} -> Tensor '{t.name}' ({bytes_loaded} bytes, shape {t.shape}, type {t.data_type}) [OK]")
+        except Exception as e:
+            print(f"[-] Error loading input tensor from {in_file}: {e}", file=sys.stderr)
+            return 1
+
+    # Parse comma-separated outputs
+    output_paths = [Path(s.strip()) for s in output_arg.split(",") if s.strip()]
+    print(f"\n[Tensor Output Generation]")
+    for idx, out_file in enumerate(output_paths):
+        if idx >= len(model.output_tensors):
+            print(f"[!] Warning: Extra output path {out_file} ignored.")
+            break
+        t = model.output_tensors[idx]
+        try:
+            bytes_dumped = vas.dump_output_file(t, out_file)
+            print(f"  • Dumped Tensor '{t.name}' -> {out_file} ({bytes_dumped} bytes) [OK]")
+        except Exception as e:
+            print(f"[-] Error dumping output tensor to {out_file}: {e}", file=sys.stderr)
+            return 1
+
+    print(f"\n[+] Tensor I/O completed successfully!")
+    print("=" * 80 + "\n")
+    return 0
+
+
 def main(args: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(
         description="ESWIN EIC7700X Open NPU/DSP Functional Simulator (eswin-sim)"
@@ -175,11 +232,22 @@ def main(args: Optional[list] = None) -> int:
         action="store_true",
         help="Display detailed memory regions and relocation tables."
     )
+    parser.add_argument(
+        "--input",
+        help="Path to input tensor binary file(s), comma-separated."
+    )
+    parser.add_argument(
+        "--output",
+        help="Path to output tensor binary file(s), comma-separated."
+    )
 
     parsed = parser.parse_args(args)
 
+    if parsed.input and parsed.output:
+        return execute_io_simulation(parsed.model, parsed.input, parsed.output)
+
     if parsed.info or parsed.json or True:
-        # Default to inspection mode for Milestone 1
+        # Default to inspection mode if no I/O flags provided
         return inspect_model(parsed.model, as_json=parsed.json, verbose=parsed.verbose)
 
     return 0
