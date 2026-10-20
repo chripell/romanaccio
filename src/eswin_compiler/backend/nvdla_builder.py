@@ -46,6 +46,7 @@ try:
     from ..ir.node import EIRNode
     from ..ir.op_types import EngineType, OpType
     from ..passes.gemm_to_conv1x1 import GemmToConv1x1Pass
+    from .gemm_builder import NVDLAGEMMBuilder
 except (ImportError, ValueError):
     from backend.flatbuffer_emitter import (
         AddressEntry,
@@ -70,6 +71,7 @@ except (ImportError, ValueError):
     from ir.node import EIRNode
     from ir.op_types import EngineType, OpType
     from passes.gemm_to_conv1x1 import GemmToConv1x1Pass
+    from backend.gemm_builder import NVDLAGEMMBuilder
 
 
 # ==============================================================================
@@ -463,7 +465,16 @@ def compile_eir_to_model(graph: EIRGraph, output_path: Optional[Union[str, Path]
         raise ValueError("Graph contains no CONV nodes for NPU compilation.")
 
     conv_node = conv_nodes[0]
-    model = NVDLAConvBuilder.build_from_node(conv_node, model_name=graph.name)
+    kernel_shape = conv_node.attributes.get("kernel_shape", [1, 1])
+    is_1x1 = (len(kernel_shape) >= 2 and kernel_shape[0] == 1 and kernel_shape[1] == 1)
+    
+    # Check if 3-pass multi-GEMM (e.g. C_out >= 1024 or 3-way split)
+    out_tensor = conv_node.outputs[0]
+    c_out = out_tensor.shape[1] if (out_tensor.shape and len(out_tensor.shape) > 1) else 1536
+    if is_1x1 and c_out >= 1024:
+        model = NVDLAGEMMBuilder.build_from_node(conv_node, model_name=graph.name)
+    else:
+        model = NVDLAConvBuilder.build_from_node(conv_node, model_name=graph.name)
 
     if output_path is not None:
         ModelWriter.write_file(model, output_path)
