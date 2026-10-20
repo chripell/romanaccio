@@ -62,6 +62,9 @@ public:
 
 private:
     void forward_lm_head_dual_die(const float *hidden_state, float *out_logits);
+    bool load_weights(const std::string &bin_path);
+    void rmsnorm(float *out, const float *x, const float *weight, int size, float eps = 1e-5f);
+    void apply_rope(float *q, float *k, int pos);
 
     ModelManifest                  m_manifest;
     Tokenizer                      m_tokenizer;
@@ -70,12 +73,35 @@ private:
     std::unique_ptr<WorkerPool>    m_worker_pool;
 
     // Weights buffers for local execution
+    bool                           m_has_weights = false;
     std::vector<float>             m_embed;         // [vocab_size, hidden_size]
+    std::vector<float>             m_rms_att;       // [n_layers, hidden_size]
+    std::vector<float>             m_wq;            // [n_layers, hidden_size, hidden_size]
+    std::vector<float>             m_wk;            // [n_layers, hidden_size, kv_dim]
+    std::vector<float>             m_wv;            // [n_layers, hidden_size, kv_dim]
+    std::vector<float>             m_wo;            // [n_layers, hidden_size, hidden_size]
+    std::vector<float>             m_rms_ffn;       // [n_layers, hidden_size]
+    std::vector<float>             m_w_gate;        // [n_layers, hidden_size, intermediate_size]
+    std::vector<float>             m_w_down;        // [n_layers, intermediate_size, hidden_size]
+    std::vector<float>             m_w_up;          // [n_layers, hidden_size, intermediate_size]
+    std::vector<float>             m_rms_final;     // [hidden_size]
     std::vector<float>             m_lm_head_weights;// [vocab_size, hidden_size] (host fallback)
 
     // Working scratch buffers
     std::vector<float>             m_hidden_state;
     std::vector<float>             m_logits;
+    std::vector<float>             m_x_buf;
+    std::vector<float>             m_x_norm_buf;
+    std::vector<float>             m_q_buf;
+    std::vector<float>             m_k_buf;
+    std::vector<float>             m_v_buf;
+    std::vector<float>             m_att_out_buf;
+    std::vector<float>             m_mlp_act_buf;
+
+    // Fast contiguous KV cache for transformer layers
+    std::vector<float>             m_k_cache_flat;
+    std::vector<float>             m_v_cache_flat;
+    int                            m_max_seq = 2048;
 
     // Dual-die NPU buffers (if offloaded)
     bool                           m_npu_dual_die = false;

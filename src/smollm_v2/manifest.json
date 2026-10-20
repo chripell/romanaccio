@@ -12,10 +12,16 @@
     "num_attention_heads": 9,
     "num_key_value_heads": 3,
     "rope_theta": 10000.0,
-    "bos_token_id": 0,
-    "eos_token_id": 0
+    "bos_token_id": 1,
+    "eos_token_id": 2
   },
   "files": [
+    {
+      "name": "smollm_135m.bin",
+      "role": "weights",
+      "size": 538060060,
+      "sha256": ""
+    },
     {
       "name": "smollm_die0.model",
       "role": "npu_die0",

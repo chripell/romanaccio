@@ -117,7 +117,20 @@ static void displayInitialCard(
     }
     std::cout << "  • Special Tokens    : <|im_start|>, <|im_end|> \033[32m[OK]\033[0m\n\n";
 
-    // 3. Hardware NPU Acceleration
+    // 3. Weights & Embeddings
+    std::cout << "\033[1m[Weights & Embeddings]\033[0m\n";
+    std::string w_path = model_dir + "/smollm_135m.bin";
+    bool w_ok = file_exists_local(w_path);
+    if (!w_ok && file_exists_local("/home/chri/smollm/models/smollm_135m.bin")) {
+        w_path = "/home/chri/smollm/models/smollm_135m.bin";
+        w_ok = true;
+    }
+    std::cout << "  • Weights Table     : " << w_path << (w_ok ? " (30 layers, 538 MB) \033[32m[OK]\033[0m\n\n" : " \033[31m[NOT FOUND]\033[0m\n\n");
+    if (!w_ok) {
+        warnings.push_back("Weights file (smollm_135m.bin) missing! Transformer layers cannot be evaluated.");
+    }
+
+    // 4. Hardware NPU Acceleration
     std::cout << "\033[1m[Hardware NPU Acceleration]\033[0m\n";
     std::string d0_path = model_dir + "/smollm_die0.model";
     std::string d1_path = model_dir + "/smollm_die1.model";
@@ -138,7 +151,7 @@ static void displayInitialCard(
     }
     std::cout << "\n";
 
-    // 4. Inference Hyperparameters & Protections
+    // 5. Inference Hyperparameters & Protections
     std::cout << "\033[1m[Inference & Protections]\033[0m\n";
     std::cout << "  • Sampling Mode     : " << (temp > 0.0f ? "Top-P / Top-K Sampling" : "Greedy (ArgMax)")
               << " (temp=" << std::fixed << std::setprecision(2) << temp

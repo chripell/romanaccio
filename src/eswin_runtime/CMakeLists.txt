@@ -7,6 +7,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include_directories(include)
 
+find_package(OpenMP)
+
 # Core Runtime Library
 set(RUNTIME_SOURCES
     src/backend/driver_wrapper.cpp
@@ -24,6 +26,9 @@ set(RUNTIME_SOURCES
 
 add_library(es_runtime SHARED ${RUNTIME_SOURCES})
 target_link_libraries(es_runtime PRIVATE ${CMAKE_DL_LIBS} pthread)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(es_runtime PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(es_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>

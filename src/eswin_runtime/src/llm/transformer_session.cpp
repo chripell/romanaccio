@@ -93,13 +93,149 @@ bool TransformerSession::init(
         }
     }
 
-    // 5. Host fallback embedding and projection initialization
-    size_t embed_elems = static_cast<size_t>(manifest.config.vocab_size) * manifest.config.hidden_size;
-    m_embed.assign(embed_elems, 0.01f);
-    m_lm_head_weights.assign(embed_elems, 0.01f);
+    // 5. Load model weights if smollm_135m.bin (or similar) exists
+    std::string weights_path;
+    const auto *w_desc = manifest.find_file_by_role("weights");
+    if (w_desc && !w_desc->name.empty() && std::ifstream(model_dir + "/" + w_desc->name).good()) {
+        weights_path = model_dir + "/" + w_desc->name;
+    } else if (std::ifstream(model_dir + "/smollm_135m.bin").good()) {
+        weights_path = model_dir + "/smollm_135m.bin";
+    } else if (std::ifstream(model_dir + "/models/smollm_135m.bin").good()) {
+        weights_path = model_dir + "/models/smollm_135m.bin";
+    } else if (std::ifstream("./smollm_135m.bin").good()) {
+        weights_path = "./smollm_135m.bin";
+    } else if (std::ifstream("/home/chri/smollm/models/smollm_135m.bin").good()) {
+        weights_path = "/home/chri/smollm/models/smollm_135m.bin";
+    }
+
+    if (!weights_path.empty()) {
+        if (!load_weights(weights_path)) {
+            std::cerr << "[TransformerSession] Warning: Failed to load binary weights from " << weights_path << std::endl;
+        }
+    }
+
+    if (!m_has_weights) {
+        // Fallback placeholder embedding for test stubs
+        size_t embed_elems = static_cast<size_t>(manifest.config.vocab_size) * manifest.config.hidden_size;
+        m_embed.assign(embed_elems, 0.01f);
+        m_lm_head_weights.assign(embed_elems, 0.01f);
+    }
 
     reset();
     return true;
+}
+
+bool TransformerSession::load_weights(const std::string &bin_path) {
+    std::ifstream f(bin_path, std::ios::binary);
+    if (!f.is_open()) {
+        return false;
+    }
+
+    int header[7];
+    f.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (!f) return false;
+
+    int dim = header[0];
+    int hidden_dim = header[1];
+    int n_layers = header[2];
+    int n_heads = header[3];
+    int n_kv_heads = header[4];
+    int vocab_size = header[5];
+    int seq_len = header[6];
+    int head_dim = n_heads > 0 ? (dim / n_heads) : 64;
+
+    m_manifest.config.hidden_size = dim;
+    m_manifest.config.intermediate_size = hidden_dim;
+    m_manifest.config.num_hidden_layers = n_layers;
+    m_manifest.config.num_attention_heads = n_heads;
+    m_manifest.config.num_key_value_heads = n_kv_heads;
+    m_manifest.config.vocab_size = vocab_size;
+
+    m_embed.resize(static_cast<size_t>(vocab_size) * dim);
+    m_rms_att.resize(static_cast<size_t>(n_layers) * dim);
+    m_wq.resize(static_cast<size_t>(n_layers) * dim * dim);
+    m_wk.resize(static_cast<size_t>(n_layers) * dim * (n_kv_heads * head_dim));
+    m_wv.resize(static_cast<size_t>(n_layers) * dim * (n_kv_heads * head_dim));
+    m_wo.resize(static_cast<size_t>(n_layers) * dim * dim);
+    m_rms_ffn.resize(static_cast<size_t>(n_layers) * dim);
+    m_w_gate.resize(static_cast<size_t>(n_layers) * dim * hidden_dim);
+    m_w_down.resize(static_cast<size_t>(n_layers) * hidden_dim * dim);
+    m_w_up.resize(static_cast<size_t>(n_layers) * dim * hidden_dim);
+    m_rms_final.resize(dim);
+
+    f.read(reinterpret_cast<char*>(m_embed.data()), m_embed.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_rms_att.data()), m_rms_att.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_wq.data()), m_wq.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_wk.data()), m_wk.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_wv.data()), m_wv.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_wo.data()), m_wo.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_rms_ffn.data()), m_rms_ffn.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_w_gate.data()), m_w_gate.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_w_down.data()), m_w_down.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_w_up.data()), m_w_up.size() * sizeof(float));
+    f.read(reinterpret_cast<char*>(m_rms_final.data()), m_rms_final.size() * sizeof(float));
+
+    if (!f) return false;
+
+    m_max_seq = seq_len > 0 ? seq_len : 2048;
+    size_t kv_size = static_cast<size_t>(n_layers) * m_max_seq * (n_kv_heads * head_dim);
+    m_k_cache_flat.assign(kv_size, 0.0f);
+    m_v_cache_flat.assign(kv_size, 0.0f);
+
+    m_x_buf.resize(dim);
+    m_x_norm_buf.resize(dim);
+    m_q_buf.resize(dim);
+    m_k_buf.resize(n_kv_heads * head_dim);
+    m_v_buf.resize(n_kv_heads * head_dim);
+    m_att_out_buf.resize(dim);
+    m_mlp_act_buf.resize(hidden_dim);
+    m_hidden_state.resize(dim);
+    m_logits.resize(vocab_size);
+
+    m_has_weights = true;
+    return true;
+}
+
+void TransformerSession::rmsnorm(float *out, const float *x, const float *weight, int size, float eps) {
+    float sum = 0.0f;
+    for (int i = 0; i < size; ++i) sum += x[i] * x[i];
+    float inv_norm = 1.0f / std::sqrt((sum / size) + eps);
+    for (int i = 0; i < size; ++i) {
+        out[i] = x[i] * inv_norm * weight[i];
+    }
+}
+
+void TransformerSession::apply_rope(float *q, float *k, int pos) {
+    int n_heads = m_manifest.config.num_attention_heads;
+    int n_kv_heads = m_manifest.config.num_key_value_heads;
+    int head_dim = m_manifest.config.hidden_size / n_heads;
+    int half_dim = head_dim / 2;
+    float theta = m_manifest.config.rope_theta > 0.0f ? m_manifest.config.rope_theta : 10000.0f;
+
+    for (int i = 0; i < half_dim; ++i) {
+        float freq = 1.0f / std::pow(theta, static_cast<float>(i) / static_cast<float>(half_dim));
+        float angle = pos * freq;
+        float cos_v = std::cos(angle);
+        float sin_v = std::sin(angle);
+
+        // Rotate Q heads
+        for (int h = 0; h < n_heads; ++h) {
+            float *qh = q + h * head_dim;
+            float v0 = qh[i];
+            float v1 = qh[i + half_dim];
+            qh[i] = v0 * cos_v - v1 * sin_v;
+            qh[i + half_dim] = v0 * sin_v + v1 * cos_v;
+        }
+
+        // Rotate K heads
+        for (int h = 0; h < n_kv_heads; ++h) {
+            float *kh = k + h * head_dim;
+            float v0 = kh[i];
+            float v1 = kh[i + half_dim];
+            kh[i] = v0 * cos_v - v1 * sin_v;
+            kh[i + half_dim] = v0 * sin_v + v1 * cos_v;
+        }
+    }
 }
 
 void TransformerSession::set_sampler_params(const SamplerParams &params) {
@@ -108,6 +244,8 @@ void TransformerSession::set_sampler_params(const SamplerParams &params) {
 
 void TransformerSession::reset() {
     if (m_kv_cache) m_kv_cache->reset();
+    if (!m_k_cache_flat.empty()) std::fill(m_k_cache_flat.begin(), m_k_cache_flat.end(), 0.0f);
+    if (!m_v_cache_flat.empty()) std::fill(m_v_cache_flat.begin(), m_v_cache_flat.end(), 0.0f);
     m_sampler.reset();
     m_current_pos = 0;
 }
@@ -151,6 +289,156 @@ void TransformerSession::forward_lm_head_dual_die(const float *hidden_state, flo
 }
 
 int32_t TransformerSession::step(int32_t token_id, int pos) {
+    if (m_has_weights) {
+        int dim = m_manifest.config.hidden_size;
+        int hidden_dim = m_manifest.config.intermediate_size;
+        int n_layers = m_manifest.config.num_hidden_layers;
+        int n_heads = m_manifest.config.num_attention_heads;
+        int n_kv_heads = m_manifest.config.num_key_value_heads;
+        int head_dim = n_heads > 0 ? (dim / n_heads) : 64;
+        int kv_dim = n_kv_heads * head_dim;
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        // 1. Embedding lookup
+        if (token_id >= 0 && static_cast<size_t>(token_id) < m_manifest.config.vocab_size) {
+            const float *emb_ptr = m_embed.data() + static_cast<size_t>(token_id) * dim;
+            std::memcpy(m_x_buf.data(), emb_ptr, dim * sizeof(float));
+        } else {
+            std::fill(m_x_buf.begin(), m_x_buf.end(), 0.0f);
+        }
+
+        // 2. Transformer layers (0 .. n_layers - 1)
+        for (int L = 0; L < n_layers; ++L) {
+            // Attention RMSNorm
+            rmsnorm(m_x_norm_buf.data(), m_x_buf.data(), m_rms_att.data() + static_cast<size_t>(L) * dim, dim);
+
+            // Q, K, V matrix projections
+            const float *wq_l = m_wq.data() + static_cast<size_t>(L) * dim * dim;
+            const float *wk_l = m_wk.data() + static_cast<size_t>(L) * dim * kv_dim;
+            const float *wv_l = m_wv.data() + static_cast<size_t>(L) * dim * kv_dim;
+
+            #pragma omp parallel for
+            for (int i = 0; i < dim; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < dim; ++j) {
+                    sum += m_x_norm_buf[j] * wq_l[j * dim + i];
+                }
+                m_q_buf[i] = sum;
+            }
+
+            #pragma omp parallel for
+            for (int i = 0; i < kv_dim; ++i) {
+                float sum_k = 0.0f;
+                float sum_v = 0.0f;
+                for (int j = 0; j < dim; ++j) {
+                    sum_k += m_x_norm_buf[j] * wk_l[j * kv_dim + i];
+                    sum_v += m_x_norm_buf[j] * wv_l[j * kv_dim + i];
+                }
+                m_k_buf[i] = sum_k;
+                m_v_buf[i] = sum_v;
+            }
+
+            // Apply RoPE
+            apply_rope(m_q_buf.data(), m_k_buf.data(), pos);
+
+            // Save to KV cache
+            float *k_cache_pos = m_k_cache_flat.data() + (static_cast<size_t>(L) * m_max_seq + pos) * kv_dim;
+            float *v_cache_pos = m_v_cache_flat.data() + (static_cast<size_t>(L) * m_max_seq + pos) * kv_dim;
+            std::memcpy(k_cache_pos, m_k_buf.data(), kv_dim * sizeof(float));
+            std::memcpy(v_cache_pos, m_v_buf.data(), kv_dim * sizeof(float));
+
+            // Grouped Query Attention (3:1 ratio for SmolLM)
+            std::fill(m_att_out_buf.begin(), m_att_out_buf.end(), 0.0f);
+            int group_ratio = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
+
+            #pragma omp parallel for
+            for (int h = 0; h < n_heads; ++h) {
+                int kv_h = h / group_ratio;
+                const float *q_head = m_q_buf.data() + h * head_dim;
+                float *out_head = m_att_out_buf.data() + h * head_dim;
+
+                std::vector<float> scores(pos + 1);
+                float max_s = -1e9f;
+                for (int t = 0; t <= pos; ++t) {
+                    const float *k_head = m_k_cache_flat.data() + (static_cast<size_t>(L) * m_max_seq + t) * kv_dim + kv_h * head_dim;
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += q_head[d] * k_head[d];
+                    }
+                    scores[t] = dot * scale;
+                    if (scores[t] > max_s) max_s = scores[t];
+                }
+
+                float exp_sum = 0.0f;
+                for (int t = 0; t <= pos; ++t) {
+                    scores[t] = std::exp(scores[t] - max_s);
+                    exp_sum += scores[t];
+                }
+                float inv_exp_sum = 1.0f / (exp_sum > 0.0f ? exp_sum : 1.0f);
+
+                for (int t = 0; t <= pos; ++t) {
+                    float weight = scores[t] * inv_exp_sum;
+                    const float *v_head = m_v_cache_flat.data() + (static_cast<size_t>(L) * m_max_seq + t) * kv_dim + kv_h * head_dim;
+                    for (int d = 0; d < head_dim; ++d) {
+                        out_head[d] += weight * v_head[d];
+                    }
+                }
+            }
+
+            // Output projection + residual
+            const float *wo_l = m_wo.data() + static_cast<size_t>(L) * dim * dim;
+            #pragma omp parallel for
+            for (int i = 0; i < dim; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < dim; ++j) {
+                    sum += m_att_out_buf[j] * wo_l[j * dim + i];
+                }
+                m_x_buf[i] += sum;
+            }
+
+            // FFN RMSNorm
+            rmsnorm(m_x_norm_buf.data(), m_x_buf.data(), m_rms_ffn.data() + static_cast<size_t>(L) * dim, dim);
+
+            // SwiGLU MLP: DownProj(SiLU(Gate) * Up)
+            const float *w_gate_l = m_w_gate.data() + static_cast<size_t>(L) * dim * hidden_dim;
+            const float *w_up_l = m_w_up.data() + static_cast<size_t>(L) * dim * hidden_dim;
+            const float *w_down_l = m_w_down.data() + static_cast<size_t>(L) * hidden_dim * dim;
+
+            #pragma omp parallel for
+            for (int i = 0; i < hidden_dim; ++i) {
+                float g = 0.0f;
+                float u = 0.0f;
+                for (int j = 0; j < dim; ++j) {
+                    g += m_x_norm_buf[j] * w_gate_l[j * hidden_dim + i];
+                    u += m_x_norm_buf[j] * w_up_l[j * hidden_dim + i];
+                }
+                float silu = g / (1.0f + std::exp(-g));
+                m_mlp_act_buf[i] = silu * u;
+            }
+
+            // Down projection + residual
+            #pragma omp parallel for
+            for (int i = 0; i < dim; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < hidden_dim; ++j) {
+                    sum += m_mlp_act_buf[j] * w_down_l[j * dim + i];
+                }
+                m_x_buf[i] += sum;
+            }
+        }
+
+        // 3. Final RMSNorm
+        rmsnorm(m_x_norm_buf.data(), m_x_buf.data(), m_rms_final.data(), dim);
+
+        // 4. Dual-Die LM Head execution (or host fallback)
+        forward_lm_head_dual_die(m_x_norm_buf.data(), m_logits.data());
+
+        // 5. Sample next token
+        int32_t next_token = m_sampler.sample(m_logits.data(), m_logits.size());
+        m_sampler.accept(next_token);
+        return next_token;
+    }
+
     uint32_t hidden_size = m_manifest.config.hidden_size;
 
     // 1. Embedding lookup
@@ -220,8 +508,9 @@ bool TransformerSession::generate(
             }
         }
 
-        // Stop on EOS
-        if (static_cast<uint32_t>(next_token) == m_manifest.config.eos_token_id) {
+        // Stop on EOS (<|im_end|> = 2, <|endoftext|> = 0)
+        if (next_token == 0 || next_token == 2 ||
+            static_cast<uint32_t>(next_token) == m_manifest.config.eos_token_id) {
             break;
         }
 
