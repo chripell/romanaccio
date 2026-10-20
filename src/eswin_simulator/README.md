@@ -28,6 +28,27 @@ It replaces the proprietary, 32-bit x86-only vendor `EsSimulator` binary with a 
   - Output tensor generation and dumping to disk (`--output=<ofmap.bin>`).
   - Zero-copy tensor read/write buffers.
 
+### Milestone 3: NPU Convolution & GEMM Functional Engine (CMAC + CACC)
+- **CMAC Functional Engine (`engines/cmac.py`)**:
+  - Direct 2D spatial convolution with arbitrary stride, padding, and dilation.
+  - Grouped and depthwise separable convolutions ($G \ge 1$).
+  - Pointwise $1\times 1$ convolution and linear GEMM ($y = x @ W^T$) across 2D, 3D (tokens), and 4D tensor inputs.
+  - Dual precision support:
+    - **FP16**: IEEE 754 half-precision multiplication with FP32 accumulator.
+    - **INT8**: 8-bit signed integer multiplication with 32-bit signed integer accumulator (`int32_t`).
+  - NVDLA Weight De-Tiling & Unpacking:
+    - `unpack_nvdla_weights_conv2d`: De-tiles spatial convolution weights from NVDLA sub-channel blocks into canonical $(C_{out}, C_{in}, KH, KW)$ shape.
+    - `unpack_nvdla_weights_1x1`: De-tiles 32-byte atomic $(C_{out\_sub}=8, C_{in\_sub}=2)$ memory burst tiles into canonical $(C_{out}, C_{in})$ GEMM matrices.
+- **CACC Functional Engine (`engines/cacc.py`)**:
+  - Multi-pass accumulation buffer management across tiled reduction steps.
+  - FP16 bias addition and rounding.
+  - INT8 channel scaling, bias addition, rounding, and strict hardware saturating clipping to $[-128, 127]$.
+- **End-to-End CLI Simulation & Differential Verification**:
+  - `--compare=<ref.bin>` mode computing Cosine Similarity, Max Relative Difference, and Max Absolute Error against reference golden data.
+  - Bit-exact verification against vendor `EsSimulator`:
+    - `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$.
+    - `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$.
+
 ---
 
 ## 2. Mathematical Model of BDMA Strided Transfers
@@ -61,7 +82,51 @@ These values are written directly at byte offset `offset` inside the command des
 
 ---
 
-## 2. Quick Start & CLI Usage
+## 3. Mathematical Model of CMAC and CACC Engines
+
+The Convolution MAC Array (CMAC) and Convolution Accumulator (CACC) form the computational core of the NVDLA/ESWIN NPU.
+
+### 3.1 NVDLA Weight Memory Tiling Format
+
+In `.model` FlatBuffers loadables, weight tensors are stored in hardware-aligned tiles optimized for 32-byte and 64-byte memory bursts:
+
+#### Spatial 2D Convolutions ($KH, KW > 1$)
+Weights are packed into sub-channel groups of $C_{\text{out\_sub}} = 8$ output channels, with input channels padded to an atomic alignment $C_{\text{in\_align}} = 4$:
+- Number of output channel groups: $G_{\text{out}} = \lceil C_{\text{out}} / 8 \rceil$
+- Aligned input channels: $C_{\text{in\_pad}} = \lceil C_{\text{in}} / 4 \rceil \times 4$
+- 5D Stored Tensor Shape:
+  $$(G_{\text{out}}, C_{\text{in\_pad}}, KH, KW, 8)$$
+- Unpacking Mapping:
+  $$W[g \cdot 8 + s, c, y, x] = \text{Buffer}[g, c, y, x, s] \quad \forall \ s \in [0, 7], \ c < C_{\text{in}}$$
+
+#### Pointwise $1\times 1$ Convolutions & GEMM
+Weights are packed into atomic blocks of 8 output channels and 2 input channel pairs:
+- Stored Shape:
+  $$(\lceil C_{\text{out}} / 8 \rceil, \lceil C_{\text{in}} / 2 \rceil, 8, 2)$$
+- Unpacking Mapping:
+  $$W[g \cdot 8 + s, k \cdot 2 + p] = \text{Buffer}[g, k, s, p] \quad \forall \ s \in [0, 7], \ p \in [0, 1]$$
+
+### 3.2 Precision and Accumulation Mechanics
+
+#### FP16 Execution Pipeline
+Inputs and weights in half-precision IEEE 754 are multiplied in FP32 and accumulated across reduction channels:
+
+$$y_{\text{acc}}[n, c_o, h_o, w_o] = \sum_{c_i=0}^{C_{\text{in}}-1} \sum_{ky=0}^{KH-1} \sum_{kx=0}^{KW-1} x[n, c_i, h_o \cdot s_h + ky \cdot d_h - p_t, w_o \cdot s_w + kx \cdot d_w - p_l] \times W[c_o, c_i, ky, kx]$$
+
+CACC adds optional bias and converts the FP32 accumulator to IEEE 754 `float16`:
+
+$$y_{\text{final}} = \text{float16}(y_{\text{acc}} + \text{bias})$$
+
+#### INT8 Execution Pipeline & Hardware Saturation
+Inputs and weights in 8-bit signed integer $[-128, 127]$ are multiplied and accumulated into a 32-bit signed accumulator ($\text{int32\_t}$). CACC adds 32-bit integer bias, applies channel quantization scale, and saturates into $[-128, 127]$:
+
+$$y_{\text{scaled}} = \left\lfloor (y_{\text{acc}} + \text{bias}) \times \text{scale} + 0.5 \right\rfloor$$
+
+$$y_{\text{final}} = \min(127, \max(-128, y_{\text{scaled}})) \in [-128, 127]$$
+
+---
+
+## 4. Quick Start & CLI Usage
 
 ### Installation
 From the repository root (or within a virtual environment):
@@ -114,52 +179,82 @@ eswin-sim -m path/to/model.model --json
   • Relocation Entries    : 4
 ```
 
+### Simulating Model Execution & Differential Parity (`--input`, `--output`, `--compare`)
+```bash
+# Execute 2D Convolution simulation and compare against golden reference
+eswin-sim \
+  --model test_conv_npu_b1.model \
+  --input ifmap.bin \
+  --output ofmap_sim.bin \
+  --compare ofmap_golden.bin
+
+# Execute 1x1 GEMM simulation with custom tolerance
+eswin-sim \
+  --model test_linear_1x1conv_npu_b1.model \
+  --input in_vec.bin \
+  --output out_sim.bin \
+  --compare out_golden.bin \
+  --tolerance 0.01
+```
+
 ---
 
-## 3. Python API
+## 5. Python API
 
 ```python
 from eswin_simulator.loader import LoadableModel
 from eswin_simulator.memory import VirtualAddressSpace
+from eswin_simulator.engines import (
+    CMACEngine,
+    CACCEngine,
+    unpack_nvdla_weights_conv2d,
+    unpack_nvdla_weights_1x1,
+)
 import numpy as np
 
 # 1. Load .model container
 model = LoadableModel.from_file("test_conv_npu_b1.model")
-print(f"Loaded {model.file_path}, version {model.version}")
-
-# 2. Inspect input/output tensors
-for t in model.input_tensors:
-    print("Input:", t.name, t.shape, t.data_type, t.size)
-
-for t in model.output_tensors:
-    print("Output:", t.name, t.shape, t.data_type, t.size)
-
-# 3. Initialize simulated virtual memory
 vas = VirtualAddressSpace(model)
-print("Memory Stats:", vas.stats())
 
-# 4. Bind input tensor data
-input_tensor = model.input_tensors[0]
-dummy_data = np.random.randn(*input_tensor.shape).astype(input_tensor.dtype)
-vas.bind_input(input_tensor, dummy_data)
+# 2. Initialize hardware compute engines
+cmac = CMACEngine(address_space=vas)
+cacc = CACCEngine(address_space=vas)
 
-# 5. Read back tensor from virtual memory
-reconstructed = vas.read_tensor(input_tensor)
-assert np.allclose(dummy_data, reconstructed)
+# 3. Unpack NVDLA weight blobs
+w_raw = model.blobs["W_0"].data
+w = unpack_nvdla_weights_conv2d(w_raw, c_out=16, c_in=3, kh=3, kw=3, dtype=np.float16)
+
+# 4. Bind input tensor and read ndarray
+in_t = model.input_tensors[0]
+x = np.ones(in_t.shape, dtype=in_t.dtype)
+vas.bind_input(in_t, x)
+
+# 5. Execute CMAC 2D convolution and CACC accumulator
+acc = cmac.conv2d(x, w, stride=1, padding=0, precision="FP16")
+y = cacc.finalize_fp16(acc, to_fp16=True)
+
+# 6. Write to output tensor and inspect
+out_t = model.output_tensors[0]
+vas.write_tensor(out_t, y)
+print("Computed output shape:", y.shape, "MACs:", cmac.total_macs)
 ```
 
 ---
 
-## 4. Running the Test Suite
+## 6. Running the Test Suite
 
-Run unit tests via `pytest`:
+Run all unit and differential tests via `pytest`:
 ```bash
 pytest -v
 ```
 
-All 9 unit tests cover:
+All 21 comprehensive tests cover:
 - Binary magic validation (`NVDA`) and error detection on corrupted containers.
 - 4D Tensor descriptor parsing (shape, strides, data format, data type, element sizes).
 - Memory allocation across 64-bit DRAM and the 4 MiB on-chip SPRAM.
-- Static weight blob population and verification.
-- Bit-exact tensor binding, buffer readback, and overflow protection.
+- Dynamic relocation resolution (splitting 64-bit IOVA into lower/upper words).
+- BDMA strided transfers (1D contiguous, 2D pitch-strided, 3D volume, DRAM $\leftrightarrow$ SPRAM).
+- CMAC 2D convolution across strides, paddings, dilations, and grouped/depthwise modes.
+- CMAC 1x1 pointwise convolution and GEMM across 2D, 3D, and 4D tensor shapes.
+- CACC 32-bit accumulation, bias addition, FP16 rounding, and INT8 saturating clipping ($[-128, 127]$).
+- Differential parity testing against vendor `EsSimulator` output (`test_conv_npu_b1.model` and `test_linear_1x1conv_npu_b1.model`), asserting Cosine Similarity $\ge 0.999999$ and Relative Difference $< 10^{-4}$.

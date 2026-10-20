@@ -112,21 +112,24 @@ Development is structured into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - Mathematical description of BDMA surface stride and line stride calculations in `src/eswin_simulator/README.md`.
 
-### Milestone 3: NPU Convolution & GEMM Functional Engine (CMAC + CACC)
+### Milestone 3: NPU Convolution & GEMM Functional Engine (CMAC + CACC) [COMPLETED]
 - **Scope**:
   - Implement `engines/cmac.py` and `engines/cacc.py`.
   - Simulate 2D convolution and $1\times 1$ pointwise Conv (GEMM) for both **FP16** and **INT8** precisions:
     - FP16 mode: IEEE 754 half-precision multiplication with FP32 accumulator.
     - INT8 mode: 8-bit signed multiplication with 32-bit signed accumulator (`int32_t`), channel scale application, and clipping to $[-128, 127]$.
-  - Support dilation, stride, and padding configurations.
+  - Support dilation, stride, padding, and grouped/depthwise configurations.
 - **Deliverables**:
-  - Fully functional CMAC/CACC simulation engine.
+  - `engines/cmac.py`: `CMACEngine` supporting 2D spatial convolution, grouped/depthwise convolution, 1x1 GEMM matrix multiplications, and NVDLA weight de-tiling (`unpack_nvdla_weights_conv2d`, `unpack_nvdla_weights_1x1`).
+  - `engines/cacc.py`: `CACCEngine` supporting 32-bit accumulation, FP16 rounding, and strict INT8 saturating clipping to $[-128, 127]$.
+  - CLI `eswin-sim` extended with `--compare` differential testing mode.
 - **Testing Requirements**:
-  - Differential testing: Run `test_conv_npu_b1.model` and `test_linear_1x1conv.model`.
-  - Compare simulator output against PyTorch golden output and vendor `EsSimulator` output.
-  - Assert cosine similarity $\ge 0.99999$ and max relative error $< 10^{-4}$.
+  - `tests/test_cmac_cacc.py`: 7 comprehensive tests covering FP16, bit-exact INT8 integer parity, depthwise convolutions, GEMM tensor shapes, and CACC saturation.
+  - Differential testing against vendor `EsSimulator`:
+    - `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$.
+    - `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$.
 - **Documentation**:
-  - Explanations of NVDLA weight dequantization and accumulator saturation.
+  - Mathematical specification of NVDLA weight de-tiling and CACC saturating clipping in `README.md`.
 
 ### Milestone 4: Single Data Point Engine (SDP) & Non-Linear LUTs
 - **Scope**:

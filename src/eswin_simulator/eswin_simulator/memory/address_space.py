@@ -229,6 +229,22 @@ class VirtualAddressSpace:
             dtype=tensor.dtype,
         )
 
+    def write_tensor(self, tensor: TensorDescriptor, data: Union[np.ndarray, bytes, bytearray, memoryview]) -> None:
+        """Writes data into the tensor's memory location in virtual address space."""
+        buf = self.get_region_buffer(tensor.mem_id)
+        if isinstance(data, np.ndarray):
+            raw_bytes = data.astype(tensor.dtype).tobytes()
+        elif isinstance(data, (bytes, bytearray, memoryview)):
+            raw_bytes = bytes(data)
+        else:
+            raise TypeError(f"Unsupported data type for write_tensor: {type(data)}")
+
+        if len(raw_bytes) > tensor.size:
+            raise ValueError(
+                f"Data size ({len(raw_bytes)}B) exceeds tensor '{tensor.name}' capacity ({tensor.size}B)."
+            )
+        buf.write(tensor.offset, raw_bytes)
+
     def write_bytes(self, address_id: int, offset: int, data: bytes) -> None:
         """Writes raw bytes to an address ID with relative offset."""
         buf, base_off, max_size = self.resolve_address(address_id)
