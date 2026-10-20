@@ -301,9 +301,27 @@ The NVDLA hardware convolution core expects FP16 weights packed into hardware at
 - Memory layout: Padded tensor of shape `(c_out_groups, 8, c_in_aligned, K_h, K_w)` transposed to `(c_out_groups, c_in_aligned, K_h, K_w, 8)`.
 - Flattening weights sequentially without this transformation causes hardware CMAC fetch hangs.
 
-### 5.4 Physical Silicon Parity Results
+### 5.4 Physical Silicon Parity Results (2D Convolution)
 A custom 2D convolution model (`test_compiler_e2e.model`) compiled directly from an EIR graph via `eswin_compiler` achieved:
 - **Die 0**: 0.18 ms average latency (**5,479 fps** throughput).
 - **Die 1**: 1.32 ms average latency (**758 fps** throughput).
 - **Numerical Parity**: Verified with `es_run_model -v -t 0.05` reporting **`Cosine similarity compare success!`** against PyTorch golden outputs.
+
+### 5.5 1x1 Pointwise Multi-Pass GEMM Architecture & Verification
+Linear projection layers in transformer models (e.g. SmolLM, Gemma, Qwen2 QKV projections and MLP expansions) operate as $1\times 1$ pointwise matrix multiplications:
+- **Weight Packing Layout**: FP16 weights are organized into hardware atomic tiles of 8 output channels and 2 input channels:
+  $$\text{Shape: } \left(\left\lceil\frac{C_{out}}{8}\right\rceil, \left\lceil\frac{C_{in}}{2}\right\rceil, 8, 2\right)$$
+  Transposed from $\left(\left\lceil\frac{C_{out}}{8}\right\rceil, 8, \left\lceil\frac{C_{in}}{2}\right\rceil, 2\right)$.
+- **3-Pass SRAM Tiling (`tiling_M_Concat`)**:
+  When $C_{out} = 1536$ (e.g. SmolLM MLP expansion / QKV projection), the layer is split into 3 symmetric passes of 512 output channels each ($M_0, M_1, M_2$).
+  Each pass:
+  1. BDMA transfers weight slice ($589,824$ bytes) from DRAM to on-chip SPRAM.
+  2. CDMA streams activation input ($C_{in} = 576$, 1152 bytes) and weights from SPRAM into CMAC.
+  3. SDP accumulates and writes the 1024-byte output slice to offset $p \times 1024$ in the concatenated output buffer.
+- **Physical Silicon Verification**:
+  Synthesized and compiled an end-to-end 3-pass GEMM model (`test_compiler_gemm_e2e.model`, 1.8 MB) with random weights directly using `NVDLAGEMMBuilder`.
+  - **Die 0**: Average latency **0.24 ms** (**4,120 fps** throughput).
+  - **Die 1**: Average latency **1.20 ms** (**833 fps** throughput).
+  - **Numerical Parity**: Tested with `es_run_model -v -t 0.05` reporting **`Cosine similarity compare success!`** against golden PyTorch outputs.
+
 
