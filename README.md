@@ -18,16 +18,22 @@ romanaccio/
 │   ├── SYSTEM_CAPABILITIES_AND_MODELS.md # Compute envelope, latency benchmarks, model feasibility
 │   ├── RUNTIME_API.md                # Userspace NPU runtime API specification & multi-die caveats
 │   └── CPU_NPU_PROTOCOL.md           # Kernel ioctl catalog (eic7700_npu.ko) & SMMU DMA mapping
+├── etc/
+│   └── TranslateGemma-4B-IT/         # Google TranslateGemma 4B translation engine (PLAN.md)
 └── src/
-    ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
-    ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
     ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
     ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
     ├── eswin_runtime/                # Open C11/C++ NPU runtime, CLI chat REPL & Python bindings
     ├── smollm/                       # SmolLM-135M chat engine (v1 prototype)
     ├── smollm_v2/                    # SmolLM-135M chat engine (v2 using Open Runtime & dual-die NPU)
     ├── qwen2_fix/                    # Root cause fixes for Issue #47 (v1 standalone prototype)
-    └── qwen2_v2/                     # Qwen2 / DeepSeek chat engine (v2 using Open Runtime & anti-looping)
+    ├── qwen2_v2/                     # Qwen2 / DeepSeek chat engine (v2 using Open Runtime & anti-looping)
+    ├── gemma-4-12B-it-Uncensored-Aquarion-INT8/ # Gemma-4 12B INT8 dual-die inference (PLAN.md)
+    ├── yolov11/                      # Ultralytics YOLO11 dual-NPU real-time vision (PLAN.md)
+    ├── TranslateGemma-4B-IT/         # TranslateGemma 4B machine translation (PLAN.md)
+    ├── whisper/                      # OpenAI Whisper edge speech-to-text (PLAN.md)
+    ├── qwen2_vl/                     # Qwen2-VL-2B multimodal vision-language model (PLAN.md)
+    └── qwen2_5_coder/                # Qwen2.5-Coder-1.5B/7B high-speed copilot (PLAN.md)
 ```
 
 ---
@@ -58,6 +64,20 @@ A production-ready C11 and Python userspace runtime library (`libes_runtime.so`)
   Incremental plan for an open-source `EsAAC` alternative. Features a hybrid frontend (ONNX for vision; native `safetensors` + `config.json` for LLMs), 4D tensor IR, NVDLA hardware engine lowering, and DSP offloading.
 - **Open Simulator (`src/eswin_simulator/PLAN.md`)**:
   Incremental plan for a 64-bit cross-platform `EsSimulator` equivalent for bit-accurate numerical verification against PyTorch and ONNX golden data.
+
+### 2.5 Modern Neural Network Acceleration Plans
+- **Gemma-4-12B-it INT8 (`src/gemma-4-12B-it-Uncensored-Aquarion-INT8/PLAN.md`)**:
+  Comprehensive feasibility assessment and dual-die pipelined execution plan for the 12-Billion parameter Gemma-4 model. Partitions 48 transformer layers (24 per die) and the 262k LM head across 22 GiB of MMZ VRAM with hybrid sliding-window attention management.
+- **YOLO11 Real-Time Vision (`src/yolov11/PLAN.md`)**:
+  Ultralytics YOLO11 (n, s, m, l, x) acceleration roadmap utilizing the hardware CMAC, SDP (SiLU LUT), PDP (SPPF MaxPool), and RUBIK engines. Supports 130–180 FPS single-die inference and dual-die dual-camera concurrent 1080p60 streaming.
+- **TranslateGemma-4B-IT (`etc/TranslateGemma-4B-IT/PLAN.md`)**:
+  High-accuracy offline translation engine covering 55 languages. Ingests Google LiteRT (`.task` / `.tflite`) and Hugging Face weights, achieving 5.0–9.0 tokens/second on the dual-die pipeline.
+- **OpenAI Whisper Speech-to-Text (`src/whisper/PLAN.md`)**:
+  Privacy-preserving, fully offline voice transcription and dictation. Maps 1D audio convolutions and encoder attention directly to hardware, reaching >15x real-time transcription speeds.
+- **Qwen2-VL-2B Multimodal Assistant (`src/qwen2_vl/PLAN.md`)**:
+  Vision-Language model pairing SigLIP / ViT patch convolutions on Die 0 with our proven Qwen2 dual-die LLM engine for image analysis, visual document OCR, and UI reasoning.
+- **Qwen2.5-Coder-1.5B & DeepSeek-R1-Distill-1.5B (`src/qwen2_5_coder/PLAN.md`)**:
+  High-speed terminal copilot and interactive coding engine generating at 35–45 tokens/second with instant response times.
 
 ---
 
