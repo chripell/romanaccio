@@ -12,6 +12,7 @@ find_package(OpenMP)
 # Core Runtime Library
 set(RUNTIME_SOURCES
     src/backend/driver_wrapper.cpp
+    src/backend/dsp_driver.cpp
     src/backend/dma_buffer.cpp
     src/backend/worker_pool.cpp
     src/model/sha256.cpp
@@ -65,6 +66,11 @@ target_link_libraries(test_runtime_e2e PRIVATE es_runtime ${CMAKE_DL_LIBS} pthre
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
+# DSP Core Runner Tool Executable
+add_executable(es_run_dsp tools/es_run_dsp.cpp)
+target_include_directories(es_run_dsp PRIVATE src)
+target_link_libraries(es_run_dsp PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
 enable_testing()
 add_test(NAME test_dma_alloc COMMAND test_dma_alloc)
