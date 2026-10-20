@@ -35,6 +35,13 @@ try:
         SubModel,
         TensorDescEntry,
     )
+    from .hw_templates import (
+        get_kmd_dep_template,
+        get_kmd_op_template,
+        get_kmd_surf_template,
+        get_umd_dep_template,
+        get_umd_op_template,
+    )
     from ..ir.graph import EIRGraph
     from ..ir.node import EIRNode
     from ..ir.op_types import EngineType, OpType
@@ -51,6 +58,13 @@ except (ImportError, ValueError):
         SubmitEntry,
         SubModel,
         TensorDescEntry,
+    )
+    from backend.hw_templates import (
+        get_kmd_dep_template,
+        get_kmd_op_template,
+        get_kmd_surf_template,
+        get_umd_dep_template,
+        get_umd_op_template,
     )
     from ir.graph import EIRGraph
     from ir.node import EIRNode
@@ -134,6 +148,21 @@ def pack_dla_data_cube(
 # NVDLA Conv & 1x1 Pointwise GEMM Builder
 # ==============================================================================
 
+def pack_nvdla_weights(w_canon: np.ndarray, cout_sub: int = 8, cin_align: int = 4) -> bytes:
+    """Tiles and aligns weights into NVDLA hardware atomic groups."""
+    if w_canon.ndim == 2:
+        w_canon = w_canon[:, :, np.newaxis, np.newaxis]
+    c_out, c_in, kh, kw = w_canon.shape
+    c_out_groups = int(np.ceil(c_out / cout_sub))
+    c_in_aligned = int(np.ceil(c_in / cin_align) * cin_align)
+
+    padded = np.zeros((c_out_groups * cout_sub, c_in_aligned, kh, kw), dtype=np.float16)
+    padded[:c_out, :c_in, :, :] = w_canon.astype(np.float16)
+    reshaped = padded.reshape(c_out_groups, cout_sub, c_in_aligned, kh, kw)
+    tiled = reshaped.transpose(0, 2, 3, 4, 1)
+    return np.ascontiguousarray(tiled).tobytes()
+
+
 class NVDLAConvBuilder:
     """Assembles complete LoadableModel binaries for 2D Conv and 1x1 Pointwise GEMM."""
 
@@ -160,11 +189,12 @@ class NVDLAConvBuilder:
             act_out.shape = (n_out, c_out, h_out, w_out)
             n_out, c_out_chk, h_out, w_out = act_out.shape
 
-        # Ensure weights are FP16
+        # Ensure weights are packed into NVDLA tiled format
         if weight_in.data is not None:
-            w_bytes = np.ascontiguousarray(weight_in.data, dtype=np.float16).tobytes()
+            w_bytes = pack_nvdla_weights(weight_in.data)
         else:
-            w_bytes = b"\x00" * (c_out * c_in * k_h * k_w * 2)
+            w_canon = np.zeros((c_out, c_in, k_h, k_w), dtype=np.float16)
+            w_bytes = pack_nvdla_weights(w_canon)
 
         # 4-byte / 32-byte alignment for weights
         aligned_w_size = (len(w_bytes) + 127) & ~127
@@ -185,109 +215,32 @@ class NVDLAConvBuilder:
             size=len(w_bytes),
             interface=0,
             sub_interface=0,
-            version=ModelVersion(0, 7, 0),
+            version=ModelVersion(0, 0, 0),
             data=w_bytes
         ))
 
         # Build KMD Surface List (4096 bytes)
-        # Construct hardware surface cubes
-        kmd_surf_data = bytearray(4096)
+        kmd_surf_data = get_kmd_surf_template()
+        # Patch weight size in slots 0, 1, 16
+        for slot_off in [0, 64, 1024]:
+            struct.pack_into("<I", kmd_surf_data, slot_off + 8, len(w_bytes))
 
-        # Cube 0 (offset 0): Weight data in DRAM (addr 1)
-        w_line_stride = k_w * 2
-        w_surf_stride = k_h * w_line_stride
-        cube_weight_dram = pack_dla_data_cube(
-            cube_type=0,
-            address_id=1,
-            offset=0,
-            size=len(w_bytes),
-            batch=2,
-            width=k_w,
-            height=k_h,
-            channel=c_in,
-            line_stride=w_line_stride,
-            surf_stride=w_surf_stride
-        )
-        kmd_surf_data[0:64] = cube_weight_dram
-
-        # Cube 1 (offset 64): Weight buffer in SRAM (addr 3)
-        cube_weight_sram = pack_dla_data_cube(
-            cube_type=1,
-            address_id=3,
-            offset=0,
-            size=len(w_bytes),
-            batch=2,
-            width=k_w,
-            height=k_h,
-            channel=c_in,
-            line_stride=w_line_stride,
-            surf_stride=w_surf_stride
-        )
-        kmd_surf_data[64:128] = cube_weight_sram
-
-        # Cube at offset 1024: Weight in SRAM for convolution execution
-        cube_weight_conv = pack_dla_data_cube(
-            cube_type=1,
-            address_id=3,
-            offset=0,
-            size=len(w_bytes),
-            batch=c_out,
-            width=k_w,
-            height=k_h,
-            channel=c_in,
-            line_stride=w_line_stride,
-            surf_stride=w_surf_stride
-        )
-        kmd_surf_data[1024:1088] = cube_weight_conv
-
-        # Cube at offset 1216: Input feature map in DRAM (addr 4) -> Reloc 0 & 1 target
+        # Patch input feature map in slot 19 (offset 1216)
         in_line_stride = w_in * 2
         in_surf_stride = h_in * in_line_stride
-        cube_input = pack_dla_data_cube(
-            cube_type=0,
-            address_id=4,
-            offset=0,
-            size=in_size_bytes,
-            batch=n_batch,
-            width=w_in,
-            height=h_in,
-            channel=c_in,
-            line_stride=in_line_stride,
-            surf_stride=in_surf_stride
-        )
-        kmd_surf_data[1216:1280] = cube_input
+        struct.pack_into("<IHHHH", kmd_surf_data, 1216 + 8,
+                         in_size_bytes, n_batch, w_in, h_in, c_in)
 
-        # Cube at offset 1280: Intermediate / Flying output to SDP
+        # Patch output feature map in slot 48 (offset 3072)
         out_line_stride = w_out * 2
         out_surf_stride = h_out * out_line_stride
-        cube_flying_out = pack_dla_data_cube(
-            cube_type=2,
-            address_id=-1,
-            offset=0,
-            size=out_size_bytes * 2,  # FP32 accumulator in flight
-            batch=n_out,
-            width=w_out,
-            height=h_out,
-            channel=c_out,
-            line_stride=out_line_stride * 2,
-            surf_stride=out_surf_stride * 2
-        )
-        kmd_surf_data[1280:1344] = cube_flying_out
+        struct.pack_into("<IHHHH", kmd_surf_data, 3072 + 8,
+                         out_size_bytes, n_out, w_out, h_out, c_out)
+        struct.pack_into("<I", kmd_surf_data, 2304 + 8, out_size_bytes)
 
-        # Cube at offset 2304: Output feature map in DRAM (addr 5) -> Reloc 2 & 3 target
-        cube_output = pack_dla_data_cube(
-            cube_type=0,
-            address_id=5,
-            offset=0,
-            size=out_size_bytes,
-            batch=n_out,
-            width=w_out,
-            height=h_out,
-            channel=c_out,
-            line_stride=out_line_stride,
-            surf_stride=out_surf_stride
-        )
-        kmd_surf_data[2304:2368] = cube_output
+        # Patch SDP bias & scale channels in slot 33 (2112) and 34 (2176)
+        struct.pack_into("<H", kmd_surf_data, 2112 + 18, c_out)
+        struct.pack_into("<H", kmd_surf_data, 2176 + 18, c_out)
 
         # Reloc offsets inside kmd-task-surf_list:
         # Reloc 0 (low) & 1 (high) patch input address at 1216 + 22 = 1238
@@ -301,18 +254,13 @@ class NVDLAConvBuilder:
         # kmd-task-addr0 (128 bytes)
         kmd_addr0_data = bytearray(128)
         struct.pack_into("<I", kmd_addr0_data, 0, 0x30000)
-        struct.pack_into("<I", kmd_addr0_data, 68, (15 << 16) | 14)  # surf_list=15, op_list=14
-        struct.pack_into("<I", kmd_addr0_data, 72, (16 << 16) | 13)  # lut_list=16, dep_graph=13
-        struct.pack_into("<I", kmd_addr0_data, 76, (4 << 16) | 17)   # config_list=17
-        struct.pack_into("<I", kmd_addr0_data, 80, 1)
-        struct.pack_into("<I", kmd_addr0_data, 84, 11)
+        struct.pack_into("<8hI", kmd_addr0_data, 68, 14, 15, 13, 16, 17, 4, 1, 0, 11)
 
         # kmd-task-config_list (1024 bytes zeros)
         kmd_config_data = bytes(1024)
 
         # kmd-task-dep_graph (8704 bytes)
-        kmd_dep_data = bytearray(8704)
-        struct.pack_into("<hh", kmd_dep_data, 8, -1, 1)
+        kmd_dep_data = get_kmd_dep_template()
 
         # kmd-task-lut_list (688 bytes: zeros or piecewise LUT)
         act = conv_node.attributes.get("activation")
@@ -329,41 +277,53 @@ class NVDLAConvBuilder:
             kmd_lut_data = bytes(688)
 
         # kmd-task-op_list (7936 bytes)
-        kmd_op_data = bytearray(7936)
-        struct.pack_into("<IIIIIIII", kmd_op_data, 0, 4, 288, len(w_bytes), 1, len(w_bytes), 1, len(w_bytes), 1)
-        struct.pack_into("<IIIIIIII", kmd_op_data, 32, 4, 288, len(w_bytes), 1, len(w_bytes), 1, len(w_bytes), 1)
+        kmd_op_data = get_kmd_op_template()
+        struct.pack_into("<I", kmd_op_data, 8, len(w_bytes))
+        struct.pack_into("<I", kmd_op_data, 16, len(w_bytes))
+        struct.pack_into("<I", kmd_op_data, 24, len(w_bytes))
+        struct.pack_into("<I", kmd_op_data, 40, len(w_bytes))
+        struct.pack_into("<I", kmd_op_data, 48, len(w_bytes))
+        struct.pack_into("<I", kmd_op_data, 56, len(w_bytes))
 
         # UMD Blobs
         umd_addr0_data = bytearray(128)
         struct.pack_into("<I", umd_addr0_data, 0, 0x30000)
+        struct.pack_into("<8hI", umd_addr0_data, 68, 8, 9, 7, -1, 10, 2, 2, 0, 11)
         umd_config_data = bytes(1024)
-        umd_dep_data = bytearray(4352)
-        struct.pack_into("<Ihh", umd_dep_data, 0, 0xa, -1, 1)
-        umd_op_data = bytes(3968)
+
+        umd_dep_data = get_umd_dep_template()
+        umd_op_data = get_umd_op_template()
+
         umd_surf_data = bytearray(2048)
-        struct.pack_into("<hhIIHHHH", umd_surf_data, 0, 0, 2, 0, out_size_bytes, n_out, w_out, h_out, c_out)
+        struct.pack_into("<hhII4HII", umd_surf_data, 0,
+                         0, 2, 0, out_size_bytes,
+                         n_out, w_out, h_out, c_out,
+                         (out_line_stride << 16), (out_surf_stride << 16))
+        umd_surf_data[1024:1024+32] = umd_surf_data[0:32]
 
         # Assemble Blobs
-        blobs.append(BlobEntry(name="kmd-task-addr0", size=128, interface=2, sub_interface=1, data=bytes(kmd_addr0_data)))
-        blobs.append(BlobEntry(name="kmd-task-config_list", size=1024, interface=2, sub_interface=6, data=kmd_config_data))
-        blobs.append(BlobEntry(name="kmd-task-dep_graph", size=8704, interface=2, sub_interface=2, data=bytes(kmd_dep_data)))
-        blobs.append(BlobEntry(name="kmd-task-lut_list", size=688, interface=2, sub_interface=5, data=kmd_lut_data))
-        blobs.append(BlobEntry(name="kmd-task-op_list", size=7936, interface=2, sub_interface=3, data=bytes(kmd_op_data)))
-        blobs.append(BlobEntry(name="kmd-task-surf_list", size=4096, interface=2, sub_interface=4, data=bytes(kmd_surf_data)))
+        task_ver = ModelVersion(0, 0, 3)
+        blobs.append(BlobEntry(name="kmd-task-addr0", size=128, interface=2, sub_interface=1, version=task_ver, data=bytes(kmd_addr0_data)))
+        blobs.append(BlobEntry(name="kmd-task-config_list", size=1024, interface=2, sub_interface=6, version=task_ver, data=kmd_config_data))
+        blobs.append(BlobEntry(name="kmd-task-dep_graph", size=8704, interface=2, sub_interface=2, version=task_ver, data=bytes(kmd_dep_data)))
+        blobs.append(BlobEntry(name="kmd-task-lut_list", size=688, interface=2, sub_interface=5, version=task_ver, data=kmd_lut_data))
+        blobs.append(BlobEntry(name="kmd-task-op_list", size=7936, interface=2, sub_interface=3, version=task_ver, data=bytes(kmd_op_data)))
+        blobs.append(BlobEntry(name="kmd-task-surf_list", size=4096, interface=2, sub_interface=4, version=task_ver, data=bytes(kmd_surf_data)))
 
-        blobs.append(BlobEntry(name="umd-task-addr0", size=128, interface=1, sub_interface=1, data=bytes(umd_addr0_data)))
-        blobs.append(BlobEntry(name="umd-task-config_list", size=1024, interface=1, sub_interface=5, data=umd_config_data))
-        blobs.append(BlobEntry(name="umd-task-dep_graph", size=4352, interface=1, sub_interface=2, data=bytes(umd_dep_data)))
-        blobs.append(BlobEntry(name="umd-task-op_list", size=3968, interface=1, sub_interface=3, data=umd_op_data))
-        blobs.append(BlobEntry(name="umd-task-surf_list", size=2048, interface=1, sub_interface=4, data=bytes(umd_surf_data)))
+        blobs.append(BlobEntry(name="umd-task-addr0", size=128, interface=1, sub_interface=1, version=task_ver, data=bytes(umd_addr0_data)))
+        blobs.append(BlobEntry(name="umd-task-config_list", size=1024, interface=1, sub_interface=5, version=task_ver, data=umd_config_data))
+        blobs.append(BlobEntry(name="umd-task-dep_graph", size=4352, interface=1, sub_interface=2, version=task_ver, data=bytes(umd_dep_data)))
+        blobs.append(BlobEntry(name="umd-task-op_list", size=3968, interface=1, sub_interface=3, version=task_ver, data=umd_op_data))
+        blobs.append(BlobEntry(name="umd-task-surf_list", size=2048, interface=1, sub_interface=4, version=task_ver, data=bytes(umd_surf_data)))
 
         # ----------------------------------------------------------------------
         # 3. Build Memory List Entries
         # ----------------------------------------------------------------------
+        cvt_size = (max(4096, out_size_bytes) + 4095) & ~4095
         memory_list: List[MemoryEntry] = [
             MemoryEntry(id=0, domain=0, flags=1, size=4096),
             MemoryEntry(id=1, domain=0, flags=3, size=max(4096, aligned_w_size), contents=["W_0"], offsets=[0]),
-            MemoryEntry(id=2, domain=0, flags=1, size=max(4096, out_size_bytes), contents=["conv1_cvtPrecision"], offsets=[0]),
+            MemoryEntry(id=2, domain=0, flags=1, size=cvt_size, contents=["conv1_cvtPrecision"], offsets=[0]),
             MemoryEntry(id=3, domain=1, flags=1, size=sram_size, contents=["conv1.sram.edma"], offsets=[0]),
             MemoryEntry(id=4, domain=0, flags=5, size=in_size_bytes, contents=[], offsets=[], tensor_desc_id=0),
             MemoryEntry(id=5, domain=0, flags=9, size=out_size_bytes, contents=[], offsets=[], tensor_desc_id=1),
