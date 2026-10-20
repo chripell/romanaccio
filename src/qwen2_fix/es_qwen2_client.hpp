@@ -90,6 +90,9 @@ typedef struct {
     bool doSample;
     float topP;
     float temperature;
+    bool showThinking = true;
+    bool showTokens = false;
+    int32_t maxThinkingTokens = 128;
     std::vector<DevicePrivAttr> devPrivAttr;
 } CLIENT_CONFIG_S;
 

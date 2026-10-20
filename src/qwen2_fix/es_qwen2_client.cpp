@@ -1233,6 +1233,9 @@ std::string Qwen2Client::generate(int32_t idx, bool master)
     }
 
     int32_t maxAllowedLen = std::min(mConfig.responseMaxLen, mConfig.tokenNum - 1);
+    bool inThinking = false;
+    int thinkingCount = 0;
+    bool thinkingLimitReached = false;
     for (i = 0; i < maxAllowedLen; ++i) {
         inputWord = mTokenizer->decode(std::vector<int32_t>(1, wordPosInVocab));
 
@@ -1272,7 +1275,58 @@ std::string Qwen2Client::generate(int32_t idx, bool master)
         if (i >= mSentencePosInVocab.size()) {
             outputIds.emplace_back(wordPosInVocab);
             if (master) {
-                std::cout << inputWord << std::flush;
+                bool isThinkStart = (wordPosInVocab == 151648 || inputWord == "<think>" || inputWord.find("<think>") != std::string::npos);
+                bool isThinkEnd   = (wordPosInVocab == 151649 || inputWord == "</think>" || inputWord.find("</think>") != std::string::npos);
+
+                if (isThinkStart) {
+                    inThinking = true;
+                    thinkingCount = 0;
+                    thinkingLimitReached = false;
+                    if (mConfig.showTokens) {
+                        std::cout << "\033[90m[#" << wordPosInVocab << ":<think>]\033[0m" << std::flush;
+                    }
+                    if (mConfig.showThinking) {
+                        std::cout << "\033[90m\n[Thinking: \033[0m" << std::flush;
+                    } else {
+                        std::cout << "\033[90m[Thinking...]\033[0m" << std::flush;
+                    }
+                } else if (isThinkEnd) {
+                    if (inThinking) {
+                        inThinking = false;
+                        if (mConfig.showThinking) {
+                            std::cout << "\033[90m]\n\n\033[0m" << std::flush;
+                        } else {
+                            std::cout << "\r              \r" << std::flush;
+                        }
+                    }
+                    if (mConfig.showTokens) {
+                        std::cout << "\033[90m[#" << wordPosInVocab << ":</think>]\033[0m\n\n" << std::flush;
+                    }
+                } else if (inThinking) {
+                    thinkingCount++;
+                    if (mConfig.maxThinkingTokens > 0 && thinkingCount >= mConfig.maxThinkingTokens && !thinkingLimitReached) {
+                        thinkingLimitReached = true;
+                        inThinking = false;
+                        if (mConfig.showThinking) {
+                            std::cout << "\033[33m\n[Thinking limit of " << mConfig.maxThinkingTokens
+                                      << " tokens reached, concluding reasoning]\n\n\033[0m" << std::flush;
+                        } else {
+                            std::cout << "\033[33m\n[Thinking limit reached]\n\033[0m" << std::flush;
+                        }
+                    } else if (mConfig.showThinking) {
+                        if (mConfig.showTokens) {
+                            std::cout << "\033[90m[#" << wordPosInVocab << ":\"" << inputWord << "\"]\033[0m" << std::flush;
+                        } else {
+                            std::cout << "\033[90m" << inputWord << "\033[0m" << std::flush;
+                        }
+                    }
+                } else {
+                    if (mConfig.showTokens) {
+                        std::cout << "[#" << wordPosInVocab << ":\"" << inputWord << "\"]" << std::flush;
+                    } else {
+                        std::cout << inputWord << std::flush;
+                    }
+                }
             }
 
             // Check for duplicate / repetition loop in output tokens

@@ -19,6 +19,7 @@
 #include <csignal>
 #include <iostream>
 #include <sstream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <limits>
@@ -90,9 +91,13 @@ void printUsage(const char* progName)
               << "  " << progName << " [options]\n\n"
               << "Options:\n"
               << "  -c, --config <path>           Path to model JSON configuration file.\n"
-              << "                                (Default: " << QWEN2_CONFIG_FILE << ")\n"
+              << "                                (Default: auto-detect deepseek_7b_1k_int8_peer/config.json)\n"
               << "  -s, --system <prompt>         Custom system prompt / assistant persona.\n"
               << "                                (Default: \"You are a helpful and intelligent AI assistant.\")\n"
+              << "  --show-thinking               Stream thinking tokens in gray (DEFAULT: on)\n"
+              << "  --hide-thinking               Hide thinking tokens, showing only final response\n"
+              << "  --max-thinking-tokens <int>   Cap thinking tokens before answering (default: 128)\n"
+              << "  --show-tokens                 Debug mode: display [#id:\"piece\"] for all tokens\n"
               << "  -t, --temp <float>            Sampling temperature (e.g. 0.6, 0.7). Set to 0.0 for greedy argmax.\n"
               << "  -k, --top-k <int>             Top-K vocabulary filtering (e.g. 20, 40).\n"
               << "  -p, --top-p <float>           Top-P nucleus sampling threshold (e.g. 0.85, 0.90).\n"
@@ -101,12 +106,12 @@ void printUsage(const char* progName)
               << "  -m, --max-tokens <int>        Maximum tokens generated per response.\n"
               << "  -h, --help                    Display this help message and exit.\n\n"
               << "Examples:\n"
-              << "  # Run with default settings:\n"
-              << "  " << progName << " --config deepseek_7b_1k_int8_peer/config.json\n\n"
-              << "  # Custom persona with high creativity:\n"
-              << "  " << progName << " -s \"You are a witty coding assistant.\" --temp 0.8\n\n"
-              << "  # Deterministic (greedy) execution:\n"
-              << "  " << progName << " --temp 0.0\n\n";
+              << "  # Run with default settings (auto-discovers Dual-Die DeepSeek-7B):\n"
+              << "  " << progName << "\n\n"
+              << "  # Custom persona with thinking tokens capped at 128:\n"
+              << "  " << progName << " -s \"You are a witty coding assistant.\" --max-thinking-tokens 128\n\n"
+              << "  # Clean answer only (no thinking reasoning displayed):\n"
+              << "  " << progName << " --hide-thinking\n\n";
 }
 
 // -----------------------------------------------------------------------------
@@ -114,8 +119,15 @@ void printUsage(const char* progName)
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv)
 {
-    // Default configuration values
+    // Auto-discover configuration file
     std::string configFile = QWEN2_CONFIG_FILE;
+    std::ifstream test_f1("deepseek_7b_1k_int8_peer/config.json");
+    std::ifstream test_f2("../qwen2_fix/deepseek_7b_1k_int8_peer/config.json");
+    std::ifstream test_f3("/home/chri/qwen2_fix/deepseek_7b_1k_int8_peer/config.json");
+    if (test_f1.good()) configFile = "deepseek_7b_1k_int8_peer/config.json";
+    else if (test_f2.good()) configFile = "../qwen2_fix/deepseek_7b_1k_int8_peer/config.json";
+    else if (test_f3.good()) configFile = "/home/chri/qwen2_fix/deepseek_7b_1k_int8_peer/config.json";
+
     std::string systemPrompt = "You are a helpful and intelligent AI assistant.";
 
     // Command-line override flags (negative or unset indicates use config file value)
@@ -125,6 +137,9 @@ int main(int argc, char** argv)
     float cliRepeatPenalty = -1.0f;
     int cliRepeatWindow = -1;
     int cliMaxTokens = -1;
+    bool cliShowThinking = true;
+    bool cliShowTokens = false;
+    int cliMaxThinkingTokens = 128;
 
     // -------------------------------------------------------------------------
     // 1. Parse Command-Line Arguments
@@ -151,6 +166,14 @@ int main(int argc, char** argv)
             cliRepeatWindow = std::stoi(argv[++i]);
         } else if ((arg == "-m" || arg == "--max-tokens") && i + 1 < argc) {
             cliMaxTokens = std::stoi(argv[++i]);
+        } else if (arg == "--show-thinking") {
+            cliShowThinking = true;
+        } else if (arg == "--hide-thinking" || arg == "--no-thinking") {
+            cliShowThinking = false;
+        } else if (arg == "--max-thinking-tokens" && i + 1 < argc) {
+            cliMaxThinkingTokens = std::stoi(argv[++i]);
+        } else if (arg == "--show-tokens" || arg == "--debug-tokens") {
+            cliShowTokens = true;
         } else if (arg[0] != '-' && i == 1 && argc == 2) {
             // Backwards compatibility: allow passing config file directly as first argument
             configFile = arg;
@@ -218,6 +241,12 @@ int main(int argc, char** argv)
             cfg.responseMaxLen = cliMaxTokens;
         }
 
+        cfg.showThinking = cliShowThinking;
+        cfg.showTokens = cliShowTokens;
+        if (cliMaxThinkingTokens >= 0) {
+            cfg.maxThinkingTokens = cliMaxThinkingTokens;
+        }
+
         // Display active inference hyperparameters
         std::cout << "\n[*] Active Generation Hyperparameters:\n"
                   << "    - Sampling Mode      : " << (cfg.doSample ? "Top-P / Top-K Sampling" : "Greedy (ArgMax)") << "\n"
@@ -225,7 +254,9 @@ int main(int argc, char** argv)
                   << "    - Top-P Nucleus      : " << cfg.topP << "\n"
                   << "    - Top-K              : " << cfg.topK << "\n"
                   << "    - Repetition Penalty : " << cfg.repetitionPenalty << " (Sliding Window: " << cfg.repeatWindow << ")\n"
-                  << "    - Max Response Length: " << cfg.responseMaxLen << " tokens\n\n";
+                  << "    - Max Response Length: " << cfg.responseMaxLen << " tokens\n"
+                  << "    - Thinking Tokens    : " << (cfg.showThinking ? "\033[32mENABLED (gray stream, max=" + std::to_string(cfg.maxThinkingTokens) + ")\033[0m" : "\033[33mHIDDEN\033[0m") << "\n"
+                  << "    - Token Debug        : " << (cfg.showTokens ? "\033[32mON (displaying [#id:\"word\"])\033[0m" : "\033[90mOFF (type /tokens on to enable)\033[0m") << "\n\n";
 
         std::cout << "[+] Model ready! Interactive chat session initiated.\n";
         std::cout << "    Type your question and press Enter. Type 'exit' or 'quit' to leave.\n\n";
@@ -250,10 +281,51 @@ int main(int argc, char** argv)
             }
 
             // Clean exit check
-            if (inputPrompt == "exit" || inputPrompt == "quit" || inputPrompt == ":q") {
+            if (inputPrompt == "exit" || inputPrompt == "quit" || inputPrompt == ":q" || inputPrompt == "/exit" || inputPrompt == "/quit") {
                 std::cout << "\n[*] Exiting chat session...\n";
                 gQwen2Client->exitClient();
                 break;
+            }
+
+            if (inputPrompt == "/thinking on") {
+                cfg.showThinking = true;
+                std::cout << "\033[32m[Thinking display enabled]\033[0m\n\n";
+                continue;
+            }
+            if (inputPrompt == "/thinking off") {
+                cfg.showThinking = false;
+                std::cout << "\033[33m[Thinking display disabled]\033[0m\n\n";
+                continue;
+            }
+            if (inputPrompt == "/tokens on") {
+                cfg.showTokens = true;
+                std::cout << "\033[32m[Token debug display enabled]\033[0m\n\n";
+                continue;
+            }
+            if (inputPrompt == "/tokens off") {
+                cfg.showTokens = false;
+                std::cout << "\033[33m[Token debug display disabled]\033[0m\n\n";
+                continue;
+            }
+            if (inputPrompt.rfind("/max-thinking", 0) == 0) {
+                std::istringstream iss(inputPrompt);
+                std::string cmd;
+                int n = 0;
+                if (iss >> cmd >> n && n >= 0) {
+                    cfg.maxThinkingTokens = n;
+                    std::cout << "\033[32m[Max thinking tokens set to " << n << "]\033[0m\n\n";
+                } else {
+                    std::cout << "Usage: /max-thinking <int>\n\n";
+                }
+                continue;
+            }
+            if (inputPrompt == "/help") {
+                std::cout << "Available commands:\n"
+                          << "  /thinking [on|off]   Toggle real-time streaming of thinking tokens\n"
+                          << "  /tokens [on|off]     Toggle raw token ID debug mode\n"
+                          << "  /max-thinking <N>    Set max thinking tokens (default: 128)\n"
+                          << "  exit, quit, /exit    Exit chat engine\n\n";
+                continue;
             }
 
             // Format response label matching the active model
