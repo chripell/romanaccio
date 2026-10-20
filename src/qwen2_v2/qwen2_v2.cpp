@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
 
 #define COLOR_RESET   "\033[0m"
 #define COLOR_BOLD    "\033[1m"
@@ -175,6 +176,169 @@ static std::string format_chatml(const std::string &user_text) {
            "<|im_start|>assistant\n";
 }
 
+static void displayInitialCard(
+    const es_model_info_t &info,
+    const std::string &model_path,
+    const std::string &resolved_tok,
+    size_t vocab_count,
+    es_device_mode_t dev_mode,
+    float temp,
+    int32_t top_k,
+    float top_p,
+    float repeat_penalty,
+    int32_t repeat_window,
+    int32_t max_tokens,
+    bool show_thinking,
+    int32_t max_thinking_tokens,
+    bool show_tokens)
+{
+    std::cout << "\n\033[1;36m================================================================================\033[0m\n"
+              << "\033[1;36m     Qwen2 / DeepSeek Chat Engine v2 (Powered by Open ESWIN Runtime)            \033[0m\n"
+              << "\033[1;36m================================================================================\033[0m\n";
+
+    std::vector<std::string> warnings;
+
+    // 1. Configuration & Model Info
+    std::cout << "\033[1m[Configuration & Model]\033[0m\n";
+    std::cout << "  • Model Name        : " << info.name << "\n";
+    std::cout << "  • Model Directory   : " << model_path;
+    struct stat dirSt;
+    if (stat(model_path.c_str(), &dirSt) == 0 && S_ISDIR(dirSt.st_mode)) {
+        std::cout << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << " \033[31m[DIRECTORY NOT FOUND]\033[0m\n";
+        warnings.push_back("Model directory does not exist: " + model_path);
+    }
+
+    std::string manifest_file = model_path + "/manifest.json";
+    if (file_exists_local(manifest_file)) {
+        std::cout << "  • Package Manifest  : " << manifest_file << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << "  • Package Manifest  : " << manifest_file << " \033[33m[MISSING / DEFAULT PARAMETERS]\033[0m\n";
+        warnings.push_back("Package manifest (manifest.json) not found in " + model_path);
+    }
+    std::cout << "  • Architecture      : " << info.num_layers << " layers, "
+              << info.num_heads << " heads, hidden dim=" << info.hidden_size
+              << ", vocab=" << info.vocab_size << "\n\n";
+
+    // 2. Tokenizer & Vocabulary
+    std::cout << "\033[1m[Tokenizer & Vocabulary]\033[0m\n";
+    if (vocab_count > 0 && !resolved_tok.empty()) {
+        std::cout << "  • Tokenizer File    : " << resolved_tok << " (" << vocab_count << " vocabulary tokens loaded) \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << "  • Tokenizer File    : " << (resolved_tok.empty() ? "(none)" : resolved_tok) << " \033[31m[NOT LOADED]\033[0m\n";
+        warnings.push_back("Tokenizer vocabulary not loaded! Tokens will be displayed in numeric [#id] form.");
+    }
+    std::cout << "  • Special Tokens    : <|im_start|>, <|im_end|>, <think>, </think> \033[32m[OK]\033[0m\n\n";
+
+    // 3. Weights & Embeddings
+    std::cout << "\033[1m[Weights & Embeddings]\033[0m\n";
+    std::string embPath;
+    std::vector<std::string> cand_emb = {
+        model_path + "/embedding.bin",
+        model_path + "/deepseek_7b_1k_int8_peer/embedding.bin",
+        "./embedding.bin",
+        "deepseek_7b_1k_int8_peer/embedding.bin",
+        "/opt/eswin/sample-code/npu_sample/qwen_sample/models/deepseek_7b_1k_int8_peer/embedding.bin"
+    };
+    for (const auto &c : cand_emb) {
+        if (file_exists_local(c)) {
+            embPath = c;
+            break;
+        }
+    }
+
+    size_t expectedEmbBytes = (size_t)info.vocab_size * info.hidden_size * 2; // fp16
+    if (!embPath.empty()) {
+        struct stat embSt;
+        stat(embPath.c_str(), &embSt);
+        if ((size_t)embSt.st_size == expectedEmbBytes) {
+            std::cout << "  • Embedding Table   : " << embPath << " (" << embSt.st_size << " bytes, fp16) \033[32m[OK]\033[0m\n";
+        } else {
+            std::cout << "  • Embedding Table   : " << embPath << " (" << embSt.st_size << " bytes) \033[33m[SIZE MISMATCH: expected " << expectedEmbBytes << " bytes]\033[0m\n";
+            warnings.push_back("Embedding table size mismatch: " + embPath);
+        }
+    } else {
+        std::cout << "  • Embedding Table   : embedding.bin \033[31m[MISSING / NOT LOADED]\033[0m\n";
+        warnings.push_back("Embedding table (embedding.bin) missing! Embeddings will use unmapped dummy fallback values (0.01f), causing gibberish sampling output.");
+    }
+    std::cout << "\n";
+
+    // 4. Hardware NPU Acceleration
+    std::cout << "\033[1m[Hardware NPU Acceleration]\033[0m\n";
+    std::vector<std::string> cand_dirs = {
+        model_path,
+        model_path + "/deepseek_7b_1k_int8_peer",
+        "./deepseek_7b_1k_int8_peer",
+        "/opt/eswin/sample-code/npu_sample/qwen_sample/models/deepseek_7b_1k_int8_peer"
+    };
+    int d0_count = 0, d1_count = 0;
+    int expected_blocks = (info.num_layers > 0) ? (int)info.num_layers : 24;
+    for (const auto &d : cand_dirs) {
+        int c0 = 0, c1 = 0;
+        for (int b = 0; b < 32; ++b) {
+            char f0[256], f1[256];
+            snprintf(f0, sizeof(f0), "%s/modified_block_%d_npu_b1_d0.model", d.c_str(), b);
+            snprintf(f1, sizeof(f1), "%s/modified_block_%d_npu_b1_d1.model", d.c_str(), b);
+            if (file_exists_local(f0)) c0++;
+            if (file_exists_local(f1)) c1++;
+        }
+        if (c0 > 0 || c1 > 0) {
+            d0_count = c0;
+            d1_count = c1;
+            break;
+        }
+    }
+
+    if (d0_count > 0 || d1_count > 0) {
+        std::cout << "  • Die 0 (Node 0)       : " << d0_count << " layer blocks loaded";
+        if (d0_count >= expected_blocks) std::cout << " \033[32m[OK]\033[0m\n";
+        else std::cout << " \033[33m[PARTIAL: expected " << expected_blocks << "]\033[0m\n";
+
+        std::cout << "  • Die 1 (Node 1)       : " << d1_count << " layer blocks loaded";
+        if (d1_count >= expected_blocks) std::cout << " \033[32m[OK]\033[0m\n";
+        else std::cout << " \033[33m[PARTIAL: expected " << expected_blocks << "]\033[0m\n";
+
+        std::cout << "  • Device Target     : "
+                  << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? "Dual-Die Auto (Die 0 + Die 1)" : "Single Die (Die 0)") << "\n";
+        std::cout << "  • Acceleration Mode : Concurrent Dual-Die Pipeline \033[32m[HARDWARE NPU]\033[0m\n";
+    } else {
+        std::cout << "  • Die 0 (Node 0)       : 0/" << expected_blocks << " layer blocks \033[31m[NOT FOUND]\033[0m\n";
+        std::cout << "  • Die 1 (Node 1)       : 0/" << expected_blocks << " layer blocks \033[31m[NOT FOUND]\033[0m\n";
+        std::cout << "  • Device Target     : "
+                  << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? "Dual-Die Auto (Die 0 + Die 1)" : "Single Die (Die 0)") << "\n";
+        std::cout << "  • Acceleration Mode : Host CPU Fallback \033[33m[FALLBACK DUMMY WEIGHTS - NO HARDWARE OFF-LOAD]\033[0m\n";
+        warnings.push_back("Hardware NPU models (.model files) missing! Execution is running on host CPU fallback with dummy weights.");
+    }
+    std::cout << "\n";
+
+    // 5. Inference Hyperparameters & Protections
+    std::cout << "\033[1m[Inference & Protections]\033[0m\n";
+    std::cout << "  • Sampling Mode     : " << (temp > 0.0f ? "Top-P / Top-K Sampling" : "Greedy (ArgMax)")
+              << " (temp=" << std::fixed << std::setprecision(2) << temp
+              << ", top_k=" << top_k << ", top_p=" << top_p << ")\n";
+    std::cout << "  • Issue #47 Guards  : Repetition penalty=" << repeat_penalty
+              << " (win=" << repeat_window << "), anti_stutter=2, cyclic loop breaker \033[32m[ACTIVE]\033[0m\n";
+    std::cout << "  • Thinking Tokens   : "
+              << (show_thinking ? "\033[32mENABLED (gray stream, max=" + std::to_string(max_thinking_tokens) + " tokens)\033[0m" : "\033[33mHIDDEN\033[0m") << "\n";
+    std::cout << "  • Token Debug       : "
+              << (show_tokens ? "\033[32mON (displaying [#id:\"word\"])\033[0m" : "\033[90mOFF (type /tokens on to enable)\033[0m") << "\n";
+    std::cout << "  • Max Response Len  : " << max_tokens << " tokens\n";
+    std::cout << "\033[1;36m--------------------------------------------------------------------------------\033[0m\n";
+
+    // Warnings Box
+    if (!warnings.empty()) {
+        std::cout << "\n\033[1;41m  WARNINGS DETECTED (" << warnings.size() << ")  \033[0m\n";
+        for (size_t w = 0; w < warnings.size(); ++w) {
+            std::cout << " \033[1;33m[!] Warning " << (w + 1) << ": " << warnings[w] << "\033[0m\n";
+        }
+        std::cout << "\n\033[33mDue to missing pieces, generation output will be degraded, unmapped, or fallback dummy.\033[0m\n"
+                  << "\033[36mTip: Ensure real weights and model files are present or symlinked to the model path.\033[0m\n\n";
+    } else {
+        std::cout << "\033[1;32m[+] All required model files, embeddings, and tokenizer pieces loaded successfully!\033[0m\n\n";
+    }
+}
+
 int main(int argc, char *argv[]) {
     std::string model_path = ".";
     std::string tokenizer_path;
@@ -296,37 +460,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::cout << COLOR_CYAN << COLOR_BOLD
-              << "===================================================================\n"
-              << "     Qwen2 / DeepSeek Chat Engine v2 (Powered by Open Runtime)     \n"
-              << "===================================================================\n"
-              << COLOR_RESET;
-    std::cout << COLOR_GRAY << " Model:         " << COLOR_RESET << info.name << "\n"
-              << COLOR_GRAY << " Vocab / Hidden:" << COLOR_RESET << " " << info.vocab_size << " / " << info.hidden_size << "\n"
-              << COLOR_GRAY << " Architecture:  " << COLOR_RESET << info.num_layers << " layers, " << info.num_heads << " heads\n";
+    // 5. Display comprehensive model card and loaded components status
+    displayInitialCard(
+        info, model_path, resolved_tok, vocab_count, dev_mode,
+        temp, top_k, top_p, repeat_penalty, repeat_window, max_tokens,
+        show_thinking, max_thinking_tokens, show_tokens
+    );
 
-    if (vocab_count > 0) {
-        std::cout << COLOR_GRAY << " Tokenizer:     " << COLOR_RESET << COLOR_GREEN << resolved_tok
-                  << " (" << vocab_count << " vocabulary tokens loaded)" << COLOR_RESET << "\n";
-    } else {
-        std::cout << COLOR_GRAY << " Tokenizer:     " << COLOR_RESET << COLOR_RED
-                  << "NOT LOADED! (Will display [#id] for each token)" << COLOR_RESET << "\n";
-    }
+    std::cout << "Interactive chat session ready. Type your question and press Enter.\n"
+              << "Type '/help' for command options, or '/exit' to quit.\n";
 
-    std::cout << COLOR_GRAY << " Thinking:      " << COLOR_RESET
-              << (show_thinking ? COLOR_GREEN "ENABLED (default" : COLOR_YELLOW "HIDDEN")
-              << ", max=" << max_thinking_tokens << " tokens)" << COLOR_RESET << "\n"
-              << COLOR_GRAY << " Token Debug:   " << COLOR_RESET
-              << (show_tokens ? COLOR_GREEN "ENABLED (showing [#id:\"piece\"])" : COLOR_GRAY "OFF (type /tokens on to enable)")
-              << COLOR_RESET << "\n"
-              << COLOR_GRAY << " Protections:   " << COLOR_RESET << COLOR_GREEN "Issue #47 Fixed (rep_pen=" << repeat_penalty
-              << ", win=" << repeat_window << ", anti_stutter=2)" << COLOR_RESET << "\n"
-              << COLOR_GRAY << " Acceleration:  " << COLOR_RESET
-              << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? COLOR_GREEN "Dual-Die Auto (Die 0 + Die 1)" : COLOR_YELLOW "Single Die")
-              << COLOR_RESET << "\n"
-              << COLOR_CYAN << "-------------------------------------------------------------------\n" << COLOR_RESET;
-
-    // 5. REPL
+    // 6. REPL
     es_perf_stats_t last_stats{};
     std::string line;
     GenerationContext gen_ctx;

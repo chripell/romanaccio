@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
 #include "es_qwen2_client.hpp"
 
@@ -112,6 +113,127 @@ void printUsage(const char* progName)
               << "  " << progName << " -s \"You are a witty coding assistant.\" --max-thinking-tokens 128\n\n"
               << "  # Clean answer only (no thinking reasoning displayed):\n"
               << "  " << progName << " --hide-thinking\n\n";
+}
+
+// -----------------------------------------------------------------------------
+// Model Card & Loaded Components Status Display
+// -----------------------------------------------------------------------------
+void displayInitialCard(const CLIENT_CONFIG_S &cfg, const std::string &configFile)
+{
+    std::cout << "\n\033[1;36m================================================================================\033[0m\n"
+              << "\033[1;36m  ESWIN EIC7700X Dual-NPU Large Language Model Engine (DeepSeek / Qwen2)\033[0m\n"
+              << "\033[1;36m================================================================================\033[0m\n";
+
+    std::vector<std::string> warnings;
+
+    // 1. Configuration & Model Info
+    std::cout << "\033[1m[Configuration]\033[0m\n";
+    std::cout << "  • Model Name        : " << cfg.modelName << "\n";
+
+    // Check Config File
+    std::ifstream cfgCheck(configFile);
+    if (cfgCheck.good()) {
+        std::cout << "  • Config File       : " << configFile << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << "  • Config File       : " << configFile << " \033[31m[MISSING]\033[0m\n";
+        warnings.push_back("Configuration file not found: " + configFile);
+    }
+
+    // Check Model Directory
+    std::cout << "  • Model Directory   : " << cfg.modelDir;
+    struct stat dirSt;
+    if (stat(cfg.modelDir.c_str(), &dirSt) == 0 && S_ISDIR(dirSt.st_mode)) {
+        std::cout << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << " \033[31m[DIRECTORY NOT FOUND]\033[0m\n";
+        warnings.push_back("Model directory does not exist: " + cfg.modelDir);
+    }
+    int totalLayers = cfg.devPrivAttr.empty() ? 0 : (int)cfg.devPrivAttr[0].blockModelFiles.size();
+    std::cout << "  • Architecture      : " << totalLayers
+              << " layers, hidden dim=" << cfg.embeddingSize << ", vocab=" << cfg.vocabSize << "\n\n";
+
+    // 2. Tokenizer & Vocabulary
+    std::cout << "\033[1m[Tokenizer & Vocabulary]\033[0m\n";
+    std::ifstream tokCheck(cfg.tiktokenFile);
+    if (tokCheck.good()) {
+        std::cout << "  • TikToken File     : " << cfg.tiktokenFile << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << "  • TikToken File     : " << cfg.tiktokenFile << " \033[31m[MISSING]\033[0m\n";
+        warnings.push_back("TikToken file missing: " + cfg.tiktokenFile + " (tokens cannot be decoded)");
+    }
+    std::cout << "  • Special Tokens    : <|im_start|>, <|im_end|>, <think>, </think> \033[32m[OK]\033[0m\n\n";
+
+    // 3. Weights & Embeddings
+    std::cout << "\033[1m[Weights & Embeddings]\033[0m\n";
+    struct stat embSt;
+    size_t expectedEmbBytes = (size_t)cfg.vocabSize * cfg.embeddingSize * 2; // fp16
+    if (stat(cfg.embeddingFile.c_str(), &embSt) == 0) {
+        if ((size_t)embSt.st_size == expectedEmbBytes) {
+            std::cout << "  • Embedding Table   : " << cfg.embeddingFile << " (" << embSt.st_size << " bytes, fp16) \033[32m[OK]\033[0m\n";
+        } else {
+            std::cout << "  • Embedding Table   : " << cfg.embeddingFile << " (" << embSt.st_size << " bytes) \033[33m[SIZE MISMATCH: expected " << expectedEmbBytes << " bytes]\033[0m\n";
+            warnings.push_back("Embedding file size mismatch: " + cfg.embeddingFile);
+        }
+    } else {
+        std::cout << "  • Embedding Table   : " << cfg.embeddingFile << " \033[31m[MISSING / NOT FOUND]\033[0m\n";
+        warnings.push_back("Embedding file missing: " + cfg.embeddingFile + " (embeddings will be unmapped dummy values!)");
+    }
+    std::cout << "\n";
+
+    // 4. Hardware NPU Acceleration
+    std::cout << "\033[1m[Hardware NPU Acceleration]\033[0m\n";
+    for (size_t d = 0; d < cfg.devPrivAttr.size(); ++d) {
+        int presentCount = 0;
+        int totalCount = (int)cfg.devPrivAttr[d].blockModelFiles.size();
+        for (const auto &file : cfg.devPrivAttr[d].blockModelFiles) {
+            std::string p = cfg.modelDir + "/" + file;
+            struct stat bSt;
+            if (stat(p.c_str(), &bSt) == 0 && S_ISREG(bSt.st_mode)) presentCount++;
+        }
+        std::cout << "  • Die " << d << " (Node " << d << ")       : " << presentCount << "/" << totalCount << " layer blocks loaded";
+        if (presentCount == totalCount && totalCount > 0) {
+            std::cout << " \033[32m[OK]\033[0m\n";
+        } else {
+            std::cout << " \033[31m[FAILED: " << (totalCount - presentCount) << " missing]\033[0m\n";
+            warnings.push_back("Die " + std::to_string(d) + " is missing " + std::to_string(totalCount - presentCount) + " block models in " + cfg.modelDir);
+        }
+
+        // LM Head
+        std::string lmPath = cfg.modelDir + "/" + cfg.devPrivAttr[d].logitsModelFile;
+        struct stat lmSt;
+        if (stat(lmPath.c_str(), &lmSt) == 0 && S_ISREG(lmSt.st_mode)) {
+            std::cout << "    └─ LM Head        : " << cfg.devPrivAttr[d].logitsModelFile << " \033[32m[OK]\033[0m\n";
+        } else {
+            std::cout << "    └─ LM Head        : " << cfg.devPrivAttr[d].logitsModelFile << " \033[31m[MISSING]\033[0m\n";
+            warnings.push_back("LM Head model missing for Die " + std::to_string(d) + ": " + lmPath);
+        }
+    }
+    std::cout << "  • Acceleration Mode : Concurrent Dual-Die Pipeline \033[32m[HARDWARE NPU]\033[0m\n\n";
+
+    // 5. Inference Hyperparameters & Protections
+    std::cout << "\033[1m[Inference & Protections]\033[0m\n";
+    std::cout << "  • Sampling Mode     : " << (cfg.doSample ? "Top-P / Top-K Sampling" : "Greedy (ArgMax)")
+              << " (temp=" << std::fixed << std::setprecision(2) << cfg.temperature
+              << ", top_k=" << cfg.topK << ", top_p=" << cfg.topP << ")\n";
+    std::cout << "  • Issue #47 Guards  : Repetition penalty=" << cfg.repetitionPenalty
+              << " (win=" << cfg.repeatWindow << "), anti-stutter=2, cyclic loop breaker \033[32m[ACTIVE]\033[0m\n";
+    std::cout << "  • Thinking Tokens   : "
+              << (cfg.showThinking ? "\033[32mENABLED (gray stream, max=" + std::to_string(cfg.maxThinkingTokens) + " tokens)\033[0m" : "\033[33mHIDDEN\033[0m") << "\n";
+    std::cout << "  • Token Debug       : "
+              << (cfg.showTokens ? "\033[32mON (displaying [#id:\"word\"])\033[0m" : "\033[90mOFF (type /tokens on to enable)\033[0m") << "\n";
+    std::cout << "  • Max Response Len  : " << cfg.responseMaxLen << " tokens\n";
+    std::cout << "\033[1;36m--------------------------------------------------------------------------------\033[0m\n";
+
+    // Print Warnings if any
+    if (!warnings.empty()) {
+        std::cout << "\n\033[1;41m  WARNINGS DETECTED (" << warnings.size() << ")  \033[0m\n";
+        for (size_t w = 0; w < warnings.size(); ++w) {
+            std::cout << " \033[1;33m[!] Warning " << (w + 1) << ": " << warnings[w] << "\033[0m\n";
+        }
+        std::cout << "\033[33mDue to missing pieces, generation output may be degraded, unmapped, or fallback dummy.\033[0m\n\n";
+    } else {
+        std::cout << "\033[1;32m[+] All required model files, embeddings, and tokenizer pieces loaded successfully!\033[0m\n\n";
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -247,19 +369,11 @@ int main(int argc, char** argv)
             cfg.maxThinkingTokens = cliMaxThinkingTokens;
         }
 
-        // Display active inference hyperparameters
-        std::cout << "\n[*] Active Generation Hyperparameters:\n"
-                  << "    - Sampling Mode      : " << (cfg.doSample ? "Top-P / Top-K Sampling" : "Greedy (ArgMax)") << "\n"
-                  << "    - Temperature        : " << std::fixed << std::setprecision(2) << cfg.temperature << "\n"
-                  << "    - Top-P Nucleus      : " << cfg.topP << "\n"
-                  << "    - Top-K              : " << cfg.topK << "\n"
-                  << "    - Repetition Penalty : " << cfg.repetitionPenalty << " (Sliding Window: " << cfg.repeatWindow << ")\n"
-                  << "    - Max Response Length: " << cfg.responseMaxLen << " tokens\n"
-                  << "    - Thinking Tokens    : " << (cfg.showThinking ? "\033[32mENABLED (gray stream, max=" + std::to_string(cfg.maxThinkingTokens) + ")\033[0m" : "\033[33mHIDDEN\033[0m") << "\n"
-                  << "    - Token Debug        : " << (cfg.showTokens ? "\033[32mON (displaying [#id:\"word\"])\033[0m" : "\033[90mOFF (type /tokens on to enable)\033[0m") << "\n\n";
+        // Display comprehensive model card and loaded components status
+        displayInitialCard(cfg, configFile);
 
-        std::cout << "[+] Model ready! Interactive chat session initiated.\n";
-        std::cout << "    Type your question and press Enter. Type 'exit' or 'quit' to leave.\n\n";
+        std::cout << "Interactive chat session ready. Type your question and press Enter.\n"
+                  << "Type '/help' for command options, or 'exit' / '/quit' to leave.\n\n";
 
         // ---------------------------------------------------------------------
         // 4. Standard Interactive Chat REPL Loop

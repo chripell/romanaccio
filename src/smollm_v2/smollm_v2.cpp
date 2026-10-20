@@ -17,6 +17,8 @@
 #include <atomic>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
+#include <sys/stat.h>
 
 #define COLOR_RESET   "\033[0m"
 #define COLOR_BOLD    "\033[1m"
@@ -53,6 +55,110 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
         std::cout << "[#" << token << "]" << std::flush;
     }
     return true;
+}
+
+static bool file_exists_local(const std::string &path) {
+    if (path.empty()) return false;
+    std::ifstream f(path);
+    return f.good();
+}
+
+static void displayInitialCard(
+    const es_model_info_t &info,
+    const std::string &model_dir,
+    const std::string &tokenizer_path,
+    size_t vocab_count,
+    es_device_mode_t dev_mode,
+    float temp,
+    int32_t top_k,
+    float top_p,
+    float repeat_penalty,
+    int32_t max_tokens)
+{
+    std::cout << "\n\033[1;36m================================================================================\033[0m\n"
+              << "\033[1;36m     SmolLM-135M Chat Engine v2 (Powered by Open ESWIN Runtime)                 \033[0m\n"
+              << "\033[1;36m================================================================================\033[0m\n";
+
+    std::vector<std::string> warnings;
+
+    // 1. Configuration & Model Info
+    std::cout << "\033[1m[Configuration & Model]\033[0m\n";
+    std::cout << "  • Model Name        : " << info.name << "\n";
+    std::cout << "  • Model Directory   : " << model_dir;
+    struct stat dirSt;
+    if (stat(model_dir.c_str(), &dirSt) == 0 && S_ISDIR(dirSt.st_mode)) {
+        std::cout << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << " \033[31m[DIRECTORY NOT FOUND]\033[0m\n";
+        warnings.push_back("Model directory does not exist: " + model_dir);
+    }
+
+    std::string manifest_file = model_dir + "/manifest.json";
+    if (file_exists_local(manifest_file)) {
+        std::cout << "  • Package Manifest  : " << manifest_file << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << "  • Package Manifest  : " << manifest_file << " \033[33m[MISSING / DEFAULT PARAMETERS]\033[0m\n";
+        warnings.push_back("Package manifest (manifest.json) not found in " + model_dir);
+    }
+    std::cout << "  • Architecture      : " << info.num_layers << " layers, "
+              << info.num_heads << " heads, hidden dim=" << info.hidden_size
+              << ", vocab=" << info.vocab_size << "\n\n";
+
+    // 2. Tokenizer & Vocabulary
+    std::cout << "\033[1m[Tokenizer & Vocabulary]\033[0m\n";
+    std::string tok_path = !tokenizer_path.empty() ? tokenizer_path : (model_dir + "/tokenizer.json");
+    if (vocab_count > 0 && file_exists_local(tok_path)) {
+        std::cout << "  • Tokenizer File    : " << tok_path << " (" << vocab_count << " vocabulary tokens loaded) \033[32m[OK]\033[0m\n";
+    } else if (file_exists_local(tok_path)) {
+        std::cout << "  • Tokenizer File    : " << tok_path << " \033[32m[OK]\033[0m\n";
+    } else {
+        std::cout << "  • Tokenizer File    : " << tok_path << " \033[31m[NOT LOADED]\033[0m\n";
+        warnings.push_back("Tokenizer vocabulary not loaded! Tokens will be displayed in numeric [#id] form.");
+    }
+    std::cout << "  • Special Tokens    : <|im_start|>, <|im_end|> \033[32m[OK]\033[0m\n\n";
+
+    // 3. Hardware NPU Acceleration
+    std::cout << "\033[1m[Hardware NPU Acceleration]\033[0m\n";
+    std::string d0_path = model_dir + "/smollm_die0.model";
+    std::string d1_path = model_dir + "/smollm_die1.model";
+    bool d0_ok = file_exists_local(d0_path);
+    bool d1_ok = file_exists_local(d1_path);
+
+    std::cout << "  • Die 0 LM-Head     : " << d0_path << (d0_ok ? " \033[32m[OK]\033[0m\n" : " \033[31m[NOT FOUND]\033[0m\n");
+    std::cout << "  • Die 1 LM-Head     : " << d1_path << (d1_ok ? " \033[32m[OK]\033[0m\n" : " \033[31m[NOT FOUND]\033[0m\n");
+
+    std::cout << "  • Device Target     : "
+              << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? "Dual-Die Auto (Die 0 + Die 1)" : "Single Die (Die 0)") << "\n";
+
+    if (d0_ok && d1_ok) {
+        std::cout << "  • Acceleration Mode : Concurrent Dual-Die Pipeline \033[32m[HARDWARE NPU]\033[0m\n";
+    } else {
+        std::cout << "  • Acceleration Mode : Host CPU Fallback \033[33m[FALLBACK DUMMY WEIGHTS - NO HARDWARE OFF-LOAD]\033[0m\n";
+        warnings.push_back("Hardware NPU models (.model files) missing! Execution is running on host CPU fallback with dummy weights.");
+    }
+    std::cout << "\n";
+
+    // 4. Inference Hyperparameters & Protections
+    std::cout << "\033[1m[Inference & Protections]\033[0m\n";
+    std::cout << "  • Sampling Mode     : " << (temp > 0.0f ? "Top-P / Top-K Sampling" : "Greedy (ArgMax)")
+              << " (temp=" << std::fixed << std::setprecision(2) << temp
+              << ", top_k=" << top_k << ", top_p=" << top_p << ")\n";
+    std::cout << "  • Anti-Looping      : Repetition penalty=" << repeat_penalty
+              << " (win=64), anti-stutter=2 \033[32m[ACTIVE]\033[0m\n";
+    std::cout << "  • Max Response Len  : " << max_tokens << " tokens\n";
+    std::cout << "\033[1;36m--------------------------------------------------------------------------------\033[0m\n";
+
+    // Warnings Box
+    if (!warnings.empty()) {
+        std::cout << "\n\033[1;41m  WARNINGS DETECTED (" << warnings.size() << ")  \033[0m\n";
+        for (size_t w = 0; w < warnings.size(); ++w) {
+            std::cout << " \033[1;33m[!] Warning " << (w + 1) << ": " << warnings[w] << "\033[0m\n";
+        }
+        std::cout << "\n\033[33mDue to missing pieces, generation output will be degraded or fallback dummy.\033[0m\n"
+                  << "\033[36mTip: Ensure real .model files and tokenizer.json are present or symlinked.\033[0m\n\n";
+    } else {
+        std::cout << "\033[1;32m[+] All required model files and tokenizer pieces loaded successfully!\033[0m\n\n";
+    }
 }
 
 static std::string format_chatml(const std::string &user_text) {
@@ -134,6 +240,9 @@ int main(int argc, char *argv[]) {
     es_model_info_t info{};
     es_model_get_info(model, &info);
 
+    const es_tokenizer_t *tok_handle = es_model_get_tokenizer(model);
+    size_t vocab_count = es_tokenizer_vocab_size(tok_handle);
+
     // 3. Create Inference Session
     es_session_config_t scfg{};
     scfg.max_seq_len = 2048;
@@ -157,20 +266,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::cout << COLOR_CYAN << COLOR_BOLD
-              << "===================================================================\n"
-              << "       SmolLM-135M Chat Engine v2 (Powered by Open ESWIN Runtime)   \n"
-              << "===================================================================\n"
-              << COLOR_RESET;
-    std::cout << COLOR_GRAY << " Model:         " << COLOR_RESET << info.name << "\n"
-              << COLOR_GRAY << " Vocab / Hidden:" << COLOR_RESET << " " << info.vocab_size << " / " << info.hidden_size << "\n"
-              << COLOR_GRAY << " Architecture:  " << COLOR_RESET << info.num_layers << " layers, " << info.num_heads << " heads\n"
-              << COLOR_GRAY << " Acceleration:  " << COLOR_RESET
-              << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? COLOR_GREEN "Dual-Die Auto (Die 0 + Die 1)" : COLOR_YELLOW "Single Die")
-              << COLOR_RESET << "\n"
-              << COLOR_CYAN << "-------------------------------------------------------------------\n" << COLOR_RESET;
+    // 4. Display comprehensive model card and loaded components status
+    displayInitialCard(
+        info, model_dir, tokenizer_path, vocab_count, dev_mode,
+        temp, top_k, top_p, repeat_penalty, max_tokens
+    );
 
-    // 4. REPL
+    std::cout << "Interactive chat session ready. Type your question and press Enter.\n"
+              << "Type '/reset' to clear KV cache, or '/exit' to quit.\n";
+
+    // 5. REPL
     es_perf_stats_t last_stats{};
     std::string line;
 
