@@ -24,6 +24,10 @@ from eswin_simulator.engines.cmac import (
 )
 from eswin_simulator.engines.cacc import CACCEngine
 from eswin_simulator.engines.sdp import SDPEngine, SDPLookupTable
+from eswin_simulator.engines.pdp import PDPEngine
+from eswin_simulator.engines.rubik import RubikEngine
+from eswin_simulator.dsp import DSPExecutor
+from eswin_simulator.evaluation import TensorComparator
 import numpy as np
 
 
@@ -42,7 +46,7 @@ def format_bytes(num_bytes: int) -> str:
 def print_banner() -> None:
     print("=" * 80)
     print("  ESWIN EIC7700X Open NPU/DSP Functional Simulator (eswin-sim)")
-    print("  Milestone 4: CMAC, CACC & SDP Non-Linear LUT Engine")
+    print("  Engines: CMAC, CACC, SDP, PDP, Rubik & Cadence Vision Q7 DSP")
     print("=" * 80)
 
 
@@ -343,36 +347,24 @@ def execute_simulation(
             return 1
 
         out_t = model.output_tensors[0]
-        actual_data = vas.read_tensor(out_t).astype(np.float32).flatten()
-        ref_data = np.fromfile(str(compare_path), dtype=out_t.dtype).astype(np.float32).flatten()
-
+        actual_data = vas.read_tensor(out_t)
+        ref_data = np.fromfile(str(compare_path), dtype=out_t.dtype)
         if actual_data.size != ref_data.size:
-            print(f"[-] Error: Tensor size mismatch for comparison: actual {actual_data.size} vs reference {ref_data.size}")
+            print(
+                f"[-] Error: Tensor size mismatch for comparison: actual {actual_data.size} vs reference {ref_data.size}",
+                file=sys.stderr,
+            )
             return 1
 
-        norm_act = np.linalg.norm(actual_data)
-        norm_ref = np.linalg.norm(ref_data)
-        if norm_act == 0 or norm_ref == 0:
-            cos = 0.0
-        else:
-            cos = float(np.dot(actual_data, ref_data) / (norm_act * norm_ref))
+        ref_reshaped = ref_data.reshape(actual_data.shape)
+        rep = TensorComparator.compare(actual_data, ref_reshaped, tolerance=tolerance)
+        print(f"\n{rep.summary()}")
 
-        rel_diff = float(np.max(np.abs(actual_data - ref_data) / (np.abs(ref_data) + 1e-7)))
-        max_abs_diff = float(np.max(np.abs(actual_data - ref_data)))
-
-        print(f"\n[Differential Parity Verification vs Reference]")
-        print(f"  • Reference File      : {compare_path.name}")
-        print(f"  • Cosine Similarity   : {cos:.8f} (threshold >= 0.9999)")
-        print(f"  • Max Relative Diff   : {rel_diff:.8f} (tolerance <= {tolerance:.4f})")
-        print(f"  • Max Absolute Diff   : {max_abs_diff:.8f}")
-
-        if cos >= 0.9999 and rel_diff <= tolerance:
-            print(f"  [+] Output verification SUCCESSFUL! Bit-accurate parity confirmed.")
-        else:
-            print(f"  [-] Output verification FAILED: exceeded tolerance limits.", file=sys.stderr)
+        if not rep.passed:
+            print("  [-] Output verification FAILED: exceeded tolerance limits.", file=sys.stderr)
             return 1
 
-    print(f"\n[+] Simulation run completed successfully!")
+    print("\n[+] Simulation run completed successfully!")
     print("=" * 80 + "\n")
     return 0
 

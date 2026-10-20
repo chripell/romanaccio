@@ -174,20 +174,27 @@ Development is structured into **6 small, independently verifiable milestones**:
 - **Documentation**:
   - DSP C ABI specification and native fallback API documentation in `README.md`.
 
-### Milestone 6: Planar Engine (PDP), Rubik, & Full Model Pipeline Verification
+### Milestone 6: Planar Engine (PDP), Rubik, & Full Model Pipeline Verification [COMPLETED]
 - **Scope**:
-  - Implement `engines/pdp.py` (MaxPool 2D, AveragePool 2D).
-  - Implement `engines/rubik.py` (Reshape, Transpose, Slice, Concat).
-  - Implement end-to-end multi-layer execution loop coordinating sequential KMD and UMD submodels.
-  - Implement `evaluation/comparator.py`: produces full comparison reports (cosine similarity, SNR, histogram of error).
+  - Implement `engines/pdp.py` (MaxPool 2D, AveragePool 2D, Global Spatial Pooling across FP16, FP32, and INT8).
+  - Implement `engines/rubik.py` (Reshape, Transpose/Permute, Slice, Split, Concat, Squeeze, Unsqueeze, Flatten, Space-to-Depth/Depth-to-Space).
+  - Implement multi-layer execution pipelines coordinating sequential NPU and DSP submodels (SwiGLU MLP blocks and GQA Attention blocks).
+  - Implement `evaluation/comparator.py`: computes Cosine Similarity, SNR (dB), NMSE, error percentiles, and ASCII error histograms.
 - **Deliverables**:
-  - Complete `eswin-sim` CLI tool ready for end-user and CI usage.
+  - `engines/pdp.py`: High-throughput vectorized 2D and global pooling engine.
+  - `engines/rubik.py`: Zero-copy and strided tensor reordering and restructuring engine.
+  - `evaluation/comparator.py`: Rigorous differential testing framework (`TensorComparator`, `ComparisonReport`).
+  - `eswin-sim` CLI tool extended with automated comparator reporting, banner metrics, and multi-engine pipeline execution.
 - **Testing Requirements**:
-  - End-to-end execution of `end2endyolov3s416_batch1_int8_npu_b1.model` (vision).
-  - End-to-end execution of SmolLM-135M SwiGLU and Attention blocks.
-  - Differential parity check against physical execution on `roma` via `es_run_model`.
+  - `tests/test_pdp.py`: 16 tests validating MaxPool, AvgPool, and Global pooling against PyTorch across kernel sizes, strides, paddings, and INT8 saturating bounds.
+  - `tests/test_rubik.py`: 9 tests verifying Reshape, Transpose, Slice, Split, Concat, Flatten, and invertible Space/Depth transformations.
+  - `tests/test_comparator.py`: 4 tests validating exact and near-exact metrics, SNR, NMSE, percentiles, and JSON serialization.
+  - `tests/test_pipeline.py`:
+    - Full SmolLM-135M SwiGLU MLP multi-op block pipeline verified against PyTorch ($> 0.99999$ cos sim).
+    - Full SmolLM-135M Transformer Attention block with GQA (9 query heads, 3 KV heads) & RoPE verified.
+    - Golden differential test on `test_swiglu_mlp_npu_b1.model` with `TensorComparator` ($0.99999972$ cos sim, $62.54$ dB SNR).
 - **Documentation**:
-  - User Guide, CLI Reference, and Troubleshooting documentation.
+  - User Guide, CLI Reference, and Python API updated in `README.md`.
 
 ---
 

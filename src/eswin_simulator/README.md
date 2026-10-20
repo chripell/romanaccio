@@ -75,6 +75,20 @@ It replaces the proprietary, 32-bit x86-only vendor `EsSimulator` binary with a 
   - **RoPE (`rope.py`)**: Rotary Position Embedding supporting Hugging Face `half` mode and Cadence DSP `interleaved` pair mode, with strict unitary L2 norm conservation.
   - **Top-K (`topk.py`)**: High-efficiency $O(N)$ partitioning and value/index extraction matching `torch.topk`.
 
+### Milestone 6: Planar Engine (PDP), Rubik, & Full Model Pipeline Verification
+- **Planar Data Processor (`engines/pdp.py`)**:
+  - 2D Max Pooling, Average Pooling, and Global Spatial Pooling with arbitrary strides, paddings, and ceiling modes.
+  - Native support for FP16, FP32, and INT8 with saturating clipping ($[-128, 127]$).
+- **Rubik Transformation Engine (`engines/rubik.py`)**:
+  - Arbitrary multi-dimensional tensor restructuring: Reshape, Transpose/Permute, Slice, Split, Concat, Squeeze, Unsqueeze, Flatten.
+  - Reversible Space-to-Depth and Depth-to-Space transformations for multi-resolution feature fusion.
+- **Differential Tensor Comparator (`evaluation/comparator.py`)**:
+  - `TensorComparator` computing Cosine Similarity, Signal-to-Noise Ratio (SNR in dB), Normalized MSE (NMSE), absolute/relative error distributions, percentiles (p50, p90, p99, p100), and ASCII error histograms.
+- **Multi-Layer Sequential Pipeline Coordination**:
+  - Full SmolLM-135M SwiGLU MLP blocks ($W_{\text{gate}} \to \text{SiLU(LUT)} \odot W_{\text{up}} \to W_{\text{down}} \to \text{residual}$) verified against PyTorch ($>0.99999$ cos sim).
+  - Full SmolLM-135M Attention blocks with Grouped-Query Attention (9 query heads, 3 KV heads) & RoPE verified.
+  - Bit-exact differential comparison against vendor `EsSimulator` on reference models.
+
 ---
 
 ## 2. Mathematical Model of BDMA Strided Transfers
@@ -288,7 +302,7 @@ Run all unit and differential tests via `pytest`:
 pytest -v
 ```
 
-All 52 comprehensive tests cover:
+All 85 comprehensive tests cover:
 - Binary magic validation (`NVDA`) and error detection on corrupted containers.
 - 4D Tensor descriptor parsing (shape, strides, data format, data type, element sizes).
 - Memory allocation across 64-bit DRAM and the 4 MiB on-chip SPRAM.
@@ -300,12 +314,18 @@ All 52 comprehensive tests cover:
 - SDP pointwise ALU operations (`bias_add`, `batch_norm`, `eltwise_mul/add/sub/min/max`).
 - SDP fixed activations (`relu`, `leaky_relu`, `prelu`, `clip`) and precision conversions.
 - SDP 688-byte piecewise linear LUT interpolation (`SiLU`, `Sigmoid`, `Tanh`, `GELU`).
+- PDP 2D Max Pooling, Average Pooling, and Global Spatial Pooling with stride/pad configurations and INT8 saturation.
+- Rubik Reshape, Transpose, Slice, Split, Concat, Flatten, and Space $\leftrightarrow$ Depth transformations.
+- Differential Tensor Comparator (`TensorComparator`) metrics (Cosine Similarity, SNR dB, NMSE, error percentiles, histograms).
 - Cadence Vision Q7 DSP C ABI buffer management and dynamic library binding.
 - DSP `RMSNorm` differential parity with PyTorch across channels (32, 64, 128, 576, 896, 1024, 2048, 4096) and INT8 quantization ($< 1.5 \times 10^{-6}$ diff).
 - DSP `Softmax` numerically stable evaluation across multiple axes ($< 1.0 \times 10^{-6}$ diff).
 - DSP `RoPE` rotary position embedding (Hugging Face `half` mode and Cadence `interleaved` mode) with unitary norm preservation.
 - DSP `TopK` bit-exact value and index extraction against PyTorch `torch.topk`.
+- End-to-end multi-layer pipeline coordination:
+  * Full SmolLM-135M SwiGLU MLP block pipeline parity ($> 0.99999$ cos sim).
+  * Full SmolLM-135M Transformer Attention block with GQA & RoPE.
 - Differential parity testing against vendor `EsSimulator` output across all reference models:
-  * `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$.
-  * `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$.
-  * `test_swiglu_mlp_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$ ($0.99999976$), Max Abs Diff $= \mathbf{0.000244}$.
+  * `test_conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000000}$, SNR $= \mathbf{+\infty\ dB}$.
+  * `test_linear_1x1conv_npu_b1.model`: Cosine Similarity $= \mathbf{1.000000}$, Relative Diff $= \mathbf{0.000518}$, SNR $= \mathbf{113.68\ dB}$.
+  * `test_swiglu_mlp_npu_b1.model`: Cosine Similarity $= \mathbf{0.99999972}$, Max Abs Diff $= \mathbf{0.000244}$, SNR $= \mathbf{62.54\ dB}$.

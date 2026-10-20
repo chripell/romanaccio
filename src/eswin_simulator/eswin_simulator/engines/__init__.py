@@ -12,6 +12,8 @@ from eswin_simulator.engines.cmac import (
 )
 from eswin_simulator.engines.cacc import CACCEngine
 from eswin_simulator.engines.sdp import SDPEngine, SDPLookupTable
+from eswin_simulator.engines.pdp import PDPEngine
+from eswin_simulator.engines.rubik import RubikEngine
 
 __all__ = [
     "HardwareEngine",
@@ -21,6 +23,8 @@ __all__ = [
     "CACCEngine",
     "SDPEngine",
     "SDPLookupTable",
+    "PDPEngine",
+    "RubikEngine",
     "unpack_nvdla_weights_conv2d",
     "unpack_nvdla_weights_1x1",
     "unpack_nvdla_weights",
