@@ -281,6 +281,9 @@ static void displayInitialCard(
     };
     int d0_count = 0, d1_count = 0;
     int expected_blocks = (info.num_layers > 0) ? (int)info.num_layers : 24;
+    bool has_decomposed_lm = false;
+    int decomposed_layers = 0;
+
     for (const auto &d : cand_dirs) {
         int c0 = 0, c1 = 0;
         for (int b = 0; b < 32; ++b) {
@@ -295,9 +298,41 @@ static void displayInitialCard(
             d1_count = c1;
             break;
         }
+
+        // Check for decomposed architecture
+        bool lm_d0 = file_exists_local(d + "/qwen2_5_lm_head_d0_npu_b1.model") || file_exists_local(d + "/lm_head_d0.model");
+        bool lm_d1 = file_exists_local(d + "/qwen2_5_lm_head_d1_npu_b1.model") || file_exists_local(d + "/lm_head_d1.model");
+        if (lm_d0 && lm_d1) has_decomposed_lm = true;
+
+        int decomp_cnt = 0;
+        for (int b = 0; b < expected_blocks; ++b) {
+            char qkv[256], attn[256], mlp[256];
+            snprintf(qkv, sizeof(qkv), "%s/qwen2_5_layer%d_qkv_npu_b1.model", d.c_str(), b);
+            snprintf(attn, sizeof(attn), "%s/qwen2_5_layer%d_attn_out_npu_b1.model", d.c_str(), b);
+            snprintf(mlp, sizeof(mlp), "%s/qwen2_5_layer%d_mlp_npu_b1.model", d.c_str(), b);
+            if (file_exists_local(qkv) || file_exists_local(attn) || file_exists_local(mlp) ||
+                (b == 0 && file_exists_local(d + "/qwen2_5_mlp_opset13_npu_b1.model"))) {
+                decomp_cnt++;
+            }
+        }
+        if (decomp_cnt > 0) {
+            decomposed_layers = decomp_cnt;
+            break;
+        }
     }
 
-    if (d0_count > 0 || d1_count > 0) {
+    if (has_decomposed_lm || decomposed_layers > 0) {
+        std::cout << "  • Architecture Mode : Decomposed Dual-Die Pipeline \033[32m[HARDWARE NPU]\033[0m\n";
+        std::cout << "  • Layer Subgraphs   : " << decomposed_layers << "/" << expected_blocks << " layers loaded";
+        if (decomposed_layers >= expected_blocks) std::cout << " \033[32m[ALL LAYERS OFF-LOADED]\033[0m\n";
+        else std::cout << " \033[33m[PARTIAL: " << decomposed_layers << " NPU, " << (expected_blocks - decomposed_layers) << " CPU/DSP]\033[0m\n";
+
+        std::cout << "  • LM Head Offload   : "
+                  << (has_decomposed_lm ? "Dual-Die Parallel (Die 0 + Die 1, 76,032 x 2) \033[32m[OK]\033[0m\n" : "CPU Fallback\n");
+        std::cout << "  • Device Target     : "
+                  << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? "Dual-Die Auto (Die 0 + Die 1)" : "Single Die (Die 0)") << "\n";
+    } else if (d0_count > 0 || d1_count > 0) {
+        std::cout << "  • Architecture Mode : Monolithic modified_block \033[32m[HARDWARE NPU]\033[0m\n";
         std::cout << "  • Die 0 (Node 0)       : " << d0_count << " layer blocks loaded";
         if (d0_count >= expected_blocks) std::cout << " \033[32m[OK]\033[0m\n";
         else std::cout << " \033[33m[PARTIAL: expected " << expected_blocks << "]\033[0m\n";
@@ -308,7 +343,6 @@ static void displayInitialCard(
 
         std::cout << "  • Device Target     : "
                   << (dev_mode == ES_DEVICE_DUAL_DIE_AUTO ? "Dual-Die Auto (Die 0 + Die 1)" : "Single Die (Die 0)") << "\n";
-        std::cout << "  • Acceleration Mode : Concurrent Dual-Die Pipeline \033[32m[HARDWARE NPU]\033[0m\n";
     } else {
         std::cout << "  • Die 0 (Node 0)       : 0/" << expected_blocks << " layer blocks \033[31m[NOT FOUND]\033[0m\n";
         std::cout << "  • Die 1 (Node 1)       : 0/" << expected_blocks << " layer blocks \033[31m[NOT FOUND]\033[0m\n";
