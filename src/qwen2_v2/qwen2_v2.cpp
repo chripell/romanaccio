@@ -70,6 +70,7 @@ struct GenerationContext {
     bool show_thinking = true;
     bool show_tokens = false;
     int  max_thinking_tokens = 128;
+    int  max_tokens = 0;
     bool in_thinking = false;
     bool thinking_done = false;
     int  thinking_count = 0;
@@ -77,13 +78,10 @@ struct GenerationContext {
     bool thinking_limit_reached = false;
 };
 
-static bool token_callback(int32_t token, const char *piece, void *user_data) {
-    if (g_interrupt_flag.load()) {
-        return false;
-    }
-
-    auto *ctx = static_cast<GenerationContext*>(user_data);
-    ctx->total_count++;
+// Streams one sampled token. The hard per-turn cap is enforced by the wrapper
+// below: the runtime snapshots max_new_tokens into the session at creation time
+// and exposes no setter, so it cannot track /max-tokens changes made mid-chat.
+static void emit_token(int32_t token, const char *piece, GenerationContext *ctx) {
     std::string str = piece ? piece : "";
 
     // Detect thinking tags (Qwen2 / DeepSeek-R1: 151648 = <think>, 151649 = </think>)
@@ -104,7 +102,7 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
         } else {
             std::cout << COLOR_GRAY << "[Thinking...]" << COLOR_RESET << std::flush;
         }
-        return true;
+        return;
     }
 
     if (is_think_end) {
@@ -120,7 +118,7 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
         if (ctx->show_tokens) {
             std::cout << COLOR_GRAY << "[#" << token << ":</think>]" << COLOR_RESET << std::flush;
         }
-        return true;
+        return;
     }
 
     if (ctx->in_thinking) {
@@ -135,7 +133,7 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
             } else {
                 std::cout << COLOR_YELLOW << "\n[Thinking limit reached]\n" << COLOR_RESET << std::flush;
             }
-            return true;
+            return;
         }
 
         if (ctx->show_thinking) {
@@ -153,7 +151,7 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
                 }
             }
         }
-        return true;
+        return;
     }
 
     ctx->thinking_done = true;
@@ -173,14 +171,39 @@ static bool token_callback(int32_t token, const char *piece, void *user_data) {
             std::cout << "[#" << token << "]" << std::flush;
         }
     }
+}
 
-    return true;
+static bool token_callback(int32_t token, const char *piece, void *user_data) {
+    if (g_interrupt_flag.load()) {
+        return false;
+    }
+
+    auto *ctx = static_cast<GenerationContext*>(user_data);
+    ctx->total_count++;
+    emit_token(token, piece, ctx);
+
+    // Returning false makes the runtime break out of its decode loop immediately.
+    return !(ctx->max_tokens > 0 && ctx->total_count >= ctx->max_tokens);
 }
 
 static std::string format_chatml(const std::string &user_text) {
     return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
            "<|im_start|>user\n" + user_text + "<|im_end|>\n"
            "<|im_start|>assistant\n";
+}
+
+// TransformerSession indexes its flat KV buffers by absolute position with no bounds
+// check, so prompt + generated tokens must stay inside the context window — the same
+// overflow class behind Issue #47. Returns the per-turn cap this prompt can afford.
+static int32_t turn_token_budget(const es_tokenizer_t *tok, const std::string &prompt,
+                                 int32_t requested, int32_t window) {
+    if (!tok || window <= 1) return requested;
+    std::vector<int32_t> buf(static_cast<size_t>(window) + 1);
+    int32_t n = es_tokenizer_encode(tok, prompt.c_str(), buf.data(), buf.size());
+    if (n < 0) return requested;
+    int32_t room = window - n - 1;
+    if (room < 1) room = 1;
+    return requested < room ? requested : room;
 }
 
 static void displayInitialCard(
@@ -398,32 +421,52 @@ int main(int argc, char *argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+
+        // Accept both "--opt value" and "--opt=value". The exact-match chain used to
+        // skip anything it did not recognise, so "--max-tokens=64" silently kept the
+        // default instead of reporting a bad flag.
+        std::string inline_value;
+        bool has_inline_value = false;
+        size_t eq = arg.find('=');
+        if (arg.rfind("--", 0) == 0 && eq != std::string::npos) {
+            inline_value = arg.substr(eq + 1);
+            arg = arg.substr(0, eq);
+            has_inline_value = true;
+        }
+        auto take_value = [&](std::string &out) -> bool {
+            if (has_inline_value) { out = inline_value; return true; }
+            if (i + 1 < argc) { out = argv[++i]; return true; }
+            std::cerr << COLOR_YELLOW << "Warning: " << arg << " requires a value" << COLOR_RESET << std::endl;
+            return false;
+        };
+        std::string val;
+
         if (arg == "-m" || arg == "--model") {
-            if (++i < argc) model_path = argv[i];
+            if (take_value(val)) model_path = val;
         } else if (arg == "-t" || arg == "--tokenizer") {
-            if (++i < argc) tokenizer_path = argv[i];
+            if (take_value(val)) tokenizer_path = val;
         } else if (arg == "-p" || arg == "--prompt") {
-            if (++i < argc) cli_prompt = argv[i];
+            if (take_value(val)) cli_prompt = val;
         } else if (arg == "--raw") {
             raw_mode = true;
         } else if (arg == "--temp") {
-            if (++i < argc) temp = std::stof(argv[i]);
+            if (take_value(val)) temp = std::stof(val);
         } else if (arg == "--top-k") {
-            if (++i < argc) top_k = std::stoi(argv[i]);
+            if (take_value(val)) top_k = std::stoi(val);
         } else if (arg == "--top-p") {
-            if (++i < argc) top_p = std::stof(argv[i]);
+            if (take_value(val)) top_p = std::stof(val);
         } else if (arg == "--repeat-penalty") {
-            if (++i < argc) repeat_penalty = std::stof(argv[i]);
+            if (take_value(val)) repeat_penalty = std::stof(val);
         } else if (arg == "--repeat-window") {
-            if (++i < argc) repeat_window = std::stoi(argv[i]);
+            if (take_value(val)) repeat_window = std::stoi(val);
         } else if (arg == "--max-tokens") {
-            if (++i < argc) max_tokens = std::stoi(argv[i]);
+            if (take_value(val)) max_tokens = std::stoi(val);
         } else if (arg == "--show-thinking") {
             show_thinking = true;
         } else if (arg == "--hide-thinking" || arg == "--no-thinking") {
             show_thinking = false;
         } else if (arg == "--max-thinking-tokens") {
-            if (++i < argc) max_thinking_tokens = std::stoi(argv[i]);
+            if (take_value(val)) max_thinking_tokens = std::stoi(val);
         } else if (arg == "--show-tokens" || arg == "--debug-tokens") {
             show_tokens = true;
         } else if (arg == "--single-die") {
@@ -448,6 +491,9 @@ int main(int argc, char *argv[]) {
                       << "  --single-die                   Force single die execution\n"
                       << "  -h, --help                     Show this help\n";
             return 0;
+        } else {
+            std::cerr << COLOR_YELLOW << "Warning: ignoring unknown option '" << argv[i] << "'"
+                      << COLOR_RESET << std::endl;
         }
     }
 
@@ -487,9 +533,23 @@ int main(int argc, char *argv[]) {
     size_t vocab_count = es_tokenizer_vocab_size(tok_handle);
 
     // 4. Create Inference Session with Issue #47 Anti-Looping Protections
+    // The runtime snapshots max_new_tokens at creation and exposes no setter, so the
+    // session carries the widest cap the chat may request while token_callback enforces
+    // the live per-turn value. That keeps /max-tokens effective in both directions.
+    const int32_t seq_window = info.max_seq_len > 0 ? static_cast<int32_t>(info.max_seq_len) : 2048;
+    if (max_tokens < 1) {
+        std::cerr << COLOR_YELLOW << "Warning: max-tokens must be >= 1, using 1" << COLOR_RESET << std::endl;
+        max_tokens = 1;
+    }
+    if (max_tokens > seq_window) {
+        std::cerr << COLOR_YELLOW << "Warning: max-tokens " << max_tokens << " exceeds the "
+                  << seq_window << "-token context window, clamped" << COLOR_RESET << std::endl;
+        max_tokens = seq_window;
+    }
+
     es_session_config_t scfg{};
-    scfg.max_seq_len = 2048;
-    scfg.max_new_tokens = max_tokens;
+    scfg.max_seq_len = seq_window;
+    scfg.max_new_tokens = seq_window;
     scfg.enable_dual_die = (dev_mode == ES_DEVICE_DUAL_DIE_AUTO);
     scfg.sampler_params.temperature = temp;
     scfg.sampler_params.top_k = top_k;
@@ -520,6 +580,7 @@ int main(int argc, char *argv[]) {
     gen_ctx.show_thinking = show_thinking;
     gen_ctx.show_tokens = show_tokens;
     gen_ctx.max_thinking_tokens = max_thinking_tokens;
+    gen_ctx.max_tokens = max_tokens;
     es_perf_stats_t last_stats{};
 
     // Handle non-interactive one-shot prompt execution
@@ -537,6 +598,7 @@ int main(int argc, char *argv[]) {
         gen_ctx.thinking_count = 0;
         gen_ctx.total_count = 0;
         gen_ctx.thinking_limit_reached = false;
+        gen_ctx.max_tokens = turn_token_budget(tok_handle, prompt, max_tokens, seq_window);
 
         status = es_session_generate(session, prompt.c_str(), token_callback, &gen_ctx, &last_stats);
 
@@ -624,8 +686,14 @@ int main(int argc, char *argv[]) {
             std::string cmd;
             int n = 0;
             if (iss >> cmd >> n && n > 0) {
+                if (n > seq_window) {
+                    std::cout << COLOR_YELLOW << "[Max tokens clamped to " << seq_window
+                              << " (context window)]" << COLOR_RESET << std::endl;
+                    n = seq_window;
+                }
                 max_tokens = n;
-                std::cout << COLOR_GREEN << "[Max tokens set to " << n << "]" << COLOR_RESET << std::endl;
+                std::cout << COLOR_GREEN << "[Max tokens set to " << n
+                          << " for the next turn]" << COLOR_RESET << std::endl;
             } else {
                 std::cout << "Usage: /max-tokens <int>" << std::endl;
             }
@@ -666,6 +734,7 @@ int main(int argc, char *argv[]) {
         gen_ctx.thinking_count = 0;
         gen_ctx.total_count = 0;
         gen_ctx.thinking_limit_reached = false;
+        gen_ctx.max_tokens = turn_token_budget(tok_handle, prompt, max_tokens, seq_window);
 
         status = es_session_generate(session, prompt.c_str(), token_callback, &gen_ctx, &last_stats);
 
