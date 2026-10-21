@@ -470,6 +470,49 @@ A detailed hardware benchmarking and configuration study was performed on the ph
 - A dense 7B model (INT8: 7.6 GB) streams 7.6 GB per token, capping throughput at **~3.7 tokens/s** across both memory controllers (28 GB/s sustained).
 - In contrast, a **Mixture of Experts (MoE)** model like DeepSeek-V2-Lite (16B total) activates only 2 of 64 experts per token (**2.4 GB active weights**), achieving **~11.7 tokens/s** ($3.2\times$ faster) while running a substantially more capable model within the 22–27 GiB VRAM envelope.
 
+---
+
+## 22. Qwen2.5-Coder-1.5B AOT Compilation, Differential Verification & Silicon Benchmarks
+
+To validate the open simulator and provide an operational, high-utility code-generation model on the dual-die platform, `Qwen/Qwen2.5-Coder-1.5B-Instruct` (1.54B parameters, 28 hidden layers, $d_{model}=1536$, $d_{mlp}=8960$, GQA 12:2 heads, RoPE $\theta=1,000,000$, vocab 151,936) was ported and compiled.
+
+### 1. Frontend Constraints & ONNX Export Pipeline (`export_qwen2_5_coder.py`):
+- **Opset 13 & Legacy Exporter Requirement**: Modern PyTorch (2.14+) defaults to ONNX IR opset 18 via Dynamo. `EsAAC` uses an older MLIR/EHLO frontend that crashes (`SIGSEGV in SetStorageLevelPass` or `ConvertF32toF16Pass`) if given opset 18 or external `.data` files.
+  All models must be exported with:
+  ```python
+  torch.onnx.export(..., opset_version=13, dynamo=False, do_constant_folding=True)
+  ```
+- **Embedding Extraction**: Raw FP16 embedding table (`(151936, 1536)`, 446.12 MB) exported directly to `embedding.bin` for zero-overhead CPU memory mapping.
+- **Dual-Die LM Head Vocab Alignment**: Padded to $76,032$ tokens per die ($152,064$ total, 128 padding tokens) matching the hardware memory surface alignment requirement ($76032 = 297 \text{ splits} \times 256$ channels).
+
+### 2. AOT Compilation Results (`EsAAC` in Container):
+| Subgraph | Input Shape | Output Shape | Parameters / File Size | Compilation Time |
+| :--- | :--- | :--- | :--- | :--- |
+| **Fused $QKV$ Projection** | $(1, 1536, 1, 1)$ | $(1, 2048, 1, 1)$ | $3.15\text{M}$ / **6.2 MiB** | **1.18 s** |
+| **Attention Output ($O$)** | $(1, 1536, 1, 1)$ | $(1, 1536, 1, 1)$ | $2.36\text{M}$ / **4.7 MiB** | **0.97 s** |
+| **Full SwiGLU MLP Block** | $(1, 1536, 1, 1)$ | $(1, 1536, 1, 1)$ | $41.29\text{M}$ / **81.0 MiB** | **17.29 s** |
+| **Die 0 LM Head Slice** | $(1, 1536, 1, 1)$ | $(1, 76032, 1, 1)$ | $116.79\text{M}$ / **228.0 MiB** | **1m 48s** |
+| **Die 1 LM Head Slice** | $(1, 1536, 1, 1)$ | $(1, 76032, 1, 1)$ | $116.79\text{M}$ / **228.0 MiB** | **1m 47s** |
+
+### 3. Bit-Accuracy Differential Verification:
+- **Vendor Simulator (`EsSimulator`)**:
+  - Full 8960-dim SwiGLU MLP output comparison against PyTorch reference: **Cosine Distance = 1.000000, Relative Difference = 0.000003** (`model output comparison successful`).
+- **Open Simulator (`eswin-sim`)**:
+  - $QKV$ Projection: **Cosine = 0.99999994**, SNR = 69.30 dB.
+  - Attention Output: **Cosine = 0.99999994**, SNR = 69.30 dB.
+  - Full SwiGLU MLP: **Cosine = 0.99999990**, SNR = 66.88 dB.
+  - LM Head Slices: **Cosine = 1.00000000**, SNR = 98.41 dB – 101.69 dB.
+  - Automated test suite: **93/93 tests passing** (100% green).
+
+### 4. Physical Silicon Hardware Execution (`roma` FML13V03):
+Executed directly on physical EIC7702 NPUs via `/opt/eswin/bin/es_run_model`:
+- **Die 0 $QKV$ Projection**: **0.617 ms** (1,620 frames/s), Cosine Similarity = **0.99999964**.
+- **Die 0 Attn Output Projection**: **0.655 ms** (1,527 frames/s), Cosine Similarity = **0.9999998**.
+- **Die 0 Full SwiGLU MLP Block**: **2.628 ms** (380.5 frames/s), Cosine Similarity = **0.9999992**.
+- **Die 1 Full SwiGLU MLP Block**: **3.234 ms** (309.2 frames/s), Cosine Similarity = **0.9999992**.
+- **Aggregate Transformer Block NPU Latency**: $\sim \mathbf{3.90\text{ ms}}$ per layer. With 14 layers per die pipelined across both NPUs, expected decode latency is $\sim \mathbf{55\text{ ms}}$ per token (**~18 tokens/sec**).
+
+
 
 
 
