@@ -132,6 +132,59 @@ static void test_manifest_verification() {
     std::cout << "\033[1;32m[PASS]\033[0m ModelManifest integrity checks verified." << std::endl;
 }
 
+static void test_context_length_parsing() {
+    std::cout << "[*] Testing Manifest Context Window (KV Cache Length) Parsing..." << std::endl;
+
+    std::string err;
+
+    // Absent -> documented default
+    {
+        eswin::ModelManifest m;
+        std::string json = R"({"name":"NoCtx","config":{"architecture":"qwen2","vocab_size":151936}})";
+        TEST_ASSERT(m.load_from_string(json, err), "Parse failed: " + err);
+        TEST_ASSERT(m.config.context_length == 2048, "Default context_length should be 2048");
+    }
+
+    // Canonical open-package key
+    {
+        eswin::ModelManifest m;
+        std::string json = R"({"name":"Ctx","config":{"context_length":8192}})";
+        TEST_ASSERT(m.load_from_string(json, err), "Parse failed: " + err);
+        TEST_ASSERT(m.config.context_length == 8192, "context_length mismatch");
+    }
+
+    // Vendor ENNP spelling ("token_num"), and the legacy aliases
+    const char *aliases[] = {"max_seq_len", "kv_cache_len", "token_num"};
+    for (const char *key : aliases) {
+        eswin::ModelManifest m;
+        std::string json = std::string(R"({"name":"A","config":{")") + key + R"(":1024}})";
+        TEST_ASSERT(m.load_from_string(json, err), "Parse failed for alias: " + std::string(key));
+        TEST_ASSERT(m.config.context_length == 1024,
+                    std::string("alias not honoured: ") + key);
+    }
+
+    // Canonical key wins when several are present
+    {
+        eswin::ModelManifest m;
+        std::string json = R"({"name":"P","config":{"token_num":1024,"context_length":4096}})";
+        TEST_ASSERT(m.load_from_string(json, err), "Parse failed: " + err);
+        TEST_ASSERT(m.config.context_length == 4096, "context_length should take precedence over token_num");
+    }
+
+    // Serialize round-trip keeps the value
+    {
+        eswin::ModelManifest m;
+        m.name = "RoundTrip";
+        m.config.context_length = 16384;
+        std::string dumped = m.to_json_string(2);
+        eswin::ModelManifest m2;
+        TEST_ASSERT(m2.load_from_string(dumped, err), "Reparse failed: " + err);
+        TEST_ASSERT(m2.config.context_length == 16384, "Round-trip lost context_length");
+    }
+
+    std::cout << "\033[1;32m[PASS]\033[0m Context window read from manifest (incl. vendor aliases)." << std::endl;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "  ESWIN Model Package Manifest & Downloader Test Suite  \n"
@@ -140,6 +193,7 @@ int main() {
     test_json_parser();
     test_sha256();
     test_manifest_verification();
+    test_context_length_parsing();
 
     std::cout << "\n========================================================\n"
               << "\033[1;32m  ALL MILESTONE 3 MANIFEST TESTS PASSED!                \033[0m\n"

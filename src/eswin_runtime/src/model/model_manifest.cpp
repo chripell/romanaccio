@@ -31,6 +31,16 @@ bool ModelManifest::load_from_string(const std::string &json_str, std::string &e
         config.rope_theta = static_cast<float>(cfg["rope_theta"].as_double(10000.0));
         config.bos_token_id = static_cast<uint32_t>(cfg["bos_token_id"].as_int(0));
         config.eos_token_id = static_cast<uint32_t>(cfg["eos_token_id"].as_int(0));
+
+        // Context window: accept the open-package name plus the vendor/legacy spellings
+        // so an existing ENNP config.json drops in without editing.
+        static const char *ctx_keys[] = {"context_length", "max_seq_len", "kv_cache_len", "token_num"};
+        for (const char *k : ctx_keys) {
+            if (cfg.has(k)) {
+                config.context_length = static_cast<uint32_t>(cfg[k].as_int(2048));
+                break;
+            }
+        }
     }
 
     files.clear();
@@ -79,6 +89,7 @@ std::string ModelManifest::to_json_string(int indent) const {
     cfg["rope_theta"] = static_cast<double>(config.rope_theta);
     cfg["bos_token_id"] = static_cast<int>(config.bos_token_id);
     cfg["eos_token_id"] = static_cast<int>(config.eos_token_id);
+    cfg["context_length"] = static_cast<int>(config.context_length);
     root["config"] = cfg;
 
     JsonValue arr;

@@ -220,10 +220,15 @@ bool TransformerSession::init(
         m_tokenizer.set_special_tokens(manifest.config.bos_token_id, manifest.config.eos_token_id);
     }
 
-    // 2. Initialize KV cache
+    // 2. Initialize KV cache. The window comes from the package manifest (or the
+    // weights blob header later), never from a fixed constant.
+    m_max_seq = manifest.config.context_length > 0
+                    ? static_cast<int>(manifest.config.context_length)
+                    : 2048;
+
     KvCacheConfig kv_cfg;
     kv_cfg.num_layers = manifest.config.num_hidden_layers;
-    kv_cfg.max_seq_len = 2048;
+    kv_cfg.max_seq_len = m_max_seq;
     kv_cfg.num_kv_heads = manifest.config.num_key_value_heads;
     kv_cfg.head_dim = manifest.config.hidden_size / manifest.config.num_attention_heads;
     m_kv_cache = std::make_unique<KvCache>(kv_cfg);
@@ -444,7 +449,7 @@ bool TransformerSession::load_weights(const std::string &bin_path) {
     m_w_up = transpose_weight_matrix(m_w_up, n_layers, dim, hidden_dim);
     m_w_down = transpose_weight_matrix(m_w_down, n_layers, hidden_dim, dim);
 
-    m_max_seq = seq_len > 0 ? seq_len : 2048;
+    m_max_seq = seq_len > 0 ? seq_len : m_max_seq;
     size_t kv_size = static_cast<size_t>(n_layers) * m_max_seq * (n_kv_heads * head_dim);
     m_k_cache_flat.assign(kv_size, 0.0f);
     m_v_cache_flat.assign(kv_size, 0.0f);
@@ -844,6 +849,19 @@ bool TransformerSession::generate(
 
     m_stats.prompt_tokens = static_cast<int>(prompt_tokens.size());
     m_stats.eval_tokens = 0;
+
+    // The flat KV buffers are indexed by absolute position with no bounds check, so a
+    // turn that would walk past the compiled window must be shrunk rather than silently
+    // corrupting attention state — the overflow class behind Framework Issue #47.
+    if (m_max_seq > 0) {
+        if (static_cast<int>(prompt_tokens.size()) >= m_max_seq) {
+            return false;
+        }
+        int room = m_max_seq - static_cast<int>(prompt_tokens.size());
+        if (max_new_tokens > room) {
+            max_new_tokens = room;
+        }
+    }
 
     auto t_start = std::chrono::high_resolution_clock::now();
 

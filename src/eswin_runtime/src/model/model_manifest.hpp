@@ -26,6 +26,9 @@ struct ModelConfig {
     float       rope_theta = 10000.0f;
     uint32_t    bos_token_id = 0;
     uint32_t    eos_token_id = 0;
+    // Context window baked into the compiled loadables (the KV cache length they
+    // were built with). Vendor ENNP config.json names this "token_num".
+    uint32_t    context_length = 2048;
 };
 
 class ModelManifest {

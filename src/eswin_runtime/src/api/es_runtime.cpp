@@ -441,7 +441,7 @@ es_status_t es_model_get_info(const es_model_t *model, es_model_info_t *info) {
     info->num_layers = model->manifest.config.num_hidden_layers;
     info->num_heads = model->manifest.config.num_attention_heads;
     info->num_kv_heads = model->manifest.config.num_key_value_heads;
-    info->max_seq_len = 2048;
+    info->max_seq_len = model->manifest.config.context_length;
     return ES_SUCCESS;
 }
 
@@ -477,7 +477,7 @@ es_status_t es_session_create(es_model_t *model, const es_session_config_t *conf
     if (config) {
         sess_wrapper->config = *config;
     } else {
-        sess_wrapper->config.max_seq_len = 2048;
+        sess_wrapper->config.max_seq_len = model->manifest.config.context_length;
         sess_wrapper->config.max_new_tokens = 512;
         sess_wrapper->config.enable_dual_die = true;
         sess_wrapper->config.sampler_params.temperature = 0.7f;
