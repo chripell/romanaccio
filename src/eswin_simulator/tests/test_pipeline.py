@@ -249,6 +249,57 @@ class TestEndToEndPipeline:
         assert rep_k.cosine_similarity > 0.99999
         assert rep_v.cosine_similarity > 0.99999
 
+    def test_qwen2_5_mini_mlp_loadable_differential(self):
+        """Verifies compiled test_mini_mlp_opset13_npu_b1.model against vendor/golden outputs."""
+        model_path = Path("/home/chri/aixigua/deep/artifacts/test_mini_mlp_opset13_npu_b1.model")
+        input_path = Path("/home/chri/aixigua/deep/artifacts/test_mini_mlp_input.bin")
+        golden_path = Path("/home/chri/aixigua/deep/artifacts/test_mini_mlp_golden_out.bin")
+
+        if not (model_path.exists() and input_path.exists() and golden_path.exists()):
+            pytest.skip("Mini MLP model/golden artifacts not present")
+
+        model = LoadableModel.from_file(str(model_path))
+        vas = VirtualAddressSpace(model)
+        cmac = CMACEngine(vas)
+        cacc = CACCEngine(vas)
+        sdp = SDPEngine(vas)
+
+        c_in = 1536
+        c_out = 1536
+
+        gate_blobs = sorted([b for b in model.blobs if b.startswith("w_gatesplitM_")], key=lambda x: int(x.split("_")[2]))
+        w_gate = np.vstack([unpack_nvdla_weights_1x1(model.blobs[b].data, 256, c_in, dtype=np.float16) for b in gate_blobs])
+        hidden_dim = w_gate.shape[0]
+
+        up_blobs = sorted([b for b in model.blobs if b.startswith("w_upsplitM_")], key=lambda x: int(x.split("_")[2]))
+        w_up = np.vstack([unpack_nvdla_weights_1x1(model.blobs[b].data, 256, c_in, dtype=np.float16) for b in up_blobs])
+
+        down_blobs = sorted([b for b in model.blobs if b.startswith("w_downsplitM_")], key=lambda x: int(x.split("_")[2]))
+        total_down_bytes = sum(len(model.blobs[b].data) for b in down_blobs)
+        w_down = np.vstack([
+            unpack_nvdla_weights_1x1(model.blobs[b].data, int(round(c_out * (len(model.blobs[b].data) / total_down_bytes))), hidden_dim, dtype=np.float16)
+            for b in down_blobs
+        ])[:c_out, :]
+
+        x = np.fromfile(str(input_path), dtype=np.float16).reshape(1, c_in, 1, 1)
+        golden = np.fromfile(str(golden_path), dtype=np.float16).reshape(1, c_out, 1, 1)
+
+        gate_act = cmac.gemm_1x1(x, w_gate, precision="FP16")
+        up_act = cmac.gemm_1x1(x, w_up, precision="FP16")
+
+        lut_blob = model.blobs.get("kmd-task-lut_list")
+        lut_desc = SDPLookupTable.from_bytes(lut_blob.data) if lut_blob else None
+        silu_act = sdp.silu(gate_act, lut=lut_desc, use_lut=(lut_desc is not None))
+
+        inter_act = sdp.eltwise_mul(silu_act, up_act)
+        down_act = cmac.gemm_1x1(inter_act, w_down, precision="FP16")
+        out_sim = cacc.finalize_fp16(down_act, to_fp16=True)
+
+        rep = TensorComparator.compare(out_sim, golden, tolerance=0.05, cos_threshold=0.999)
+        assert rep.passed
+        assert rep.cosine_similarity > 0.99999
+
+
     def test_qwen2_5_coder_transformer_block_pipeline(self, setup_engines):
         """Simulates full Qwen2.5-Coder-1.5B Transformer block with GQA, RoPE (theta=1M), and SwiGLU MLP."""
         eng = setup_engines

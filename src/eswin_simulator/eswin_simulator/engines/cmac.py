@@ -97,17 +97,22 @@ def unpack_nvdla_weights_1x1(
     else:
         arr = np.asarray(raw_data, dtype=dtype)
 
-    expected_elements = (c_out // cout_sub) * (c_in // cin_sub) * cout_sub * cin_sub
+    total_elements = arr.size
+    c_in_padded = total_elements // c_out if c_out > 0 else c_in
+    if c_in_padded < c_in:
+        c_in_padded = c_in
+
+    expected_elements = (c_out // cout_sub) * (c_in_padded // cin_sub) * cout_sub * cin_sub
     if arr.size < expected_elements:
         raise ValueError(
             f"Weight buffer size ({arr.size}) is smaller than required "
-            f"tiled size ({expected_elements}) for 1x1 conv [C_out={c_out}, C_in={c_in}]"
+            f"tiled size ({expected_elements}) for 1x1 conv [C_out={c_out}, C_in={c_in}, C_in_padded={c_in_padded}]"
         )
 
-    tiled = arr[:expected_elements].reshape(c_out // cout_sub, c_in // cin_sub, cout_sub, cin_sub)
-    # Permute to (c_out // cout_sub, cout_sub, c_in // cin_sub, cin_sub)
-    unpacked = tiled.transpose(0, 2, 1, 3).reshape(c_out, c_in)
-    return np.ascontiguousarray(unpacked)
+    tiled = arr[:expected_elements].reshape(c_out // cout_sub, c_in_padded // cin_sub, cout_sub, cin_sub)
+    # Permute to (c_out // cout_sub, cout_sub, c_in_padded // cin_sub, cin_sub)
+    unpacked = tiled.transpose(0, 2, 1, 3).reshape(c_out, c_in_padded)
+    return np.ascontiguousarray(unpacked[:c_out, :c_in])
 
 
 def unpack_nvdla_weights(

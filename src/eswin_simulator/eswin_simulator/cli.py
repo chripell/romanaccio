@@ -238,27 +238,38 @@ def execute_simulation(
         print(f"  • Conv2D Execution: {cmac.total_macs:,} MACs, output shape {y.shape} [OK]")
         computed = True
 
-    # Scenario B: 1x1 Pointwise Convolution / GEMM with M-splits (e.g. test_linear_1x1conv_npu_b1.model)
-    elif "WsplitM_0_0" in model.blobs and model.input_tensors and model.output_tensors:
+    # Scenario B: 1x1 Pointwise Convolution / GEMM with M-splits (e.g. test_linear_1x1conv_npu_b1.model, QKV, AttnOut)
+    elif any(b.startswith(("WsplitM_", "weightsplitM_", "_lm_MatMul")) for b in model.blobs) and model.input_tensors and model.output_tensors:
         in_t = model.input_tensors[0]
         out_t = model.output_tensors[0]
         c_in = in_t.c
         c_out = out_t.c
 
         # Collect all split blobs
-        split_idx = 0
+        prefix = "WsplitM_" if "WsplitM_0_0" in model.blobs else ("weightsplitM_" if "weightsplitM_0_0" in model.blobs else None)
         w_splits = []
-        while f"WsplitM_{split_idx}_{split_idx}" in model.blobs:
-            bname = f"WsplitM_{split_idx}_{split_idx}"
-            raw = model.blobs[bname].data
-            # Each split has size = C_out_split * C_in * 2
-            c_out_split = len(raw) // (c_in * 2)
-            w_s = unpack_nvdla_weights_1x1(raw, c_out=c_out_split, c_in=c_in, dtype=in_t.dtype)
-            w_splits.append(w_s)
-            split_idx += 1
+        if prefix:
+            split_idx = 0
+            while f"{prefix}{split_idx}_{split_idx}" in model.blobs:
+                bname = f"{prefix}{split_idx}_{split_idx}"
+                raw = model.blobs[bname].data
+                c_out_split = len(raw) // (c_in * 2)
+                w_s = unpack_nvdla_weights_1x1(raw, c_out=c_out_split, c_in=c_in, dtype=in_t.dtype)
+                w_splits.append(w_s)
+                split_idx += 1
+        else:
+            matching_blobs = sorted(
+                [b for b in model.blobs if "splitM_" in b or "MatMul" in b],
+                key=lambda x: int(x.split("_")[-2]) if x.split("_")[-2].isdigit() else 0
+            )
+            for bname in matching_blobs:
+                raw = model.blobs[bname].data
+                c_out_split = len(raw) // (c_in * 2)
+                w_s = unpack_nvdla_weights_1x1(raw, c_out=c_out_split, c_in=c_in, dtype=in_t.dtype)
+                w_splits.append(w_s)
 
         if w_splits:
-            w_total = np.vstack(w_splits)
+            w_total = np.vstack(w_splits)[:c_out, :]
             print(f"  • Detected 1x1 Conv / GEMM ({len(w_splits)} M-splits): C_in={c_in}, C_out={c_out}")
             x = vas.read_tensor(in_t)
 
@@ -269,33 +280,55 @@ def execute_simulation(
             print(f"  • GEMM Execution: {cmac.total_macs:,} MACs, output shape {y.shape} [OK]")
             computed = True
 
-    # Scenario C: SwiGLU MLP Block (e.g. test_swiglu_mlp_npu_b1.model)
-    elif "w_gatesplitM_0_0" in model.blobs and "w_upsplitM_0_3" in model.blobs and "w_downsplitM_0_6" in model.blobs:
+    # Scenario C: SwiGLU MLP Block (arbitrary hidden dimension and arbitrary M-splits)
+    elif any(b.startswith("w_gatesplitM_") for b in model.blobs):
         in_t = model.input_tensors[0]
         out_t = model.output_tensors[0]
         c_in = in_t.c
-        hidden_dim = 1536
+        c_out = out_t.c
 
-        print(f"  • Detected SwiGLU MLP Architecture: Hidden Dim={hidden_dim}, C_in={c_in}, C_out={out_t.c}")
+        # Unpack w_gate splits
+        gate_blobs = sorted(
+            [b for b in model.blobs if b.startswith("w_gatesplitM_")],
+            key=lambda x: int(x.split("_")[2])
+        )
+        gate_splits = []
+        for b in gate_blobs:
+            raw = model.blobs[b].data
+            c_out_s = len(raw) // (c_in * 2)
+            gate_splits.append(unpack_nvdla_weights_1x1(raw, c_out_s, c_in, dtype=in_t.dtype))
+        w_gate = np.vstack(gate_splits)
+        hidden_dim = w_gate.shape[0]
 
-        # Unpack w_gate (1536, 576)
-        w_gate = np.vstack([
-            unpack_nvdla_weights_1x1(model.blobs[f"w_gatesplitM_{i}_{i}"].data, 512, c_in, dtype=in_t.dtype)
-            for i in range(3)
-        ])
+        # Unpack w_up splits
+        up_blobs = sorted(
+            [b for b in model.blobs if b.startswith("w_upsplitM_")],
+            key=lambda x: int(x.split("_")[2])
+        )
+        up_splits = []
+        for b in up_blobs:
+            raw = model.blobs[b].data
+            c_out_s = len(raw) // (c_in * 2)
+            up_splits.append(unpack_nvdla_weights_1x1(raw, c_out_s, c_in, dtype=in_t.dtype))
+        w_up = np.vstack(up_splits)
 
-        # Unpack w_up (1536, 576)
-        w_up = np.vstack([
-            unpack_nvdla_weights_1x1(model.blobs[f"w_upsplitM_{i}_{i+3}"].data, 512, c_in, dtype=in_t.dtype)
-            for i in range(3)
-        ])
+        # Unpack w_down splits
+        down_blobs = sorted(
+            [b for b in model.blobs if b.startswith("w_downsplitM_")],
+            key=lambda x: int(x.split("_")[2])
+        )
+        total_down_bytes = sum(len(model.blobs[b].data) for b in down_blobs)
+        down_splits = []
+        for b in down_blobs:
+            raw = model.blobs[b].data
+            c_out_s = int(round(c_out * (len(raw) / total_down_bytes))) if total_down_bytes > 0 else (c_out // len(down_blobs))
+            down_splits.append(unpack_nvdla_weights_1x1(raw, c_out_s, hidden_dim, dtype=in_t.dtype))
+        w_down = np.vstack(down_splits)[:c_out, :]
 
-        # Unpack w_down (576, 1536)
-        w_down = np.vstack([
-            unpack_nvdla_weights_1x1(model.blobs["w_downsplitM_0_6"].data, 256, hidden_dim, dtype=in_t.dtype),
-            unpack_nvdla_weights_1x1(model.blobs["w_downsplitM_1_7"].data, 256, hidden_dim, dtype=in_t.dtype),
-            unpack_nvdla_weights_1x1(model.blobs["w_downsplitM_2_8"].data, 64, hidden_dim, dtype=in_t.dtype),
-        ])
+        print(f"  • Detected SwiGLU MLP Architecture: Hidden Dim={hidden_dim}, C_in={c_in}, C_out={c_out}")
+        print(f"    - w_gate: {w_gate.shape} ({len(gate_splits)} splits)")
+        print(f"    - w_up:   {w_up.shape} ({len(up_splits)} splits)")
+        print(f"    - w_down: {w_down.shape} ({len(down_splits)} splits)")
 
         x = vas.read_tensor(in_t)
 
@@ -324,20 +357,21 @@ def execute_simulation(
     if not computed:
         print("  • Notice: Model does not have direct Conv/GEMM weight blobs; bypassing compute.")
 
-    # 3. Dump output tensors
-    output_paths = [Path(s.strip()) for s in output_arg.split(",") if s.strip()]
-    print(f"\n[Tensor Output Generation]")
-    for idx, out_file in enumerate(output_paths):
-        if idx >= len(model.output_tensors):
-            print(f"[!] Warning: Extra output path {out_file} ignored.")
-            break
-        t = model.output_tensors[idx]
-        try:
-            bytes_dumped = vas.dump_output_file(t, out_file)
-            print(f"  • Dumped Tensor '{t.name}' -> {out_file} ({bytes_dumped} bytes) [OK]")
-        except Exception as e:
-            print(f"[-] Error dumping output tensor to {out_file}: {e}", file=sys.stderr)
-            return 1
+    # 3. Dump output tensors (if output path requested)
+    output_paths = [Path(s.strip()) for s in (output_arg or "").split(",") if s.strip()]
+    if output_paths:
+        print(f"\n[Tensor Output Generation]")
+        for idx, out_file in enumerate(output_paths):
+            if idx >= len(model.output_tensors):
+                print(f"[!] Warning: Extra output path {out_file} ignored.")
+                break
+            t = model.output_tensors[idx]
+            try:
+                bytes_dumped = vas.dump_output_file(t, out_file)
+                print(f"  • Dumped Tensor '{t.name}' -> {out_file} ({bytes_dumped} bytes) [OK]")
+            except Exception as e:
+                print(f"[-] Error dumping output tensor to {out_file}: {e}", file=sys.stderr)
+                return 1
 
     # 4. Optional differential comparison against reference golden
     if compare_arg:
@@ -414,11 +448,11 @@ def main(args: Optional[list] = None) -> int:
 
     parsed = parser.parse_args(args)
 
-    if parsed.input and parsed.output:
+    if parsed.input:
         return execute_simulation(
             parsed.model,
             parsed.input,
-            parsed.output,
+            output_arg=parsed.output,
             compare_arg=parsed.compare,
             tolerance=parsed.tolerance,
         )
