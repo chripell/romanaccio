@@ -25,15 +25,19 @@ from safetensors import safe_open
 
 
 class Qwen25QKVBlock(nn.Module):
-    """Fused QKV 1x1 Pointwise Convolution (1536 in -> 2048 out)."""
-    def __init__(self, q_w: torch.Tensor, k_w: torch.Tensor, v_w: torch.Tensor):
+    """Fused QKV 1x1 Pointwise Convolution (1536 in -> 2048 out) with Q, K, V bias."""
+    def __init__(self, q_w: torch.Tensor, k_w: torch.Tensor, v_w: torch.Tensor,
+                 q_b: torch.Tensor, k_b: torch.Tensor, v_b: torch.Tensor):
         super().__init__()
-        # Concatenate along output channels: Q (1536), K (256), V (256) -> 2048
-        fused = torch.cat([q_w, k_w, v_w], dim=0)
-        self.weight = nn.Parameter(fused.view(fused.shape[0], fused.shape[1], 1, 1))
+        # Concatenate weights along output channels: Q (1536), K (256), V (256) -> 2048
+        fused_w = torch.cat([q_w, k_w, v_w], dim=0)
+        self.weight = nn.Parameter(fused_w.view(fused_w.shape[0], fused_w.shape[1], 1, 1))
+        # Concatenate biases along output channels: Q (1536), K (256), V (256) -> 2048
+        fused_b = torch.cat([q_b, k_b, v_b], dim=0)
+        self.bias = nn.Parameter(fused_b)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(x, self.weight)
+        return F.conv2d(x, self.weight, self.bias)
 
 
 class Qwen25AttnOutBlock(nn.Module):
@@ -71,16 +75,19 @@ class DualDieLMHead(nn.Module):
         return F.conv2d(x, self.weight)
 
 
-def export_layer(f, output_path: Path, layer_idx: int, dummy_x: torch.Tensor):
+def export_layer(f, output_path: Path, layer_idx: int, dummy_x: torch.Tensor, force: bool = False):
     """Exports QKV, Attn Out, and SwiGLU MLP subgraphs for a single layer."""
-    # 1. QKV
+    # 1. QKV (with Q, K, V bias)
     qkv_onnx = output_path / f"qwen2_5_layer{layer_idx}_qkv.onnx"
-    if not qkv_onnx.exists():
-        print(f"[*] Exporting Layer {layer_idx} QKV (1536 -> 2048)...")
+    if force or not qkv_onnx.exists():
+        print(f"[*] Exporting Layer {layer_idx} QKV with bias (1536 -> 2048)...")
         q_w = f.get_tensor(f"model.layers.{layer_idx}.self_attn.q_proj.weight").to(torch.float32)
         k_w = f.get_tensor(f"model.layers.{layer_idx}.self_attn.k_proj.weight").to(torch.float32)
         v_w = f.get_tensor(f"model.layers.{layer_idx}.self_attn.v_proj.weight").to(torch.float32)
-        qkv_block = Qwen25QKVBlock(q_w, k_w, v_w)
+        q_b = f.get_tensor(f"model.layers.{layer_idx}.self_attn.q_proj.bias").to(torch.float32)
+        k_b = f.get_tensor(f"model.layers.{layer_idx}.self_attn.k_proj.bias").to(torch.float32)
+        v_b = f.get_tensor(f"model.layers.{layer_idx}.self_attn.v_proj.bias").to(torch.float32)
+        qkv_block = Qwen25QKVBlock(q_w, k_w, v_w, q_b, k_b, v_b)
         qkv_block.eval()
         torch.onnx.export(
             qkv_block, dummy_x, str(qkv_onnx),
@@ -126,7 +133,7 @@ def export_layer(f, output_path: Path, layer_idx: int, dummy_x: torch.Tensor):
         print(f"[=] Layer {layer_idx} SwiGLU MLP already exported.")
 
 
-def export_qwen2_5_coder(model_dir: str, out_dir: str, start_layer: int = 0, num_layers: int = 1):
+def export_qwen2_5_coder(model_dir: str, out_dir: str, start_layer: int = 0, num_layers: int = 1, force: bool = False):
     model_path = Path(model_dir)
     output_path = Path(out_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -154,7 +161,7 @@ def export_qwen2_5_coder(model_dir: str, out_dir: str, start_layer: int = 0, num
 
         # 2. Export requested layers
         for l_idx in range(start_layer, start_layer + num_layers):
-            export_layer(f, output_path, l_idx, dummy_x)
+            export_layer(f, output_path, l_idx, dummy_x, force=force)
 
         # 3. Export Dual-Die LM Head ONNX Models (if not already exported)
         half_padded = 76032
@@ -202,7 +209,8 @@ if __name__ == "__main__":
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--all-layers", action="store_true")
+    parser.add_argument("--force", action="store_true", help="Force re-exporting existing layers")
     args = parser.parse_args()
 
     n_layers = 28 if args.all_layers else args.num_layers
-    export_qwen2_5_coder(args.model_dir, args.out_dir, start_layer=args.start_layer, num_layers=n_layers)
+    export_qwen2_5_coder(args.model_dir, args.out_dir, start_layer=args.start_layer, num_layers=n_layers, force=args.force)

@@ -512,15 +512,21 @@ Executed directly on physical EIC7702 NPUs via `/opt/eswin/bin/es_run_model`:
 - **Die 1 Full SwiGLU MLP Block**: **3.234 ms** (309.2 frames/s), Cosine Similarity = **0.9999992**.
 - **Aggregate Transformer Block NPU Latency**: $\sim \mathbf{3.90\text{ ms}}$ per layer. With 14 layers per die pipelined across both NPUs, expected decode latency is $\sim \mathbf{55\text{ ms}}$ per token (**~18 tokens/sec**).
 
+---
 
+## 13. Full End-to-End Model Port: Qwen2.5-Coder-1.5B on Dual-Die NPU
 
+We have ported and validated **Qwen2.5-Coder-1.5B-Instruct** running end-to-end on board `roma` using the open runtime (`libes_runtime.so`) and `qwen2_v2`.
 
-
-
-
-
-
-
-
-
+- **Detailed Findings Document**: [findings/QWEN2_5_CODER_PORTING_AND_DUAL_DIE.md](findings/QWEN2_5_CODER_PORTING_AND_DUAL_DIE.md).
+- **Architecture Highlights**:
+  - **All 28 Layers Offloaded**: 14 layers on Die 0, 14 layers on Die 1 ($84$ NPU layer graphs).
+  - **Dual-Die Parallel LM Head**: $76,032 \times 1536$ FP16 vocab slice per die ($2$ NPU graphs).
+  - **Q, K, V Bias Fusion**: Fused learned additive projection biases ($b_q, b_k, b_v$) into $1\times 1$ Conv2D filters, achieving bit-exact cosine similarity ($1.000000$) with PyTorch golden reference.
+  - **Extended RoPE Frequency**: Configured $\theta_{\text{base}} = 1,000,000.0$ ($10^6$) for code long-context stability.
+  - **Atomic Special Token Parsing**: Isolated `<|im_start|>`, `<|im_end|>`, and `<|endoftext|>` prior to BPE subword segmentation to prevent token corruption.
+- **Hardware Performance**:
+  - **Prefill Latency**: $230\text{ ms / prompt token}$.
+  - **Autoregressive Generation**: **$4.18 - 5.49\text{ tokens/second}$** sustained.
+  - **Zero Closed-Source Blob Dependencies**: Operates directly via `/dev/npu0`, `/dev/npu1`, and `/dev/malloc_dmabuf`.
 

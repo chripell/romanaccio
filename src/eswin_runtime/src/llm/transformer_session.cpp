@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <algorithm>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -52,22 +53,42 @@ bool TransformerSession::load_rms_norms(const std::string &path) {
 
 bool TransformerSession::load_embeddings_fp16(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return false;
+    if (!f.is_open()) {
+        std::cerr << "[load_embeddings_fp16] Failed to open: " << path << std::endl;
+        return false;
+    }
     std::streamsize size = f.tellg();
     f.seekg(0, std::ios::beg);
 
     size_t total_elements = static_cast<size_t>(m_manifest.config.vocab_size) * m_manifest.config.hidden_size;
     size_t expected_bytes = total_elements * sizeof(es_fp16_t);
     if (static_cast<size_t>(size) < expected_bytes) {
+        std::cerr << "[load_embeddings_fp16] File too small! size=" << size << " < " << expected_bytes << std::endl;
         return false;
     }
 
-    m_embed_fp16.resize(total_elements);
-    f.read(reinterpret_cast<char*>(m_embed_fp16.data()), expected_bytes);
-    if (!f) {
+    try {
+        m_embed_fp16.resize(total_elements);
+    } catch (const std::exception &e) {
+        std::cerr << "[load_embeddings_fp16] resize threw: " << e.what() << std::endl;
+        return false;
+    }
+
+    // Read in chunks of 16MB to avoid any std::streamsize limits
+    size_t bytes_read = 0;
+    char *buf = reinterpret_cast<char*>(m_embed_fp16.data());
+    while (bytes_read < expected_bytes && f) {
+        size_t chunk = std::min(size_t(16 * 1024 * 1024), expected_bytes - bytes_read);
+        f.read(buf + bytes_read, chunk);
+        bytes_read += f.gcount();
+    }
+
+    if (bytes_read < expected_bytes) {
+        std::cerr << "[load_embeddings_fp16] Read failed! Only read " << bytes_read << " / " << expected_bytes << " bytes" << std::endl;
         m_embed_fp16.clear();
         return false;
     }
+
     m_has_embed_fp16 = true;
     return true;
 }
@@ -318,19 +339,15 @@ bool TransformerSession::init(
         }
     }
 
-    // 7. Load model weights if smollm_135m.bin (or similar) exists
+    // 7. Load model weights if role "weights" exists or for legacy SmolLM
     std::string weights_path;
     const auto *w_desc = manifest.find_file_by_role("weights");
     if (w_desc && !w_desc->name.empty() && std::ifstream(model_dir + "/" + w_desc->name).good()) {
         weights_path = model_dir + "/" + w_desc->name;
-    } else if (std::ifstream(model_dir + "/smollm_135m.bin").good()) {
-        weights_path = model_dir + "/smollm_135m.bin";
-    } else if (std::ifstream(model_dir + "/models/smollm_135m.bin").good()) {
-        weights_path = model_dir + "/models/smollm_135m.bin";
-    } else if (std::ifstream("./smollm_135m.bin").good()) {
-        weights_path = "./smollm_135m.bin";
-    } else if (std::ifstream("/home/chri/smollm/models/smollm_135m.bin").good()) {
-        weights_path = "/home/chri/smollm/models/smollm_135m.bin";
+    } else if (manifest.config.architecture != "qwen2" && manifest.config.hidden_size == 576) {
+        if (std::ifstream(model_dir + "/smollm_135m.bin").good()) {
+            weights_path = model_dir + "/smollm_135m.bin";
+        }
     }
 
     if (!weights_path.empty()) {
@@ -600,7 +617,7 @@ int32_t TransformerSession::step(int32_t token_id, int pos) {
         const float *emb_ptr = m_embed.data() + static_cast<size_t>(token_id) * dim;
         std::memcpy(m_x_buf.data(), emb_ptr, dim * sizeof(float));
     } else {
-        std::fill(m_x_buf.begin(), m_x_buf.end(), 0.01f);
+        std::fill(m_x_buf.begin(), m_x_buf.end(), 0.0f);
     }
 
     // 2. Transformer layers (0 .. n_layers - 1)
@@ -819,8 +836,9 @@ bool TransformerSession::generate(
     reset();
 
     // 1. Encode prompt
-    std::vector<int32_t> prompt_tokens = m_tokenizer.encode(prompt, true);
-    if (prompt_tokens.empty()) {
+    bool add_bos = (m_manifest.config.architecture != "qwen2" && prompt.find("<|im_start|>") == std::string::npos);
+    std::vector<int32_t> prompt_tokens = m_tokenizer.encode(prompt, add_bos);
+    if (prompt_tokens.empty() && m_manifest.config.bos_token_id >= 0 && add_bos) {
         prompt_tokens.push_back(m_manifest.config.bos_token_id);
     }
 
@@ -852,9 +870,18 @@ bool TransformerSession::generate(
             }
         }
 
-        // Stop on EOS (<|im_end|> = 2, <|endoftext|> = 0)
-        if (next_token == 0 || next_token == 2 ||
-            static_cast<uint32_t>(next_token) == m_manifest.config.eos_token_id) {
+        // Stop on EOS (<|im_end|>, <|endoftext|>, or manifest eos_token_id)
+        bool is_eos = (static_cast<uint32_t>(next_token) == m_manifest.config.eos_token_id);
+        if (m_manifest.config.architecture == "qwen2" || m_manifest.config.vocab_size > 100000) {
+            if (next_token == 151643 || next_token == 151645) { // <|endoftext|>, <|im_end|>
+                is_eos = true;
+            }
+        } else {
+            if (next_token == 0 || next_token == 2) {
+                is_eos = true;
+            }
+        }
+        if (is_eos) {
             break;
         }
 

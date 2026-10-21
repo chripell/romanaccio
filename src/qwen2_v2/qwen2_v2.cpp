@@ -392,6 +392,8 @@ int main(int argc, char *argv[]) {
     bool show_thinking = true;         // Default: show thinking
     int32_t max_thinking_tokens = 128; // Default limit for thinking reasoning
     bool show_tokens = false;          // Debug token mode
+    bool raw_mode = false;             // Raw generation mode (no ChatML)
+    std::string cli_prompt;            // Non-interactive prompt
     es_device_mode_t dev_mode = ES_DEVICE_DUAL_DIE_AUTO;
 
     for (int i = 1; i < argc; ++i) {
@@ -400,6 +402,10 @@ int main(int argc, char *argv[]) {
             if (++i < argc) model_path = argv[i];
         } else if (arg == "-t" || arg == "--tokenizer") {
             if (++i < argc) tokenizer_path = argv[i];
+        } else if (arg == "-p" || arg == "--prompt") {
+            if (++i < argc) cli_prompt = argv[i];
+        } else if (arg == "--raw") {
+            raw_mode = true;
         } else if (arg == "--temp") {
             if (++i < argc) temp = std::stof(argv[i]);
         } else if (arg == "--top-k") {
@@ -427,6 +433,8 @@ int main(int argc, char *argv[]) {
                       << "Options:\n"
                       << "  -m, --model <path>             Model directory or manifest.json (default: .)\n"
                       << "  -t, --tokenizer <path>         Explicit tokenizer.json / qwen.tiktoken path\n"
+                      << "  -p, --prompt <text>            Run single turn non-interactively and exit\n"
+                      << "  --raw                          Do not wrap prompt in ChatML (raw code completion)\n"
                       << "  --show-thinking                Stream thinking tokens in gray (DEFAULT: on)\n"
                       << "  --hide-thinking                Hide thinking tokens, showing only final response\n"
                       << "  --max-thinking-tokens <int>    Cap thinking tokens before answering (default: 128)\n"
@@ -508,16 +516,52 @@ int main(int argc, char *argv[]) {
         show_thinking, max_thinking_tokens, show_tokens
     );
 
-    std::cout << "Interactive chat session ready. Type your question and press Enter.\n"
-              << "Type '/help' for command options, or '/exit' to quit.\n";
-
-    // 6. REPL
-    es_perf_stats_t last_stats{};
-    std::string line;
     GenerationContext gen_ctx;
     gen_ctx.show_thinking = show_thinking;
     gen_ctx.show_tokens = show_tokens;
     gen_ctx.max_thinking_tokens = max_thinking_tokens;
+    es_perf_stats_t last_stats{};
+
+    // Handle non-interactive one-shot prompt execution
+    if (!cli_prompt.empty()) {
+        std::string prompt = (raw_mode || cli_prompt.find("<|im_start|>") != std::string::npos)
+                                ? cli_prompt
+                                : format_chatml(cli_prompt);
+
+        std::cout << COLOR_CYAN << COLOR_BOLD << "Qwen2 > " << COLOR_RESET;
+
+        g_interrupt_flag.store(false);
+        g_in_generation.store(true);
+        gen_ctx.in_thinking = false;
+        gen_ctx.thinking_done = false;
+        gen_ctx.thinking_count = 0;
+        gen_ctx.total_count = 0;
+        gen_ctx.thinking_limit_reached = false;
+
+        status = es_session_generate(session, prompt.c_str(), token_callback, &gen_ctx, &last_stats);
+
+        g_in_generation.store(false);
+        std::cout << std::endl;
+
+        if (status == ES_SUCCESS) {
+            std::cout << COLOR_GRAY
+                      << "[" << last_stats.prompt_tokens << " prompt tokens (" << std::fixed << std::setprecision(1) << last_stats.prompt_eval_ms << "ms) | "
+                      << last_stats.eval_tokens << " gen tokens (" << last_stats.eval_ms << "ms) | "
+                      << std::setprecision(2) << last_stats.tokens_per_sec << " t/s]"
+                      << COLOR_RESET << std::endl;
+        }
+
+        es_session_free(session);
+        es_model_unload(model);
+        es_free(ctx);
+        return (status == ES_SUCCESS) ? 0 : 1;
+    }
+
+    std::cout << "Interactive chat session ready. Type your question and press Enter.\n"
+              << "Type '/help' for command options, or '/exit' to quit.\n";
+
+    // 6. REPL
+    std::string line;
 
     while (true) {
         std::cout << COLOR_GREEN << COLOR_BOLD << "\nUser > " << COLOR_RESET;
@@ -531,6 +575,16 @@ int main(int argc, char *argv[]) {
         if (line == "/reset") {
             es_session_reset(session);
             std::cout << COLOR_YELLOW << "[KV cache reset]" << COLOR_RESET << std::endl;
+            continue;
+        }
+        if (line == "/raw on") {
+            raw_mode = true;
+            std::cout << COLOR_GREEN << "[Raw prompt mode enabled]" << COLOR_RESET << std::endl;
+            continue;
+        }
+        if (line == "/raw off") {
+            raw_mode = false;
+            std::cout << COLOR_YELLOW << "[ChatML prompt mode enabled]" << COLOR_RESET << std::endl;
             continue;
         }
         if (line == "/thinking on") {
@@ -588,6 +642,7 @@ int main(int argc, char *argv[]) {
         }
         if (line == "/help") {
             std::cout << "Available commands:\n"
+                      << "  /raw [on|off]          Toggle raw code completion vs ChatML mode\n"
                       << "  /thinking [on|off]     Toggle streaming of thinking tokens\n"
                       << "  /tokens [on|off]       Toggle raw token ID debug mode\n"
                       << "  /max-thinking <N>      Set max thinking tokens (default: 128)\n"
@@ -598,7 +653,9 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        std::string prompt = format_chatml(line);
+        std::string prompt = (raw_mode || line.find("<|im_start|>") != std::string::npos)
+                                ? line
+                                : format_chatml(line);
 
         std::cout << COLOR_CYAN << COLOR_BOLD << "Qwen2 > " << COLOR_RESET;
 

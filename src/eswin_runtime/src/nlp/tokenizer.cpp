@@ -100,10 +100,6 @@ void Tokenizer::add_token(int32_t id, const std::string &piece) {
     m_id_to_piece[id] = piece;
     m_piece_to_id[piece] = id;
 
-    if (!m_uses_gpt2_space && piece.size() >= 2 &&
-        static_cast<unsigned char>(piece[0]) == 0xC4 && static_cast<unsigned char>(piece[1]) == 0xA0) {
-        m_uses_gpt2_space = true;
-    }
     if (!m_uses_spm_space && piece.size() >= 3 &&
         static_cast<unsigned char>(piece[0]) == 0xE2 && static_cast<unsigned char>(piece[1]) == 0x96 && static_cast<unsigned char>(piece[2]) == 0x81) {
         m_uses_spm_space = true;
@@ -113,6 +109,10 @@ void Tokenizer::add_token(int32_t id, const std::string &piece) {
 bool Tokenizer::load_json(const std::string &json_str, std::string &err) {
     JsonValue root = JsonValue::parse(json_str, err);
     if (!err.empty()) return false;
+
+    m_id_to_piece.clear();
+    m_piece_to_id.clear();
+    m_special_tokens.clear();
 
     // Check "model" -> "vocab"
     if (root.has("model") && root["model"].is_object()) {
@@ -133,10 +133,17 @@ bool Tokenizer::load_json(const std::string &json_str, std::string &err) {
                 std::string content = item["content"].as_string();
                 if (id >= 0 && !content.empty()) {
                     add_token(id, content);
+                    m_special_tokens.push_back({content, id});
                 }
             }
         }
     }
+
+    // Sort special tokens by length descending (longest match first)
+    std::sort(m_special_tokens.begin(), m_special_tokens.end(),
+              [](const std::pair<std::string, int32_t> &a, const std::pair<std::string, int32_t> &b) {
+                  return a.first.size() > b.first.size();
+              });
 
     if (m_id_to_piece.empty()) {
         err = "No vocabulary items parsed from JSON";
@@ -221,7 +228,13 @@ bool Tokenizer::load_tiktoken(const std::string &tiktoken_path, std::string &err
         if (static_cast<size_t>(sp.first) >= m_id_to_piece.size() || m_id_to_piece[sp.first].empty()) {
             add_token(sp.first, sp.second);
         }
+        m_special_tokens.push_back({sp.second, sp.first});
     }
+
+    std::sort(m_special_tokens.begin(), m_special_tokens.end(),
+              [](const std::pair<std::string, int32_t> &a, const std::pair<std::string, int32_t> &b) {
+                  return a.first.size() > b.first.size();
+              });
 
     return !m_id_to_piece.empty();
 }
@@ -268,39 +281,62 @@ std::vector<int32_t> Tokenizer::encode(const std::string &text, bool add_bos) co
         return tokens;
     }
 
-    std::string processed;
-    if (m_uses_gpt2_space) {
-        for (char c : text) {
-            if (c == ' ') processed += "\xC4\xA0"; // "Ġ"
-            else processed += c;
-        }
-    } else if (m_uses_spm_space) {
-        for (char c : text) {
-            if (c == ' ') processed += "\xE2\x96\x81"; // " "
-            else processed += c;
-        }
-    } else {
-        processed = text;
-    }
-
-    // Subword greedy longest prefix match
+    // Process text: handle special tokens atomically, encode normal text chunks in between
     size_t i = 0;
-    while (i < processed.size()) {
-        bool matched = false;
-        size_t max_search = std::min(size_t(64), processed.size() - i);
-        for (size_t len = max_search; len >= 1; --len) {
-            std::string sub = processed.substr(i, len);
-            auto it = m_piece_to_id.find(sub);
-            if (it != m_piece_to_id.end()) {
-                tokens.push_back(it->second);
-                i += len;
-                matched = true;
+    while (i < text.size()) {
+        // 1. Check if current position matches any special token
+        bool matched_sp = false;
+        for (const auto &sp : m_special_tokens) {
+            if (i + sp.first.size() <= text.size() &&
+                text.compare(i, sp.first.size(), sp.first) == 0) {
+                tokens.push_back(sp.second);
+                i += sp.first.size();
+                matched_sp = true;
                 break;
             }
         }
-        if (!matched) {
-            i++; // Skip unknown byte
+        if (matched_sp) continue;
+
+        // 2. Find distance to next special token
+        size_t next_sp = text.size();
+        for (const auto &sp : m_special_tokens) {
+            size_t pos = text.find(sp.first, i);
+            if (pos != std::string::npos && pos < next_sp) {
+                next_sp = pos;
+            }
         }
+
+        std::string chunk = text.substr(i, next_sp - i);
+        if (m_uses_spm_space) {
+            std::string spm_chunk;
+            for (char c : chunk) {
+                if (c == ' ') spm_chunk += "\xE2\x96\x81";
+                else spm_chunk += c;
+            }
+            chunk = std::move(spm_chunk);
+        }
+
+        // Greedy longest prefix match on chunk
+        size_t c_idx = 0;
+        while (c_idx < chunk.size()) {
+            bool matched = false;
+            size_t max_search = std::min(size_t(64), chunk.size() - c_idx);
+            for (size_t len = max_search; len >= 1; --len) {
+                std::string sub = chunk.substr(c_idx, len);
+                auto it = m_piece_to_id.find(sub);
+                if (it != m_piece_to_id.end()) {
+                    tokens.push_back(it->second);
+                    c_idx += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                c_idx++; // Skip unknown byte
+            }
+        }
+
+        i = next_sp;
     }
 
     return tokens;

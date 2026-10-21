@@ -45,13 +45,14 @@ public:
 private:
     void add_token(int32_t id, const std::string &piece);
 
-    std::vector<std::string>             m_id_to_piece;
-    std::unordered_map<std::string, int> m_piece_to_id;
-    int32_t                              m_bos_id = 0;
-    int32_t                              m_eos_id = 0;
-    int32_t                              m_pad_id = -1;
-    bool                                 m_uses_gpt2_space = false;
-    bool                                 m_uses_spm_space = false;
+    std::vector<std::string>                     m_id_to_piece;
+    std::unordered_map<std::string, int32_t>     m_piece_to_id;
+    std::vector<std::pair<std::string, int32_t>> m_special_tokens;
+    int32_t                                      m_bos_id = -1;
+    int32_t                                      m_eos_id = -1;
+    int32_t                                      m_pad_id = -1;
+    bool                                         m_uses_gpt2_space = false;
+    bool                                         m_uses_spm_space = false;
 };
 
 } // namespace eswin
