@@ -433,6 +433,44 @@ During Milestone 6 implementation and verification of `eswin_runtime`:
    - Implemented via `ctypes` foreign function interface with zero external binary compilation dependencies.
    - Pythonic context managers (`with RuntimeContext() as ctx`, `with ctx.load_model(...) as model`, `with model.create_session(...) as session`) ensure leak-free operation in Python scripts, Jupyter notebooks, and Web API backends.
 
+---
+
+## 21. NUMA Memory Architecture, Physical Silicon Bandwidth & Shared NPU Memory Configuration
+
+A detailed hardware benchmarking and configuration study was performed on the physical DC-ROMA RISC-V Mainboard II (`roma` FML13V03, dual-die EIC7702, 32 GiB LPDDR5). Full report: [findings/NUMA_MEMORY_AND_HARDWARE_BENCHMARK.md](findings/NUMA_MEMORY_AND_HARDWARE_BENCHMARK.md).
+
+### 1. Silicon Benchmark Summary (STREAM & Pointer-Chasing):
+- **Local vs Remote Latency**: Local pointer-chasing latency is **206.6 ns**; remote cross-die latency is **670.1 ns** ($3.25\times$ latency penalty).
+- **Single-Core Bandwidth Degradation**: Local single-core write is **7.86 GB/s**; remote write drops to **1.02 GB/s** ($7.7\times$ slowdown due to D2D serialization).
+- **Die-Level Saturation (4 Cores)**: Local streaming read peaks at **13.93 GB/s** per die (~28 GB/s aggregate read across both dies).
+- **Full-System Aggregate Bandwidth (8 Cores)**: Concurrent local triad achieves **47.93 GB/s**.
+- **Die-to-Die (D2D) Interconnect Ceiling**: Concurrent cross-die transfers cap at **21.85 GB/s** bidirectional throughput.
+- **MMZ DMA Buffer Risk**: CPU reads from `NoCache` MMZ buffers drop to **10–60 MB/s** (single uncacheable transactions). Output buffers read by the CPU **must** use `Cached` mode (yielding **1.74–2.89 GB/s** with cache invalidation).
+
+### 2. Expanding NPU Shared MMZ Memory (Above 11 GiB):
+- The board has 32 GiB physical RAM: Die 0 (`0x80000000`–`0x480000000`, 16 GiB) and Die 1 (`0x2000000000`–`0x2400000000`, 16 GiB).
+- For headless AI inference where Linux needs only 4–5 GiB total RAM:
+  - **27 GiB Total NPU VRAM (13.5 GiB / die, 5 GiB Linux)**:
+    ```text
+    setenv fdt0_cmd "fdt mmz mmz_nid_0_part_0 0x120000000 0x360000000"
+    setenv fdt1_cmd "fdt mmz mmz_nid_1_part_0 0x20a0000000 0x360000000"
+    setenv bootcmd "run fdt0_cmd; run fdt1_cmd; ${bootcmd}"
+    saveenv
+    ```
+  - **28 GiB Total NPU VRAM (14.0 GiB / die, 4 GiB Linux)**:
+    ```text
+    setenv fdt0_cmd "fdt mmz mmz_nid_0_part_0 0x100000000 0x380000000"
+    setenv fdt1_cmd "fdt mmz mmz_nid_1_part_0 0x2080000000 0x380000000"
+    setenv bootcmd "run fdt0_cmd; run fdt1_cmd; ${bootcmd}"
+    saveenv
+    ```
+
+### 3. Memory Bandwidth Wall & MoE Architectures:
+- Autoregressive LLM decoding operates at an arithmetic intensity of $I \approx 2\text{ FLOPs/byte}$, placing it $700\times$ below the NPU compute roofline. Generation speed is strictly memory-bandwidth bound.
+- A dense 7B model (INT8: 7.6 GB) streams 7.6 GB per token, capping throughput at **~3.7 tokens/s** across both memory controllers (28 GB/s sustained).
+- In contrast, a **Mixture of Experts (MoE)** model like DeepSeek-V2-Lite (16B total) activates only 2 of 64 experts per token (**2.4 GB active weights**), achieving **~11.7 tokens/s** ($3.2\times$ faster) while running a substantially more capable model within the 22–27 GiB VRAM envelope.
+
+
 
 
 
