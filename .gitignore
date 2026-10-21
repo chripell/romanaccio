@@ -41,3 +41,4 @@ venv/
 .vscode/
 .idea/
 QWEN.md
+.qwen
