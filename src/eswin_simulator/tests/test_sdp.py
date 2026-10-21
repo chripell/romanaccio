@@ -149,6 +149,8 @@ def test_golden_swiglu_mlp_differential(vas: VirtualAddressSpace):
 
     golden_path = Path("/tmp/es_swiglu_golden.bin")
     if not golden_path.exists():
+        golden_path = ARTIFACTS_DIR / "scratch" / "golden_swiglu" / "es_swiglu_golden.bin"
+    if not golden_path.exists():
         pytest.skip("Golden file es_swiglu_golden.bin not found")
 
     model = LoadableModel.from_file(str(model_path))

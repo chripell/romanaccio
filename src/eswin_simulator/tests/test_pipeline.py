@@ -161,6 +161,8 @@ class TestEndToEndPipeline:
         """Verifies test_swiglu_mlp_npu_b1.model using TensorComparator against vendor output."""
         model_path = Path("/home/chri/aixigua/deep/artifacts/test_swiglu_mlp_npu_b1.model")
         golden_path = Path("/tmp/es_swiglu_golden.bin")
+        if not golden_path.exists():
+            golden_path = Path("/home/chri/aixigua/deep/artifacts/scratch/golden_swiglu/es_swiglu_golden.bin")
 
         if not (model_path.exists() and golden_path.exists()):
             pytest.skip("Golden model artifacts not present")
@@ -246,3 +248,138 @@ class TestEndToEndPipeline:
         assert rep_q.cosine_similarity > 0.99999
         assert rep_k.cosine_similarity > 0.99999
         assert rep_v.cosine_similarity > 0.99999
+
+    def test_qwen2_5_coder_transformer_block_pipeline(self, setup_engines):
+        """Simulates full Qwen2.5-Coder-1.5B Transformer block with GQA, RoPE (theta=1M), and SwiGLU MLP."""
+        eng = setup_engines
+        cmac, sdp, dsp, rubik = eng["cmac"], eng["sdp"], eng["dsp"], eng["rubik"]
+
+        batch, seq = 1, 4
+        dim = 1536              # Qwen2.5-Coder-1.5B hidden_size
+        num_q_heads = 12        # 12 query heads
+        num_kv_heads = 2        # 2 KV heads (GQA with ratio 6)
+        head_dim = 128          # head dimension (12 * 128 = 1536)
+        hidden_dim = 8960       # intermediate_size (SwiGLU)
+        rope_theta = 1000000.0  # Qwen2.5 1M context theta
+        rms_norm_eps = 1e-6
+
+        np.random.seed(42)
+        x = np.random.randn(batch, seq, dim).astype(np.float32) * 0.05
+
+        # Attention weights
+        w_norm1 = np.ones(dim, dtype=np.float32)
+        wq = np.random.randn(num_q_heads * head_dim, dim).astype(np.float32) * 0.02
+        wk = np.random.randn(num_kv_heads * head_dim, dim).astype(np.float32) * 0.02
+        wv = np.random.randn(num_kv_heads * head_dim, dim).astype(np.float32) * 0.02
+        wo = np.random.randn(dim, num_q_heads * head_dim).astype(np.float32) * 0.02
+
+        # MLP weights
+        w_norm2 = np.ones(dim, dtype=np.float32)
+        w_gate = np.random.randn(hidden_dim, dim).astype(np.float32) * 0.02
+        w_up = np.random.randn(hidden_dim, dim).astype(np.float32) * 0.02
+        w_down = np.random.randn(dim, hidden_dim).astype(np.float32) * 0.02
+
+        # ---------------------------------------------------------------------
+        # 1. Attention Block Execution via Simulator Engines
+        # ---------------------------------------------------------------------
+        # Pre-attention RMSNorm via DSP
+        x_norm1 = dsp.execute_rms_norm(x, w_norm1, eps=rms_norm_eps)
+
+        # Q, K, V Projections via CMAC
+        q_proj = cmac.gemm_1x1(x_norm1, wq)
+        k_proj = cmac.gemm_1x1(x_norm1, wk)
+        v_proj = cmac.gemm_1x1(x_norm1, wv)
+
+        # Rubik Reshape & Transpose to (B, H, S, D)
+        q = rubik.transpose(rubik.reshape(q_proj, (batch, seq, num_q_heads, head_dim)), (0, 2, 1, 3))
+        k = rubik.transpose(rubik.reshape(k_proj, (batch, seq, num_kv_heads, head_dim)), (0, 2, 1, 3))
+        v = rubik.transpose(rubik.reshape(v_proj, (batch, seq, num_kv_heads, head_dim)), (0, 2, 1, 3))
+
+        # RoPE via DSP with theta=1,000,000
+        q_rot = dsp.execute_rope(q, theta_base=rope_theta, mode="half")
+        k_rot = dsp.execute_rope(k, theta_base=rope_theta, mode="half")
+
+        # GQA KV Repeat: 2 heads -> 12 heads (repeat 6x)
+        k_rep = np.repeat(k_rot, num_q_heads // num_kv_heads, axis=1)
+        v_rep = np.repeat(v, num_q_heads // num_kv_heads, axis=1)
+
+        # Attention Scores & Softmax
+        scale = 1.0 / np.sqrt(head_dim)
+        scores = np.matmul(q_rot, np.transpose(k_rep, (0, 1, 3, 2))) * scale
+        causal_mask = np.triu(np.full((seq, seq), -1e9, dtype=np.float32), k=1)
+        scores_masked = scores + causal_mask
+        probs = dsp.execute_softmax(scores_masked, axis=-1)
+
+        # Context multiply
+        context = np.matmul(probs, v_rep)
+
+        # Rubik Merge Heads
+        context_merged = rubik.flatten(rubik.transpose(context, (0, 2, 1, 3)), start_dim=2, end_dim=3)
+
+        # Output projection via CMAC
+        attn_out = cmac.gemm_1x1(context_merged, wo)
+
+        # Residual connection 1 via SDP
+        h1 = sdp.eltwise_add(x, attn_out)
+
+        # ---------------------------------------------------------------------
+        # 2. SwiGLU MLP Block Execution via Simulator Engines
+        # ---------------------------------------------------------------------
+        # Post-attention RMSNorm via DSP
+        h1_norm = dsp.execute_rms_norm(h1, w_norm2, eps=rms_norm_eps)
+
+        # Gate and Up projections via CMAC
+        gate_proj = cmac.gemm_1x1(h1_norm, w_gate)
+        up_proj = cmac.gemm_1x1(h1_norm, w_up)
+
+        # SiLU activation on Gate via SDP LUT
+        silu_lut = SDPLookupTable.create_silu_lut()
+        gate_act = sdp.interpolate_lut(gate_proj, silu_lut)
+
+        # Elementwise Gate * Up via SDP
+        gated = sdp.eltwise_mul(gate_act, up_proj)
+
+        # Down projection via CMAC
+        down_proj = cmac.gemm_1x1(gated, w_down)
+
+        # Residual connection 2 via SDP
+        out_sim = sdp.eltwise_add(h1, down_proj)
+
+        # ---------------------------------------------------------------------
+        # 3. Golden Reference via PyTorch
+        # ---------------------------------------------------------------------
+        x_pt = torch.from_numpy(x)
+        w_norm1_pt = torch.from_numpy(w_norm1)
+        wq_pt, wk_pt, wv_pt, wo_pt = [torch.from_numpy(w) for w in (wq, wk, wv, wo)]
+        w_norm2_pt = torch.from_numpy(w_norm2)
+        w_gate_pt, w_up_pt, w_down_pt = [torch.from_numpy(w) for w in (w_gate, w_up, w_down)]
+
+        # Attn
+        x_n1_pt = F.rms_norm(x_pt, (dim,), w_norm1_pt, eps=rms_norm_eps)
+        q_pt = F.linear(x_n1_pt, wq_pt).view(batch, seq, num_q_heads, head_dim).transpose(1, 2)
+        k_pt = F.linear(x_n1_pt, wk_pt).view(batch, seq, num_kv_heads, head_dim).transpose(1, 2)
+        v_pt = F.linear(x_n1_pt, wv_pt).view(batch, seq, num_kv_heads, head_dim).transpose(1, 2)
+
+        q_rot_pt = torch.from_numpy(q_rot)
+        k_rot_pt = torch.from_numpy(k_rot)
+        k_rep_pt = k_rot_pt.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+        v_rep_pt = v_pt.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+
+        scores_pt = torch.matmul(q_rot_pt, k_rep_pt.transpose(-1, -2)) * scale
+        scores_pt = scores_pt + torch.from_numpy(causal_mask)
+        probs_pt = F.softmax(scores_pt, dim=-1)
+        ctx_pt = torch.matmul(probs_pt, v_rep_pt).transpose(1, 2).contiguous().view(batch, seq, dim)
+        attn_out_pt = F.linear(ctx_pt, wo_pt)
+        h1_pt = x_pt + attn_out_pt
+
+        # MLP
+        h1_n_pt = F.rms_norm(h1_pt, (dim,), w_norm2_pt, eps=rms_norm_eps)
+        gate_pt = F.linear(h1_n_pt, w_gate_pt)
+        up_pt = F.linear(h1_n_pt, w_up_pt)
+        gated_pt = F.silu(gate_pt) * up_pt
+        down_pt = F.linear(gated_pt, w_down_pt)
+        out_pt = h1_pt + down_pt
+
+        rep = TensorComparator.compare(out_sim, out_pt.numpy(), tolerance=2e-3, cos_threshold=0.9999)
+        assert rep.passed, f"Qwen2.5-Coder block verification failed:\n{rep.summary()}"
+        assert rep.cosine_similarity > 0.99999
