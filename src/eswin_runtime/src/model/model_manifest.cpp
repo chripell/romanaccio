@@ -1,6 +1,7 @@
 #include "model_manifest.hpp"
 #include "simple_json.hpp"
 #include "sha256.hpp"
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -71,6 +72,37 @@ bool ModelManifest::load_from_string(const std::string &json_str, std::string &e
         }
     }
 
+    blocks.clear();
+    if (root.has("blocks") && root["blocks"].is_array()) {
+        // Open package format: explicit per-block die assignment and chain position.
+        int32_t order = 0;
+        for (const auto &item : root["blocks"].as_array()) {
+            if (!item.is_object()) continue;
+            BlockModelEntry b;
+            b.name = item["name"].as_string();
+            if (b.name.empty()) continue;
+            b.die_id = static_cast<uint16_t>(item["die_id"].as_int(0));
+            b.stage = static_cast<int32_t>(item["stage"].as_int(order));
+            blocks.push_back(b);
+            ++order;
+        }
+    } else if (root.has("model_list") && root["model_list"].is_array()) {
+        // Vendor ENNP config.json format: one entry per device holding block_models[].
+        int32_t order = 0;
+        for (const auto &dev : root["model_list"].as_array()) {
+            if (!dev.is_object() || !dev.has("block_models")) continue;
+            const uint16_t die = static_cast<uint16_t>(dev["device_id"].as_int(0));
+            for (const auto &bm : dev["block_models"].as_array()) {
+                BlockModelEntry b;
+                b.name = bm.as_string();
+                if (b.name.empty()) continue;
+                b.die_id = die;
+                b.stage = order++;
+                blocks.push_back(b);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -117,6 +149,16 @@ std::string ModelManifest::to_json_string(int indent) const {
         arr.push_back(item);
     }
     root["files"] = arr;
+
+    JsonValue barr;
+    for (const auto &b : blocks) {
+        JsonValue item;
+        item["name"] = b.name;
+        item["die_id"] = static_cast<int>(b.die_id);
+        item["stage"] = static_cast<int>(b.stage);
+        barr.push_back(item);
+    }
+    root["blocks"] = barr;
 
     return root.dump(indent);
 }
@@ -169,6 +211,20 @@ const ModelFileDesc* ModelManifest::find_file_by_role(const std::string &role) c
         if (f.role == role) return &f;
     }
     return nullptr;
+}
+
+std::vector<BlockModelEntry> ModelManifest::blocks_for_die(uint16_t die_id) const {
+    std::vector<BlockModelEntry> out;
+    for (const auto &b : blocks) {
+        if (b.die_id == die_id) out.push_back(b);
+    }
+    // Declaration order is the fallback for entries that omit an explicit stage, so
+    // the sort must be stable to keep those in file order.
+    std::stable_sort(out.begin(), out.end(),
+                     [](const BlockModelEntry &a, const BlockModelEntry &b) {
+                         return a.stage < b.stage;
+                     });
+    return out;
 }
 
 } // namespace eswin

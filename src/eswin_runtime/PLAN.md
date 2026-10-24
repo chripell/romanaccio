@@ -289,7 +289,13 @@ Development is structured into **11 independently verifiable milestones**:
   - Public C11 API Reference & Python SDK Guide (`docs/C_API_AND_PYTHON_GUIDE.md`).
   - Technical reverse-engineering report updated in `romanaccio/FINDINGS.md` (Section 20).
 
-### Milestone 7: Multi-Layer Block Chaining & Pipeline Engine (Dual-Die Sequential Graphs) [PLANNED]
+### Milestone 7: Multi-Layer Block Chaining & Pipeline Engine (Dual-Die Sequential Graphs) [COMPLETED]
+- **Implementation Status** (2026-10-24):
+  - `src/backend/pipeline_executor.{hpp,cpp}` implemented: per-die ping-pong `Cached` MMZ activation buffers, per-die SMMU prepare, one CPU-mediated handoff per die boundary, per-stage timing (`PipelineStats`).
+  - `ModelManifest` extended with `BlockModelEntry` / `blocks` / `blocks_for_die()`, parsing both the open `"blocks"` spelling and the vendor ENNP `"model_list"`/`"block_models"` spelling (`device_id` → `die_id`).
+  - `tests/test_layer_chaining.cpp` and `docs/MULTI_LAYER_PIPELINE_GUIDE.md` added; wired into `Makefile` (`make test`) and `CMakeLists.txt` (`ctest`).
+  - Verified: host-fallback suite green (2/8/28-stage chains, single- and dual-die, manifest-driven chain, 40-cycle RSS leak check); clean `riscv64-linux-gnu-` cross-compile.
+  - **Outstanding**: the 28-layer board run and the <40 µs/layer handoff target are asserted only when hardware is present, so they still need a `roma` run. Folding the executor into `TransformerSession::step()` is deferred to Milestone 10 — that path interleaves CPU work (RoPE, softmax, KV update) between NPU GEMMs and is currently silicon-validated, so it should not be refactored without board verification.
 - **Motivation & Objectives**:
   - `TransformerSession` in Milestone 5 implemented single-stage dual-die offload (specifically LM-head reduction). Large-scale models like DeepSeek-7B and Qwen2 consist of 28 to 32 sequential transformer layer block models across Die 0 and Die 1 (totaling 56+ hardware models).
   - Implement a zero-copy pipeline execution engine capable of sequentially chaining $N$ layer block models per die, passing activation tensors directly between layer stages without CPU-side round-trips.

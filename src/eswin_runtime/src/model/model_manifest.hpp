@@ -15,6 +15,13 @@ struct ModelFileDesc {
     std::string url;        // Remote download URL (Hugging Face / ModelScope / CDN)
 };
 
+/// One compiled block loadable in a sequential multi-layer chain (Milestone 7).
+struct BlockModelEntry {
+    std::string name;         // .model filename, relative to the package directory
+    uint16_t    die_id = 0;   // Die whose worker executes this block
+    int32_t     stage = -1;   // Position in the chain; -1 keeps declaration order
+};
+
 struct ModelConfig {
     std::string architecture = "transformer";
     uint32_t    vocab_size = 49152;
@@ -46,6 +53,9 @@ public:
     // Helper accessors
     const ModelFileDesc* find_file_by_role(const std::string &role) const;
 
+    /// Block chain entries assigned to one die, ordered by stage (then declaration).
+    std::vector<BlockModelEntry> blocks_for_die(uint16_t die_id) const;
+
     // Properties
     std::string                name;
     std::string                version = "1.0.0";
@@ -53,6 +63,7 @@ public:
     uint16_t                   tensor_parallel = 1; // 1 = Single Die, 2 = Dual Die
     ModelConfig                config;
     std::vector<ModelFileDesc> files;
+    std::vector<BlockModelEntry> blocks;  // Sequential per-die block chain (Milestone 7)
 };
 
 } // namespace eswin
