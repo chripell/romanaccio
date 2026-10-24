@@ -90,7 +90,8 @@ class NVDLAGEMMBuilder:
     def build_from_node(
         node: EIRNode,
         model_name: str = "gemm_model",
-        sram_size: int = 4 * 1024 * 1024
+        sram_size: int = 4 * 1024 * 1024,
+        dynamic_weight: bool = False
     ) -> LoadableModel:
         """Lowers an EIR GEMM or 1x1 CONV node into an executable 3-pass LoadableModel."""
         act_in = node.inputs[0]
@@ -111,7 +112,8 @@ class NVDLAGEMMBuilder:
             act_in_name=act_in.name,
             act_out_name=act_out.name,
             model_name=model_name,
-            sram_size=sram_size
+            sram_size=sram_size,
+            dynamic_weight=dynamic_weight
         )
 
     @staticmethod
@@ -120,9 +122,19 @@ class NVDLAGEMMBuilder:
         act_in_name: str = "input",
         act_out_name: str = "output",
         model_name: str = "gemm_model",
-        sram_size: int = 4 * 1024 * 1024
+        sram_size: int = 4 * 1024 * 1024,
+        dynamic_weight: bool = False
     ) -> LoadableModel:
-        """Constructs an executable 3-pass 1x1 GEMM LoadableModel."""
+        """Constructs an executable 3-pass 1x1 GEMM LoadableModel.
+
+        @param dynamic_weight When True the weight is emitted as a *runtime-bound*
+               (Class B) tensor instead of being baked into blobs: the caller supplies it
+               per submit as input slot 1, so one loadable can serve many different weight
+               sets by varying DevBuf.offset. That is the MoE expert-selection primitive —
+               27 loadables instead of 1716 for DeepSeek-V2-Lite. Verified byte-identical
+               to the baked-in blob on `roma`; see FINDINGS.md §27. The weight array is
+               still used to derive shapes and the packed size, but its bytes are dropped.
+        """
         c_out, c_in = w_arr.shape
         # Expect 3-way split across C_out
         c_out_per_pass = c_out // 3
@@ -149,10 +161,16 @@ class NVDLAGEMMBuilder:
         struct.pack_into("<I", umd_addr0_data, 0, 0x30000)
         struct.pack_into("<8hI", umd_addr0_data, 68, 8, 9, 7, -1, 10, 2, 2, 0, 11)
 
-        blobs = [
+        # Weight bytes live in the loadable unless the caller wants them supplied per
+        # submit. Dropping them is what makes the dynamic-weight loadable ~27x smaller
+        # (1,838,632 -> 68,872 bytes for the 1536x576 reference case).
+        weight_blobs = [] if dynamic_weight else [
             BlobEntry(name="WsplitM_0_0", size=slice_w_size, interface=0, sub_interface=0, version=weight_ver, data=w0_packed),
             BlobEntry(name="WsplitM_1_1", size=slice_w_size, interface=0, sub_interface=0, version=weight_ver, data=w1_packed),
             BlobEntry(name="WsplitM_2_2", size=slice_w_size, interface=0, sub_interface=0, version=weight_ver, data=w2_packed),
+        ]
+
+        blobs = weight_blobs + [
             BlobEntry(name="kmd-task-addr0", size=128, interface=2, sub_interface=1, version=task_ver, data=bytes(kmd_addr0_data)),
             BlobEntry(name="kmd-task-config_list", size=1024, interface=2, sub_interface=6, version=task_ver, data=bytes(1024)),
             BlobEntry(name="kmd-task-dep_graph", size=21760, interface=2, sub_interface=2, version=task_ver, data=bytes(get_linear3p_kmd_dep_template())),
@@ -170,9 +188,27 @@ class NVDLAGEMMBuilder:
         out_size_bytes = c_out * 2
 
         # Memory list
+        #
+        # The weight region is Class A (blob-backed: contents/offsets populated, flags=3)
+        # normally, and Class B (runtime-bound: contents=[], flags=5, bind_id set) when
+        # dynamic_weight is requested. bind_id=1 makes the weight input slot 1, leaving the
+        # activation at slot 0, so the caller submits with inputFdNum=2.
+        #
+        # No relocs are added for a Class B weight. That was tested directly: a variant with
+        # six extra relocs at weight-cube +22/+26 produced byte-identical output to one
+        # without, so the driver resolves the weight through
+        # address_list -> mem_id -> bind_id -> DevBuf and needs no patched IOVA slot.
+        if dynamic_weight:
+            weight_mem = MemoryEntry(id=1, domain=0, flags=5, size=total_w_size,
+                                     contents=[], offsets=[], bind_id=1, tensor_desc_id=2)
+        else:
+            weight_mem = MemoryEntry(id=1, domain=0, flags=3, size=total_w_size,
+                                     contents=["WsplitM_0_0", "WsplitM_1_1", "WsplitM_2_2"],
+                                     offsets=[0, slice_w_size, slice_w_size * 2])
+
         memory_list = [
             MemoryEntry(id=0, domain=0, flags=1, size=4096),
-            MemoryEntry(id=1, domain=0, flags=3, size=total_w_size, contents=["WsplitM_0_0", "WsplitM_1_1", "WsplitM_2_2"], offsets=[0, slice_w_size, slice_w_size * 2]),
+            weight_mem,
             MemoryEntry(id=2, domain=0, flags=1, size=4096, contents=["custom_name_0_cvtPrecisionsplitM_0", "custom_name_0_cvtPrecisionsplitM_1", "custom_name_0_cvtPrecisionsplitM_2"], offsets=[0, 1024, 2048]),
             MemoryEntry(id=3, domain=1, flags=1, size=sram_size, contents=["custom_name_0splitM_0.sram.edma", "custom_name_0splitM_1.sram.edma", "custom_name_0splitM_2.sram.edma", "custom_name_0_cvtPrecisiontiling_M_Concat"], offsets=[0, slice_w_size, slice_w_size * 2, slice_w_size * 3]),
             MemoryEntry(id=4, domain=0, flags=5, size=in_size_bytes, contents=[], offsets=[], tensor_desc_id=0),
@@ -246,6 +282,30 @@ class NVDLAGEMMBuilder:
                 stride_2=2
             ),
         ]
+
+        if dynamic_weight:
+            # Describe the runtime-bound weight so the caller binds a DevBuf for it.
+            # data_category=1 (WEIGHT) distinguishes it from the FEATURE activations;
+            # id=2 and mem_id=1 match the Class B memory entry's tensor_desc_id.
+            tensor_descs.append(TensorDescEntry(
+                name="weight",
+                id=2,
+                mem_id=1,
+                size=total_w_size,
+                offset=0,
+                data_format=1,     # NCHW
+                data_type=2,       # HALF
+                data_category=1,   # WEIGHT
+                pixel_format=36,
+                pixel_mapping=0,
+                n=1,
+                c=c_out,
+                h=1,
+                w=c_in,
+                stride_0=2,
+                stride_1=2,
+                stride_2=2
+            ))
 
         tasks = [
             SubModel(id=0, kmd_id=1, interface=1, address_list=[6, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11]),

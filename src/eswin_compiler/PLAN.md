@@ -284,18 +284,27 @@ Development is broken down into **6 small, independently reviewable and testable
   *faithful* — the earlier "outputs differ" evidence is now upgraded to bit-exact equality,
   and the emitter change is safe to build on. `FINDINGS.md` §27.
 
+  **Emitter implemented (2026-10-24).** `NVDLAGEMMBuilder.build_linear_3pass()` and
+  `build_from_node()` take `dynamic_weight: bool = False`. When set, the three `WsplitM_*`
+  blobs are omitted, the weight memory entry becomes Class B (`contents=[]`, `flags=5`,
+  `bind_id=1`, `tensor_desc_id=2`), and a `data_category=1` WEIGHT `TensorDescEntry` is
+  appended — with **no** relocs, per question 2. The static path is untouched.
+  Verified: emitter output is structurally correct (`flags=5 bind_id=1`, 3 descriptors,
+  11 blobs, 8 relocs vs the static model's `flags=3`, 3 contents, 2 descriptors, 14 blobs),
+  68,872 bytes vs 1,838,520, and **an emitter-produced dynamic model is byte-identical to
+  its emitter-produced static counterpart on `roma`** (mean 31698.7018 both, 3072/3072 bytes).
+  The existing compiler tests still pass (5 ok, 3 skipped for absent test-data fixtures).
+
   Remaining work, in order:
-  1. Add `dynamic_weight` to `NVDLAGEMMBuilder.build_linear_3pass()` / `build_from_node()`:
-     make the weight blobs conditional, switch the memory entry to Class B, allocate
-     `bind_id` (activation 0, weight 1), append the WEIGHT `TensorDescEntry`, and add **no**
-     relocs. Static path must stay bit-reproducible. The patcher
-     (`make_dynamic_weight_model.py`) is a working reference for every field value.
-  2. A `--dynamic-weights` CLI flag and `tests/test_dynamic_weight_binding.py`. The test
-     should assert the emitted structures off-board (Class B entry, `bind_id`, WEIGHT
-     descriptor, no weight blobs, no weight relocs) and re-run the bit-match on `roma`.
-  3. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
+  1. A `--dynamic-weights` CLI flag and `tests/test_dynamic_weight_binding.py` so the
+     structural assertions and the board bit-match are repeatable rather than ad hoc.
+  2. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
      gate/up/down), which is what DeepSeek-V2-Lite actually needs — 2048→1408→2048, three
-     runtime-bound weight tensors per expert rather than one.
+     runtime-bound weight tensors per expert rather than one. That also needs a `bind_id`
+     allocator, since slots 1..3 would all be weights.
+  3. Wire the runtime side: a session path that keeps one expert blob resident per die and
+     submits with `inputFdNum = 1 + n_weight_tensors`, taking each offset from
+     `MoERouter::expert_blob_offset()`.
 
 ---
 
