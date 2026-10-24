@@ -310,16 +310,56 @@ Development is broken down into **6 small, independently reviewable and testable
   address geometry with the weight address still referenced by the task; and the flag appears
   in `--help`. The board bit-match remains `probe_weight_bitmatch.cpp`.
 
+  **SwiGLU expert-FFN generalisation: DONE (2026-10-24), and it corrected an assumption in
+  this plan.** `backend/dynamic_weight_binding.py` converts the weight regions of *any*
+  compiled loadable — vendor or ours — from Class A to Class B, with a `bind_id` allocator,
+  plus `extract_weight_blob()` to rebuild the submit-time buffer for bit-match testing.
+  `tests/test_dynamic_weight_swiglu.py` (14 tests) runs against the real vendor
+  `test_swiglu_mlp_npu_b1.model`.
+
+  **The plan assumed "three runtime-bound weight tensors per expert". That is wrong.**
+  EsAAC packs a whole FFN's gate/up/down into **one** Class A region:
+  `mem_id=1, flags=3, size=5,308,416` = 3 × 1,769,472, holding nine blobs
+  (`w_gatesplitM_0_0..2_2`, `w_upsplitM_0_3..2_5`, `w_downsplitM_0_6,1_7,2_8`). So an expert
+  FFN needs **one** runtime-bound tensor and **one** `bind_id`, not three — which is better
+  for MoE than planned: a single per-die blob can hold every expert's gate/up/down, and
+  selecting an expert is one `DevBuf.offset`. The allocator still handles multiple regions,
+  since nothing guarantees future templates pack the same way.
+
+  Verified on the vendor SwiGLU block: auto-detects exactly one weight region; assigns
+  `bind_id=1` (activation keeps 0); drops 9 weight blobs (20 → 11) while **all 11 KMD/UMD
+  command streams survive**; tensor descriptors become `[WEIGHT, FEATURE, FEATURE]`; no
+  weight relocs added and the activation relocs for address ids 4/5 preserved; weight bytes
+  extractable and each blob present at its declared offset; `ModelWriter` round-trips the
+  empty `contents` and `bind_id`; **5,482,752 → 173,448 bytes (31.6× smaller)**.
+  The blob classifier is tested to reject every task stream and intermediate
+  (`cvtPrecision`, `.sram.edma`, `tiling_`, `Concat`, `mul_`, `biasadd`, `_BIAS`) — dropping
+  a command stream would brick the loadable, so that invariant is asserted explicitly.
+  Also covered: idempotence (a second call is a no-op), explicit `mem_ids` override, and the
+  converter working on our own `gemm_builder` output as well as vendor models.
+  Full compiler suite: 25 tests pass.
+
+  **Not yet done for this archetype: the board bit-match.** The single-weight GEMM case is
+  proven byte-identical on `roma` (§27), but the SwiGLU conversion has only been verified
+  structurally. `probe_weight_bitmatch.cpp` is hardcoded for one weight input at 1536×576;
+  validating the FFN needs `inputFdNum=2` with a 5,308,416-byte weight buffer and the
+  SwiGLU model's own activation geometry (1152 B in / 1152 B out). Until that passes, treat
+  multi-blob-region conversion as structurally sound but numerically unconfirmed.
+
   Remaining work, in order:
-  1. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
-     gate/up/down), which is what DeepSeek-V2-Lite actually needs — 2048→1408→2048, three
-     runtime-bound weight tensors per expert rather than one. That also needs a `bind_id`
-     allocator, since slots 1..3 would all be weights.
-  2. Extend `--dynamic-weights` to the 2D conv emitter, or lower spatial convs through the
+  1. Board bit-match for the SwiGLU conversion (generalise `probe_weight_bitmatch.cpp`).
+  2. Expose the converter through the CLI for pre-compiled loadables (`--convert-weights`),
+     since it operates on vendor `.model` files that never pass through our emitter.
+  3. Extend `--dynamic-weights` to the 2D conv emitter, or lower spatial convs through the
      GEMM path, so the flag is not 1×1-only.
-  3. Wire the runtime side: a session path that keeps one expert blob resident per die and
-     submits with `inputFdNum = 1 + n_weight_tensors`, taking each offset from
+  4. Wire the runtime side: a session path that keeps one expert blob resident per die and
+     submits with `inputFdNum = 1 + n_weight_regions`, taking each offset from
      `MoERouter::expert_blob_offset()`.
+  5. A native SwiGLU emitter remains unbuilt: `hw_templates.py` has only `kmd_*`/`umd_*` and
+     `linear3p_*` command-stream templates, so emitting an FFN from scratch needs new
+     `dep_graph`/`op_list`/`surf_list` templates. Note this means FINDINGS §15's "complete
+     SwiGLU MLP compilation capability" describes the *passes* (SDP fusion, LUT generation,
+     SPRAM tiling), not a from-scratch emitter — worth correcting there.
 
 ---
 
