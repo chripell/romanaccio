@@ -611,4 +611,102 @@ machine-readable `PERF`/`PPL` lines for exactly this. **Blocked at the time of w
 SSH to `roma` began failing with `Permission denied (publickey,password)` on 2026-10-24
 after working earlier the same day, so no new on-board numbers were collected for this
 section — every figure above is either previously measured or derived from measurements.
+(SSH was restored later the same day; §25's results are from after that.)
+
+---
+
+## 25. How a Loadable Binds Runtime-Supplied Tensors (`bind_id`, empty `contents`, relocs)
+
+Dissected a real vendor loadable — `Qwen2-0.5B_ENNP/qwen2_0_5b_int8/modified_block_0_npu_b1.model`
+(35,534,936 bytes) — through the open compiler's `ModelReader`. This answers the question
+left open by §24-era MoE planning: **whether the `.model` format can express a tensor whose
+address is supplied at submit time rather than baked into the file.** It can, and the
+mechanism is fully visible.
+
+Counts: `tasks=2 memory=23 address=23 events=0 blobs=61 tensor_descs=7 relocs=42 submits=2`.
+
+### 25.1 Two disjoint classes of memory entry
+
+Every `memory_list` entry falls into exactly one of two classes, distinguishable by whether
+`contents` is populated:
+
+**Class A — static, blob-backed (weights and command packets).** `contents` lists blob names
+and `offsets` gives each blob's byte offset inside the region. Example, `mem_id=1`:
+`flags=3`, `size=30,429,184`, `contents` = 50 entries covering every projection in the block
+(`_block_self_attn_q_proj_MatMul_transpose_weightsplitM_0_0`, `..._biasaddsplitM_0_BIAS`,
+`k_proj`, `v_proj`, `o_proj`, `mlp_gate_proj`, `mlp_up_proj`, `mlp_down_proj` …) with matching
+`offsets`. A separate `domain=1` (SPRAM) region holds intermediates and `.sram.edma` staging.
+**These regions are never relocation targets.**
+
+**Class B — runtime-bound (the network I/O).** `contents: []` and `offsets: []`, i.e. the file
+carries *no data* for them, only a size and an alignment. All seven tensor descriptors are
+this class:
+
+| tensor_desc | mem_id | size | dtype | dims | flags | **bind_id** |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| input (hidden) | 4 | 1,792 | HALF | [1,896,1,1] | 5 | **0** |
+| input (token step) | 5 | 2 | INT16 | [1,1,1,1] | 5 | **1** |
+| input (V cache) | 6 | 262,144 | HALF | [2,1024,1,64] | 5 | **2** |
+| input (K cache) | 7 | 262,144 | HALF | [2,64,1,1024] | 5 | **3** |
+| output (hidden) | 8 | 1,792 | HALF | [1,896,1,1] | 9 | **0** |
+| output (V update) | 9 | 262,144 | HALF | [1,2048,64,1] | 9 | **1** |
+| output (K update) | 10 | 262,144 | HALF | [1,128,1024,1] | 9 | **2** |
+
+**`bind_id` is the index into the task's `DevBuf` array.** Inputs number 0–3 and outputs
+0–2 independently, which matches `NPU_TASK_S`'s separate `inputFd[10]` / `outputFd[10]`
+(§19, 744 bytes, `inputFd` at offset 16). `flags` is 5 for inputs and 9 for outputs —
+consistent with an input/output direction bit plus a shared "externally supplied" flag; the
+bit layout is not yet decoded.
+
+### 25.2 The binding chain
+
+```
+tensor_desc.mem_id ──> memory_list[mem_id]   (contents empty, size + bind_id)
+                            │
+                            v
+                       address_list[id]       (mem_id, offset=0, size)   1:1 for ids 4..10
+                            │
+                            v
+                       reloc_list[]           (address_id, write_id, offset, reloc_type)
+                            │
+                            v
+                    IOVA patched into the command packet at submit
+```
+
+`address_list` entries 4–10 map 1:1 onto `mem_id` 4–10 with `offset=0` and the tensor's
+size. `relocs` target **exactly** `{4,5,6,7,8,9,10}` and nothing else — every relocation in
+the file belongs to a runtime-bound tensor. Each address is patched twice, as a
+`reloc_type=1` / `reloc_type=2` pair at adjacent offsets (e.g. address_id 4 → packet offsets
+6166 and 6170), i.e. the **low and high 32-bit halves of a 64-bit IOVA**, exactly as §14
+described for `src_data`/`dst_data` in `kmd-task-surf_list`. `write_id=20` identifies the
+command blob being patched; `interface`/`sub_interface` (1 or 2, and 4) select the surface.
+
+### 25.3 Consequences
+
+1. **All 7 tensor descriptors are `data_category = FEATURE` (2). There is not a single
+   `WEIGHT` (1) category descriptor**, and no weight is a relocation target. Weights are
+   100% blob-backed static data — 61 blobs totalling 35,513,648 bytes, essentially the whole
+   file. So the *vendor* toolchain always bakes weights in.
+2. **But nothing in the format requires that.** A weight is just a CDMA read from a memory
+   surface. Class B proves the format can describe a large (256 KiB) externally-supplied
+   buffer, give it a `bind_id`, and have its IOVA patched at submit. Emitting an expert
+   weight as a Class B entry with its own `bind_id` is therefore expressible.
+3. **This is what makes `eswin_compiler` the route for MoE approach (b)** — one loadable per
+   layer whose weight tensor is runtime-bound, with expert selection done by pointing
+   `DevBuf.offset` at the chosen expert inside one resident blob (§6.4 of
+   `src/DeepSeek-V2-Lite/PLAN.md`). `MoERouter::expert_blob_offset()` already computes
+   exactly that offset. EsAAC cannot produce it: its frontend SIGSEGVs on any second dynamic
+   graph input.
+4. **Still unverified, and the next experiment:** that the KMD command stream treats a
+   runtime-bound weight surface identically to a blob-backed one. The reloc offsets are
+   baked into the command packet at compile time, so a compiler emitting this must place the
+   weight surface descriptor where it also emits the matching reloc pair. Proposed test:
+   emit a minimal 1×1 Conv whose weight is Class B with `bind_id=1`, run it on `roma` twice
+   with different weight buffers, and confirm the outputs differ accordingly. `ModelWriter`
+   round-trips vendor models, so the emitter side is available.
+5. `memory_list` also reveals the vendor's own tiling: `weightsplitM_0..13` on `q_proj` and
+   `down_proj`, `splitM_0..9` on `gate_proj`/`up_proj`, plus `biasaddsplitM_*_BIAS` pairs and
+   `tiling_M_Concat` regions — i.e. large GEMMs are split along M into 10–14 chunks with
+   per-chunk SPRAM `.sram.edma` staging. That is the pattern `passes/sram_tiler.py` needs to
+   reproduce for expert FFNs.
 

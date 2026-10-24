@@ -520,12 +520,39 @@ LLM KV-cache path, not that the loadable format cannot express a runtime-bound w
    cannot bind a weight at submit time, we are back to 1716 per-expert loadables, which
    makes the §6.4 load-time and concurrent-`modelId` measurements mandatory rather than
    optional. Those are still unrun.
-3. **Verify before building on this.** The probe used a bare `MatMul`. Before concluding
-   anything about the *runtime* (as opposed to the compiler frontend), inspect a
-   vendor-compiled multi-input loadable and confirm whether its non-activation inputs are
-   `tensor_desc_list` entries with relocations or blobs. An attempt to retrieve the
-   compiled static probe failed (0-byte transfer — the output path was wrong, EsAAC's
-   naming was not confirmed), so **this inspection is outstanding**.
+3. **RESOLVED — the inspection in item 3 was completed.** Dissecting the real vendor
+   `modified_block_0_npu_b1.model` with the open compiler's `ModelReader` shows exactly how
+   runtime-supplied tensors are bound, and it is good news for approach (b). Full detail in
+   **`FINDINGS.md` §25**; summary:
+   - `memory_list` entries split into two classes. **Class A** has populated `contents` +
+     `offsets` (blob-backed static data — all 61 blobs, 35,513,648 bytes, i.e. every weight).
+     **Class B** has `contents: []` and carries only a size plus a **`bind_id`**.
+   - All 7 tensor descriptors are Class B, including the two **256 KiB** KV caches.
+     `bind_id` numbers inputs 0–3 and outputs 0–2 independently — matching `NPU_TASK_S`'s
+     separate `inputFd[10]`/`outputFd[10]`.
+   - `relocs` target **exactly** the Class B address ids and nothing else, each patched as a
+     `reloc_type` 1/2 pair at adjacent packet offsets = the low and high halves of a 64-bit
+     IOVA. So the chain is `tensor_desc.mem_id → memory_list → address_list → reloc_list →
+     IOVA patched at submit`.
+   - All descriptors are `data_category = FEATURE`; there is **no** `WEIGHT`-category
+     descriptor and no weight is a relocation target. The vendor toolchain always bakes
+     weights in — **but nothing in the format requires it.** A weight is just a CDMA read
+     from a memory surface, and Class B proves the format can describe a large
+     externally-supplied buffer with a `bind_id` and a submit-time IOVA patch.
+
+   So approach (b) is **expressible in the format** and `eswin_compiler` is the route.
+   What remains unverified is narrower and testable: that the KMD command stream treats a
+   runtime-bound *weight* surface identically to a blob-backed one. Reloc offsets are baked
+   into the command packet at compile time, so the emitter must place the weight surface
+   descriptor where it also emits the matching reloc pair. **Next experiment:** emit a
+   minimal 1×1 Conv whose weight is Class B with `bind_id=1`, run it on `roma` twice with
+   different weight buffers, and confirm the outputs differ accordingly.
+
+**Bonus finding for the compiler plan:** the same dump reveals the vendor's GEMM tiling —
+`weightsplitM_0..13` on `q_proj`/`down_proj`, `splitM_0..9` on `gate_proj`/`up_proj`, paired
+`biasaddsplitM_*_BIAS`, and `tiling_M_Concat` regions, with per-chunk `.sram.edma` staging in
+a `domain=1` (SPRAM) memory entry. Large GEMMs are split along M into 10–14 chunks. That is
+the pattern `passes/sram_tiler.py` must reproduce for expert FFNs.
 
 **Not run:** the load-time / concurrent-`modelId` / per-submit-overhead measurements
 (§6.4 items 2 and 3). Per-submit overhead remains the other open risk: ~318 submits per
