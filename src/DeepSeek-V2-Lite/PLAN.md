@@ -416,3 +416,60 @@ matches the published 15.71 B. The arithmetic is now closed.
 host `hf` CLI is **not logged in** — this is an auth problem, not evidence the repos are
 missing. They need `hf auth login` with a token that has accepted each model's licence
 (gemma repos are licence-gated even for valid tokens).
+
+---
+
+## 6.10 Phase 2 COMPLETE: MoE router implemented and measured on silicon (2026-10-24)
+
+`src/eswin_runtime/src/llm/moe_router.{hpp,cpp}` + `tests/test_moe_router.cpp`, wired into
+both build systems. All of §5 Phase 2's items are done except the RVV-specific kernel.
+
+**Measured on `roma` (RISC-V, 1.4 GHz), 64×2048 gate, top-6: 53.4 µs average per layer**
+— inside the <60 µs target. Over 26 MoE layers that is 1.39 ms/token, **0.87% of a
+6.25 tok/s budget**, so routing is confirmed *not* to be the bottleneck, as §6.6 predicted.
+For comparison the x86 host measures 47.5 µs, i.e. the board is within ~12% of host speed
+for this kernel; both runs show a multi-ms worst-case outlier (3.4 ms board / 10.6 ms host)
+from scheduler preemption, which matters for a latency-sensitive decode loop and is the
+argument for pinning the routing thread to a specific core.
+
+What it implements, driven by the verified config rather than assumption:
+
+- Gate GEMM `[64][2048]` with OpenMP over experts; all scratch pre-sized in `init()` so
+  `route()` performs **no allocation** (it runs 26× per token).
+- `Softmax` (V2-Lite's `scoring_func`) and `Sigmoid` (V3-family), numerically stable.
+- `norm_topk_prob=false` honoured: the top-6 weights stay as raw softmax probabilities and
+  sum to **less than 1** (measured 0.144 on a random gate). Renormalising them would
+  silently rescale every expert contribution — the test asserts both modes and that they
+  select the same experts and differ only by a uniform rescale.
+- `Greedy` top-k and `GroupLimitedGreedy` (degenerate at `n_group=1` for V2-Lite, but
+  implemented and tested for the V3 family). `init()` rejects a `topk_group × group_size`
+  that cannot supply `top_k`, which would otherwise select `-inf`-scored experts.
+- Deterministic tie-breaking toward the lower expert index — `std::sort` is not stable, so
+  the index is part of the comparator rather than left to the sort.
+- Expert-parallel dispatch grouping (`die_experts[2]`) and the addressing helpers that make
+  the §6.4(b) execution model possible: `expert_blob_offset(layer, expert, bytes)` returns
+  the `DevBuf.offset` for one expert inside **its own die's** blob, so a single per-layer
+  loadable can run any of the 64 experts by changing an offset instead of a model. Offsets
+  are per-die-relative by design (die 0 and die 1 both start at 0) since each die has a
+  separate `DmaBuffer`/`mem_fd`.
+
+Verification: 200 random tokens differentially matched against an **independent
+double-precision reference** written inline in the test (sharing no code with the router) on
+expert set, ordering, weights and argmax; plus sigmoid/scaling, gate bias, group masking,
+per-die offset density and collisions, determinism across repeat calls, and 11 rejected
+invalid configurations. Clean `riscv64-linux-gnu-` cross-compile.
+
+Not done: an RVV-vectorised gate kernel (the scalar+OpenMP version already meets target, so
+this is optimisation, not a gap), and the `PyTorch` golden comparison §6.6 asked for — the
+inline double-precision reference covers selection semantics but not HF's exact
+`DeepseekV2MoE` gating code path, which is worth adding once the weights finish downloading.
+
+**Correction to §6.9's download note:** the host `hf` CLI *is* now authenticated
+(`chripell`), and the five other repos still fail — for two different reasons.
+`google/gemma-3-12b-it` and `litert-community/TranslateGemma-4B-IT` return
+**"Access denied … requires approval"** (licence-gated; accept the licence on the HF site).
+`Sao10K/L3.1-8B-Stheno-v3.3`, `Rin247/gemma-4-12B-it-Uncensored-Aquarion-INT8` and
+`huihui-ai/Qwen2.5-7B-Instruct-abliterated` return **404/not found**, so those repo IDs in
+the `rpg_uncensored` and `gemma-4-12B` plans need to be re-checked — note `gemma-4` is not a
+model family that exists, and the plan's own parameter table matches Gemma **3**.
+`deepseek-ai/DeepSeek-V2-Lite` is ungated and downloading normally.
