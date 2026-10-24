@@ -557,3 +557,28 @@ the pattern `passes/sram_tiler.py` must reproduce for expert FFNs.
 **Not run:** the load-time / concurrent-`modelId` / per-submit-overhead measurements
 (§6.4 items 2 and 3). Per-submit overhead remains the other open risk: ~318 submits per
 token means anything above ~0.3 ms caps throughput below 10 tok/s regardless of bandwidth.
+
+---
+
+## 6.12 §6.4's gating question is answered: approach (b) is viable (2026-10-24)
+
+§6.4 left approach (b) — one loadable per layer, weights bound at submit time — conditional
+on the driver honouring `DevBuf.offset`. **It does.** Measured on `roma` with
+`src/eswin_runtime/tools/probe_devbuf_offset.cpp`: three submits of the same loadable, with
+pattern P1 at offset 4096 of a shared buffer (run B) producing output **byte-identical** to
+a separate buffer holding P1 at offset 0 (control C), and different from P0 at offset 0
+(run A). Full write-up in `FINDINGS.md` §26.
+
+Consequences for this plan:
+
+- **27 loadables, not 1716.** The 1664 routed + 52 shared per-expert loadables — with their
+  unknown concurrent-`modelId` limit and possibly minutes of startup — are avoided. Expert
+  selection becomes `DevBuf.offset` into one resident per-die blob, which is precisely what
+  `MoERouter::expert_blob_offset()` (runtime Milestone 12) already computes.
+- The load-time and `modelId`-limit measurements drop from **blocking** to merely
+  interesting. Per-submit overhead stays a live risk and is still unmeasured.
+- The remaining work is in `eswin_compiler` Milestone 7 (runtime-bound weight surfaces):
+  emit the weight as a Class B memory entry with a `bind_id`, and settle whether it also
+  needs a `reloc` pair and whether the SPRAM `.sram.edma` staging path resolves a
+  runtime-bound weight source. EsAAC cannot do this — it segfaults on a second dynamic
+  input (§6.11).

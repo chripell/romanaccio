@@ -229,11 +229,14 @@ Development is broken down into **6 small, independently reviewable and testable
   submit and expert selection becomes `DevBuf.offset`. `MoERouter::expert_blob_offset()`
   (Milestone 12 of `eswin_runtime`) already computes exactly that offset, per die.
 - **Open questions, ordered by cost to answer**:
-  1. **Does the driver honour a non-zero `DevBuf.offset` when resolving a Class B bind?**
-     Cheapest possible test and needs **no compiler change**: take an existing vendor or
-     `gemm_builder` loadable, bind its *input* tensor from one `mem_fd` at two different
-     offsets, and check the outputs differ. If offset is ignored, the whole design changes
-     (one buffer per expert instead of one blob), so answer this first.
+  1. **RESOLVED (2026-10-24, on `roma`): the driver *does* honour a non-zero
+     `DevBuf.offset`.** `tools/probe_devbuf_offset.cpp` (in `eswin_runtime`) submitted the
+     same `test_linear_1x1conv_npu_b1.model` three times: pattern P0 at offset 0 of a shared
+     buffer (A), pattern P1 at offset 4096 of **that same buffer** (B), and P1 at offset 0 of
+     a separate buffer as the control (C). Result: `A != B`, **`B == C` byte-for-byte**. So B
+     genuinely read from offset 4096 — offset is applied to the resolved IOVA, not ignored.
+     **Approach (b) is viable**; full write-up in `FINDINGS.md` §26. This also demotes the
+     load-time / concurrent-`modelId` measurements from blocking to merely interesting.
   2. **Where is the weight's 64-bit IOVA slot in the packet, and does it need a reloc pair?**
      The cube's `address` field is an `address_list` *index* (int16), not an IOVA, while the
      input/output relocs patch 64-bit values elsewhere (+1238 / +2326 within 2048-byte
@@ -262,7 +265,10 @@ Development is broken down into **6 small, independently reviewable and testable
   - Verify `eswin-sim` executes the Class B weight path, so this stays testable off-board.
 - **Documentation**: weight-binding specification (Class A vs Class B, `bind_id` numbering,
   cube/reloc offsets) appended to `findings/MODEL_FORMAT.md`.
-- **Status**: not started. Blocked on open question 1, which is a runtime-only experiment.
+- **Status**: not started, but **no longer blocked**. Open question 1 — the one that could
+  have invalidated the whole design — is resolved in favour of approach (b) (see above and
+  `FINDINGS.md` §26). Questions 2 and 3 are implementation details discoverable while
+  building the emitter, not go/no-go gates.
 
 ---
 

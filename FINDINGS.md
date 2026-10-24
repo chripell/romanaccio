@@ -710,3 +710,70 @@ command blob being patched; `interface`/`sub_interface` (1 or 2, and 4) select t
    per-chunk SPRAM `.sram.edma` staging. That is the pattern `passes/sram_tiler.py` needs to
    reproduce for expert FFNs.
 
+---
+
+## 26. The Driver Honours `DevBuf.offset` — MoE via One Resident Blob Is Viable
+
+**Verified on `roma`, 2026-10-24.** This was the cheapest gating question for the
+DeepSeek-V2-Lite expert-parallel design (`src/eswin_compiler/PLAN.md` Milestone 7, open
+question 1) and the answer is **yes**.
+
+### Why it matters
+
+MoE selects 6 of 64 experts per layer *at run time*, but a compiled `.model` bakes its
+weights into blobs. Two ways out:
+
+- **(a)** one loadable per (layer, expert) = **1716 files**, 1716 `ES_NPU_LoadModelFromFile`
+  calls, unknown concurrent-`modelId` limit, possibly minutes of startup.
+- **(b)** one loadable per layer whose weight is a **Class B** (runtime-bound) tensor, with
+  expert selection done by pointing `DevBuf.offset` at the chosen expert inside one resident
+  per-die blob = **27 files**.
+
+(b) is only possible if the driver actually adds `DevBuf.offset` to the resolved IOVA rather
+than ignoring it. `DevBuf` is `{mem_fd, offset, size, reserved}`, so the field exists — but
+existence is not honouring.
+
+### The experiment
+
+`src/eswin_runtime/tools/probe_devbuf_offset.cpp`, driving `EswinDriver` directly so
+`DevBuf.offset` is set explicitly. Model: our own `test_linear_1x1conv_npu_b1.model`
+(input 1152 B = 576×fp16, output 3072 B = 1536×fp16). Three submits:
+
+| Run | Buffer | Input pattern | `DevBuf.offset` |
+| :-- | :-- | :-- | :-- |
+| A | shared | `P0 = 0x3800` (+0.5) at offset 0 | 0 |
+| B | **same shared buffer** | `P1 = 0xBE00` (−0.5) at offset 4096 | **4096** |
+| C | separate buffer | `P1` at offset 0 | 0 |
+
+C is the control: it establishes what the output *should* be when the NPU genuinely reads
+`P1`. Comparing B against both A and C separates "read the right data" from "read something".
+
+### Result
+
+```
+mean|A| = 34437.201    mean|B| = 36017.814    mean|C| = 36017.814
+A == B : no        B == C : yes        A == C : no
+```
+
+**B matches C byte-for-byte and differs from A.** So run B really did read `P1` from offset
+4096 of the shared buffer — the offset was applied, not ignored. (The mean direction is
+consistent too: `0xBE00` has the sign bit set, so its raw uint16 average is higher than
+`0x3800`'s.) All three submits returned success and the loadable executed on the NPU with
+`model_id=0`, `devices=2`.
+
+### Consequences
+
+1. **MoE approach (b) is viable.** One resident expert blob per die plus a per-submit
+   `DevBuf.offset` selects the expert. `MoERouter::expert_blob_offset()` (runtime Milestone
+   12) already computes exactly that offset, per die and per layer.
+2. This removes the 1716-loadable problem, so the still-unmeasured load-time and
+   concurrent-`modelId` limits drop from blocking to merely interesting.
+3. **Still required before it works end to end** (`eswin_compiler` Milestone 7, questions 2
+   and 3): the compiler must emit the weight as a Class B memory entry with a `bind_id`, and
+   we must determine whether that also needs a `reloc` pair like the activation I/O does, and
+   whether the SPRAM `.sram.edma` staging path resolves a runtime-bound weight source or
+   whether MoE weights must stay in DRAM (`domain=0`).
+4. **Method note:** the probe initially reported "no NPU hardware" *on the board* because
+   `EswinDriver::instance()` alone does not detect anything — `initialize()` is what dlopens
+   the vendor libraries and calls `ES_NPU_GetNumDevices()`. Any standalone tool must call it.
+
