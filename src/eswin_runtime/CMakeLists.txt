@@ -28,6 +28,7 @@ set(RUNTIME_SOURCES
     src/nlp/sampler.cpp
     src/nlp/tokenizer.cpp
     src/llm/kv_cache.cpp
+    src/llm/hardware_kv_cache.cpp
     src/llm/transformer_session.cpp
     src/api/es_runtime.cpp
 )
@@ -79,6 +80,10 @@ target_link_libraries(test_layer_chaining PRIVATE es_runtime ${CMAKE_DL_LIBS} pt
 add_executable(test_embedding_loader tests/test_embedding_loader.cpp)
 target_link_libraries(test_embedding_loader PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 9 Hardware MMZ KV-Cache Test Executable
+add_executable(test_hardware_kv_cache tests/test_hardware_kv_cache.cpp)
+target_link_libraries(test_hardware_kv_cache PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -97,4 +102,5 @@ add_test(NAME test_transformer_session COMMAND test_transformer_session)
 add_test(NAME test_runtime_e2e COMMAND test_runtime_e2e)
 add_test(NAME test_layer_chaining COMMAND test_layer_chaining)
 add_test(NAME test_embedding_loader COMMAND test_embedding_loader)
+add_test(NAME test_hardware_kv_cache COMMAND test_hardware_kv_cache)
 

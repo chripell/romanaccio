@@ -71,6 +71,42 @@ float es_f16_to_f32(uint16_t h) {
     return out;
 }
 
+uint16_t es_f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const uint32_t exp32 = (x >> 23) & 0xFFu;
+    uint32_t mant = x & 0x7FFFFFu;
+
+    if (exp32 == 0xFFu) {
+        // inf, or NaN (keep it a NaN by forcing a non-zero mantissa).
+        return static_cast<uint16_t>(sign | 0x7C00u | (mant ? 0x200u : 0u));
+    }
+
+    int32_t exp = static_cast<int32_t>(exp32) - 127 + 15;
+    if (exp >= 0x1F) {
+        return static_cast<uint16_t>(sign | 0x7C00u);   // overflow to infinity
+    }
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);  // flush to signed zero
+        // Subnormal fp16: shift the implicit leading 1 into the mantissa.
+        mant |= 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - exp);
+        const uint32_t half = 1u << (shift - 1);
+        const uint32_t odd = (mant >> shift) & 1u;             // round-half-to-even
+        return static_cast<uint16_t>(sign | ((mant + half + odd - 1u) >> shift));
+    }
+
+    // Normal: 23 mantissa bits down to 10, round-half-to-even.
+    uint32_t m10 = (mant + 0x0FFFu + ((mant >> 13) & 1u)) >> 13;
+    if (m10 & 0x400u) {                                        // mantissa carry
+        m10 = 0;
+        if (++exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (m10 & 0x3FFu));
+}
+
 float es_bf16_to_f32(uint16_t b) {
     const uint32_t bits = static_cast<uint32_t>(b) << 16;
     float out;

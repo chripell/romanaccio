@@ -110,6 +110,9 @@ private:
 /// Portable IEEE-754 half to float. Matches the RISC-V _Float16 path bit-for-bit for
 /// finite values; kept here so model/ does not depend on llm/.
 float es_f16_to_f32(uint16_t h);
+/// Float to IEEE-754 half, round-to-nearest-even, with overflow to infinity and
+/// subnormal support. Canonical encoder for the runtime's fp16 DMA contracts.
+uint16_t es_f32_to_f16(float f);
 /// bfloat16 is the truncated top half of an fp32, so conversion is a shift.
 float es_bf16_to_f32(uint16_t b);
 

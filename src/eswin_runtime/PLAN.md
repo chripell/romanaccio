@@ -350,7 +350,16 @@ Development is structured into **11 independently verifiable milestones**:
 - **Documentation**:
   - Weights format and memory mapping specification (`docs/WEIGHTS_AND_EMBEDDING_SPEC.md`).
 
-### Milestone 9: Hardware Contiguous MMZ Dynamic KV-Cache with Circular Address Offsetting [PLANNED]
+### Milestone 9: Hardware Contiguous MMZ Dynamic KV-Cache with Circular Address Offsetting [COMPLETED]
+- **Implementation Status** (2026-10-24):
+  - `src/llm/hardware_kv_cache.{hpp,cpp}`: per-layer K and V `DmaBuffer`s in the owning die's MMZ zone, SMMU-prepared **through that die's worker** (preparing from the master fails `0xA00F604A`), `Cached` mode because the CPU reads them back (NoCache MMZ reads are 10–60 MB/s), with `flush_cache()` after every CPU write.
+  - Both KV layouts are implemented and selected explicitly, because they are **not interchangeable and a wrong choice fails silently** as Issue #47-style gibberish:
+    - `HeadMajor` — K `[head][dim][token]`, V `[head][token][dim]`. Verified against a real loadable: `eswin-sim --info -v` on Qwen2-0.5B 1k INT8 `modified_block_0_npu_b1.model` reports K `(2, 64, 1, 1024)` and V `(2, 1024, 1, 64)`, both 256.00 KiB, with `kv_len == token_num == 1024`. This is the default.
+    - `TokenMajorTiled` — the FINDINGS §5 vendor formulas verbatim (`K: elem * kv_dim * token`, `V: elem * (token_n2 * head_dim * (t / token_n2) + (t % token_n2))`), exposed as `k_token_offset()` / `v_token_offset()` for task descriptors.
+  - Circular addressing via `slot_for()`, `advance()` saturating at capacity in wrap mode and **refusing** past the window in strict mode, and `reset()` that rewinds without reallocating or re-preparing (multi-turn reuse).
+  - `tests/test_hardware_kv_cache.cpp` and `docs/HARDWARE_KV_CACHE_GUIDE.md` added; wired into `Makefile` and `CMakeLists.txt`.
+  - Verified: suite green on host, including `bytes_per_layer() == 262144` for the real Qwen2-0.5B geometry (24 layers × 2 × 256 KiB = 12 MiB), round-trips in **both** layouts over tokens {0,1,7,63,1023}, highest-element offsets in bounds, vendor formula agreement at tile boundaries, wrap/saturation/strict refusal, dual-die placement, 6 invalid configs, and 200 reset cycles reusing one allocation. Clean `riscv64-linux-gnu-` cross-compile.
+  - **Outstanding**: layout cannot yet be derived automatically — `ModelInfo` crossing the worker IPC carries only counts and buffer *sizes*, not `NPU_DIMS4_S` dims/strides, so the caller must declare `KvLayout`. Extending `IpcResponse`/`ModelInfo` to carry tensor dims is the right fix. Board allocation of real MMZ and the `TransformerSession` switch-over are Milestone 10 work.
 - **Motivation & Objectives**:
   - In `TransformerSession`, KV caching is currently implemented as a host software buffer. The hardware NPU block models expect K and V caches directly mapped to contiguous physical DMA memory (`IN_K_CACHE_IDX`, `IN_V_CACHE_IDX`) with circular address offsets computed per sequence step.
 - **Scope**:

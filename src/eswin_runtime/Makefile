@@ -24,6 +24,7 @@ SRCS           = $(SRC_DIR)/backend/driver_wrapper.cpp \
                  $(SRC_DIR)/nlp/sampler.cpp \
                  $(SRC_DIR)/nlp/tokenizer.cpp \
                  $(SRC_DIR)/llm/kv_cache.cpp \
+                 $(SRC_DIR)/llm/hardware_kv_cache.cpp \
                  $(SRC_DIR)/llm/transformer_session.cpp \
                  $(SRC_DIR)/api/es_runtime.cpp
 
@@ -37,12 +38,13 @@ TEST_SESSION   = $(BUILD_DIR)/test_transformer_session
 TEST_E2E       = $(BUILD_DIR)/test_runtime_e2e
 TEST_CHAIN     = $(BUILD_DIR)/test_layer_chaining
 TEST_EMBED     = $(BUILD_DIR)/test_embedding_loader
+TEST_KVHW      = $(BUILD_DIR)/test_hardware_kv_cache
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
 TOOL_CHAT      = $(BUILD_DIR)/eswin-chat
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TOOL_FETCH) $(TOOL_CHAT)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TOOL_FETCH) $(TOOL_CHAT)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -103,7 +105,12 @@ $(TEST_EMBED): $(TEST_DIR)/test_embedding_loader.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED)
+$(TEST_KVHW): $(TEST_DIR)/test_hardware_kv_cache.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
@@ -120,6 +127,8 @@ test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_CHAIN)
 	@echo "\nRunning Milestone 8 Embedding & Weights Loader test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_EMBED)
+	@echo "\nRunning Milestone 9 Hardware MMZ KV-Cache test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_KVHW)
 
 clean:
 	rm -rf $(BUILD_DIR)
