@@ -47,6 +47,8 @@ HardwareKvConfig qwen2_05b_config(KvLayout layout) {
     c.max_seq_len = 1024;
     c.elem_bytes = 2;
     c.layout = layout;
+    // The real package value (config.json token_n2), not a divisor guess.
+    c.token_n2 = 16;
     return c;
 }
 
@@ -147,9 +149,27 @@ void test_vendor_offset_formulas() {
                     "vendor K offset formula mismatch at token " + std::to_string(t));
     }
 
+    // The tiled layout must refuse to guess its tile height. The real Qwen2-0.5B 1k
+    // package declares token_n2 = 16, while the divisor heuristic would pick 256 - a
+    // silent V-cache mis-addressing, so guessing is rejected rather than defaulted.
+    {
+        HardwareKvCache guess;
+        auto no_n2 = cfg;
+        no_n2.token_n2 = 0;
+        std::string guess_err;
+        TEST_ASSERT(!guess.allocate(no_n2, nullptr, guess_err),
+                    "tiled layout must refuse a missing token_n2");
+        TEST_ASSERT(guess_err.find("refusing to guess") != std::string::npos,
+                    "unhelpful error for a missing token_n2: " + guess_err);
+        TEST_ASSERT(HardwareKvCache::default_token_n2(cfg.max_seq_len) == 256,
+                    "divisor heuristic changed (it must never be used for tiled layouts)");
+    }
+
     // V: precision * (tokenN2 * embeddingDim * (token_idx / tokenN2) + (token_idx % tokenN2))
-    const uint32_t n2 = HardwareKvCache::default_token_n2(cfg.max_seq_len);
-    TEST_ASSERT(n2 > 0 && cfg.max_seq_len % n2 == 0, "token_n2 must divide max_seq_len");
+    // n2 is the package value (16), not the heuristic.
+    const uint32_t n2 = cfg.token_n2;
+    TEST_ASSERT(n2 == 16, "expected the Qwen2-0.5B package token_n2 of 16");
+    TEST_ASSERT(cfg.max_seq_len % n2 == 0, "token_n2 must divide max_seq_len");
     for (uint32_t t : {0u, 1u, n2 - 1, n2, n2 + 1, 1023u}) {
         const size_t expect = elem * (static_cast<size_t>(n2) * cfg.head_dim * (t / n2) + (t % n2));
         TEST_ASSERT(kv.v_token_offset(t) == expect,

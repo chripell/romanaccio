@@ -387,6 +387,26 @@ es_status_t es_session_generate(
     es_perf_stats_t *stats
 );
 
+/**
+ * @brief Teacher-forced perplexity of @p text under the loaded model.
+ *
+ * Runs the prefill path only (no sampling), so the result is deterministic and usable
+ * as a quality regression signal across builds. Scoring stops at the compiled KV window
+ * rather than writing past it.
+ *
+ * @param session         Valid session handle.
+ * @param text            Text to tokenize and score; needs at least 2 tokens.
+ * @param[out] perplexity exp(-mean log P(token[i+1] | prefix)). May be NULL.
+ * @param[out] mean_logprob Mean natural log-probability per predicted token. May be NULL.
+ * @return ES_SUCCESS, or ES_ERR_INVALID_ARG when nothing could be scored.
+ */
+es_status_t es_session_perplexity(
+    es_session_t *session,
+    const char *text,
+    double *perplexity,
+    double *mean_logprob
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -43,7 +43,11 @@ V: elem * (token_n2 * head_dim * (token / token_n2) + (token % token_n2))
 
 `k_token_offset()` / `v_token_offset()` return these verbatim in this mode, for callers
 building task descriptors. `token_n2` defaults to the largest of {256,128,…,1} that
-divides `max_seq_len` (256 for a 1024 window) and must divide it exactly.
+divides `max_seq_len` and must divide it exactly — but the default is only a fallback.
+The real value is a property of the compile and is published by the package: the
+Qwen2-0.5B 1k INT8 `config.json` declares `token_n2: 16` (with `embedding_dim1: 4`,
+`embedding_dim2: 16`, `token_n1: 64`), which `ModelManifest` now reads into
+`config.kv_token_n2`. Pass that through rather than relying on the divisor heuristic.
 
 `HeadMajor` is the default because it is the one confirmed against a real compiled
 loadable rather than inferred from a formula.

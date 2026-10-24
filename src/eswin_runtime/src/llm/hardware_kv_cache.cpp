@@ -63,7 +63,21 @@ bool HardwareKvCache::allocate(const HardwareKvConfig &cfg, WorkerPool *pool, st
     }
 
     m_cfg = cfg;
-    m_token_n2 = cfg.token_n2 ? cfg.token_n2 : default_token_n2(cfg.max_seq_len);
+    if (cfg.layout == KvLayout::TokenMajorTiled) {
+        // The tile height is a compile-time property of the loadable, published by the
+        // package as token_n2 (16 for Qwen2-0.5B 1k INT8). A divisor heuristic picks 256
+        // there, and a wrong tile height mis-addresses every V write without crashing -
+        // it just produces Issue #47-style corruption. Refuse to guess.
+        if (cfg.token_n2 == 0) {
+            err = "HardwareKvCache: TokenMajorTiled requires an explicit token_n2 taken "
+                  "from the package (ModelConfig::kv_token_n2); refusing to guess a "
+                  "V-cache tile height";
+            return false;
+        }
+        m_token_n2 = cfg.token_n2;
+    } else {
+        m_token_n2 = cfg.token_n2 ? cfg.token_n2 : default_token_n2(cfg.max_seq_len);
+    }
     if (m_token_n2 == 0 || cfg.max_seq_len % m_token_n2 != 0) {
         err = "HardwareKvCache: token_n2 (" + std::to_string(m_token_n2) +
               ") must divide max_seq_len (" + std::to_string(cfg.max_seq_len) + ")";

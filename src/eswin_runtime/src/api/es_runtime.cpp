@@ -372,6 +372,16 @@ es_status_t es_model_load(es_context_t *ctx, const es_model_config_t *config, es
         }
     }
 
+    // Vendor ENNP packages ship config.json, not manifest.json. ModelManifest reads both
+    // (root-level token_num, model_list/block_models), so prefer that over silently
+    // falling back to hard-coded SmolLM defaults for a DeepSeek/Qwen2 package.
+    if (manifest_path.empty() || !file_exists(manifest_path)) {
+        std::string vendor_cfg = model_dir + "/config.json";
+        if (file_exists(vendor_cfg)) {
+            manifest_path = vendor_cfg;
+        }
+    }
+
     auto model = std::make_unique<es_model_t>();
     model->model_dir = model_dir;
     model->device_mode = config->device_mode;
@@ -530,5 +540,27 @@ es_status_t es_session_generate(
         stats->tokens_per_sec = s_stats.tokens_per_sec;
     }
 
+    return ES_SUCCESS;
+}
+
+es_status_t es_session_perplexity(
+    es_session_t *session,
+    const char *text,
+    double *perplexity,
+    double *mean_logprob
+) {
+    if (!session || !session->session || !text) return ES_ERR_INVALID_ARG;
+
+    // Score the raw text as given: Qwen2/DeepSeek prompts already carry their ChatML
+    // delimiters, and adding a BOS here would shift every position by one.
+    const bool add_bos =
+        (session->session->manifest().config.architecture != "qwen2" &&
+         std::strstr(text, "<|im_start|>") == nullptr);
+    std::vector<int32_t> tokens = session->session->tokenizer().encode(text, add_bos);
+    if (tokens.size() < 2) return ES_ERR_INVALID_ARG;
+
+    if (!session->session->score_sequence(tokens, mean_logprob, perplexity)) {
+        return ES_ERR_INVALID_ARG;
+    }
     return ES_SUCCESS;
 }

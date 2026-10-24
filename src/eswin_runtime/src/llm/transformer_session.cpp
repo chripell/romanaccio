@@ -832,6 +832,52 @@ int32_t TransformerSession::step(int32_t token_id, int pos) {
     return next_token;
 }
 
+bool TransformerSession::score_sequence(const std::vector<int32_t> &tokens,
+                                        double *mean_logprob, double *perplexity) {
+    if (tokens.size() < 2) return false;
+
+    reset();
+
+    double sum = 0.0;
+    size_t scored = 0;
+
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        // Never walk past the compiled KV window: the flat caches are indexed by
+        // absolute position with no bounds check.
+        if (m_max_seq > 0 && m_current_pos >= m_max_seq - 1) break;
+
+        step(tokens[i], m_current_pos++);
+
+        const int32_t target = tokens[i + 1];
+        if (m_logits.empty() || target < 0 ||
+            static_cast<size_t>(target) >= m_logits.size()) {
+            continue;
+        }
+
+        // Numerically stable log-softmax at the true next token.
+        float max_logit = m_logits[0];
+        for (float v : m_logits) {
+            if (v > max_logit) max_logit = v;
+        }
+        double sum_exp = 0.0;
+        for (float v : m_logits) {
+            sum_exp += std::exp(static_cast<double>(v) - static_cast<double>(max_logit));
+        }
+        if (!(sum_exp > 0.0)) continue;
+
+        sum += (static_cast<double>(m_logits[target]) - static_cast<double>(max_logit)) -
+               std::log(sum_exp);
+        ++scored;
+    }
+
+    if (scored == 0) return false;
+
+    const double mean = sum / static_cast<double>(scored);
+    if (mean_logprob) *mean_logprob = mean;
+    if (perplexity) *perplexity = std::exp(-mean);
+    return true;
+}
+
 bool TransformerSession::generate(
     const std::string &prompt,
     int max_new_tokens,

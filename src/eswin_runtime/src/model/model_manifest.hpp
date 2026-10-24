@@ -36,6 +36,14 @@ struct ModelConfig {
     // Context window baked into the compiled loadables (the KV cache length they
     // were built with). Vendor ENNP config.json names this "token_num".
     uint32_t    context_length = 2048;
+    // Per-head dimension. 0 means derive as hidden_size / num_attention_heads.
+    // Vendor ENNP config.json names this "embedding_dim" (64 for Qwen2-0.5B).
+    uint32_t    head_dim = 0;
+    // V-cache tiling height, vendor "token_n2". Must come from the package: it is 16
+    // for Qwen2-0.5B 1k, and guessing it silently mis-addresses the V cache.
+    uint32_t    kv_token_n2 = 0;
+    // Bytes per activation element, vendor "precision" (2 = fp16).
+    uint32_t    elem_bytes = 2;
 };
 
 class ModelManifest {

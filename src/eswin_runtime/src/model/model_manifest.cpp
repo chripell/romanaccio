@@ -58,6 +58,29 @@ bool ModelManifest::load_from_string(const std::string &json_str, std::string &e
         }
     }
 
+    // Vendor ENNP config.json shape: everything at the document root, no nested
+    // "config". Field semantics were confirmed against the Qwen2-0.5B 1k INT8 package
+    // and its compiled loadable, whose K/V tensors are (2, 64, 1, 1024) and
+    // (2, 1024, 1, 64):
+    //   embedding_size 896 = hidden_size      embedding_dim 64 = head_dim
+    //   num_head         2 = num_kv_heads     token_num   1024 = compiled KV window
+    //   token_n2        16 = V tiling height  precision      2 = bytes per element
+    if (!root.has("config")) {
+        if (root.has("model_name")) config.architecture = root["model_name"].as_string(config.architecture);
+        if (root.has("vocab_size")) config.vocab_size = static_cast<uint32_t>(root["vocab_size"].as_int(config.vocab_size));
+        if (root.has("embedding_size")) config.hidden_size = static_cast<uint32_t>(root["embedding_size"].as_int(config.hidden_size));
+        if (root.has("embedding_dim")) config.head_dim = static_cast<uint32_t>(root["embedding_dim"].as_int(0));
+        if (root.has("num_head")) config.num_key_value_heads = static_cast<uint32_t>(root["num_head"].as_int(config.num_key_value_heads));
+        if (root.has("token_n2")) config.kv_token_n2 = static_cast<uint32_t>(root["token_n2"].as_int(0));
+        if (root.has("precision")) config.elem_bytes = static_cast<uint32_t>(root["precision"].as_int(2));
+
+        // The vendor config states KV heads and head_dim but not attention heads;
+        // derive them so RoPE and the attention path get a consistent geometry.
+        if (config.head_dim > 0 && config.hidden_size % config.head_dim == 0) {
+            config.num_attention_heads = config.hidden_size / config.head_dim;
+        }
+    }
+
     files.clear();
     if (root.has("files") && root["files"].is_array()) {
         for (const auto &item : root["files"].as_array()) {
@@ -136,6 +159,9 @@ std::string ModelManifest::to_json_string(int indent) const {
     cfg["bos_token_id"] = static_cast<int>(config.bos_token_id);
     cfg["eos_token_id"] = static_cast<int>(config.eos_token_id);
     cfg["context_length"] = static_cast<int>(config.context_length);
+    cfg["head_dim"] = static_cast<int>(config.head_dim);
+    cfg["kv_token_n2"] = static_cast<int>(config.kv_token_n2);
+    cfg["elem_bytes"] = static_cast<int>(config.elem_bytes);
     root["config"] = cfg;
 
     JsonValue arr;

@@ -95,6 +95,21 @@ public:
     // Forward single token and produce next token ID
     int32_t step(int32_t token_id, int pos);
 
+    /**
+     * @brief Teacher-forced scoring: mean log P(token[i+1] | tokens[0..i]).
+     *
+     * Runs the prefill path only (no sampling), so it is deterministic and usable as a
+     * quality regression signal. Stops early at the compiled KV window rather than
+     * writing past it.
+     *
+     * @param tokens        Sequence to score; needs at least 2 tokens.
+     * @param mean_logprob  Optional out: mean natural log-probability per predicted token.
+     * @param perplexity    Optional out: exp(-mean_logprob).
+     * @return false when fewer than 2 tokens are given or nothing could be scored.
+     */
+    bool score_sequence(const std::vector<int32_t> &tokens,
+                        double *mean_logprob, double *perplexity);
+
     // Accessors
     const ModelManifest& manifest() const { return m_manifest; }
     Tokenizer& tokenizer() { return m_tokenizer; }

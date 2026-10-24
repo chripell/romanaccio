@@ -84,6 +84,10 @@ target_link_libraries(test_embedding_loader PRIVATE es_runtime ${CMAKE_DL_LIBS} 
 add_executable(test_hardware_kv_cache tests/test_hardware_kv_cache.cpp)
 target_link_libraries(test_hardware_kv_cache PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 10 DeepSeek/Qwen2 End-to-End Test Executable
+add_executable(test_deepseek_e2e tests/test_deepseek_e2e.cpp)
+target_link_libraries(test_deepseek_e2e PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -103,4 +107,5 @@ add_test(NAME test_runtime_e2e COMMAND test_runtime_e2e)
 add_test(NAME test_layer_chaining COMMAND test_layer_chaining)
 add_test(NAME test_embedding_loader COMMAND test_embedding_loader)
 add_test(NAME test_hardware_kv_cache COMMAND test_hardware_kv_cache)
+add_test(NAME test_deepseek_e2e COMMAND test_deepseek_e2e)
 
