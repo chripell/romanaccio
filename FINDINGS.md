@@ -530,3 +530,85 @@ We have ported and validated **Qwen2.5-Coder-1.5B-Instruct** running end-to-end 
   - **Autoregressive Generation**: **$4.18 - 5.49\text{ tokens/second}$** sustained.
   - **Zero Closed-Source Blob Dependencies**: Operates directly via `/dev/npu0`, `/dev/npu1`, and `/dev/malloc_dmabuf`.
 
+---
+
+## 24. Calibrated Decode Throughput Model (and why the per-model plans are 3–10× optimistic)
+
+Every model plan in `src/*/PLAN.md` projects tokens/second from
+$\text{bandwidth} / \text{bytes-per-token}$ using an assumed bandwidth of 25–51 GB/s *per die*
+and **100% efficiency**. Both assumptions are wrong, and the errors compound. This section
+derives a calibrated model from the one dense LLM we have actually run on silicon.
+
+### 24.1 Measured bandwidth (already recorded, restated because the plans ignore it)
+
+From `findings/NUMA_MEMORY_AND_HARDWARE_BENCHMARK.md`:
+
+- **One die, local read: ~14.0 GB/s** (4 local cores, 256 MiB streaming buffer).
+- Both dies reading their *own* local memory concurrently: **47.93 GB/s** aggregate triad.
+- D2D cross-die ceiling: **21.85 GB/s**; remote reads ~5.8 GB/s; remote writes 1.02 GB/s.
+- MMZ `Cached` CPU access: 0.84–2.89 GB/s; MMZ `NoCache` CPU reads: **10–60 MB/s**.
+
+There is no 51.2 GB/s per die and no 102.4 GB/s peak. The "~28 GB/s practical sustained
+read across both dies" used in `src/DeepSeek-V2-Lite/PLAN.md` §1.1 is the defensible
+conservative figure — **but only when both dies are reading simultaneously.**
+
+### 24.2 Layer-pipeline parallelism does not aggregate bandwidth at batch 1
+
+This is the single most consequential fact for model selection, and no plan states it.
+
+With layers $0..L/2$ on Die 0 and $L/2..L$ on Die 1, one token flows through Die 0's layers
+and *then* Die 1's. At batch 1 the other die is idle for half of every token, so effective
+streaming bandwidth is the **single-die ~14 GB/s**, not 28 GB/s. Bandwidth only aggregates
+when both dies work on the *same* layer — i.e. tensor parallelism (the dual-die LM head,
+which does aggregate) or MoE **expert** parallelism.
+
+### 24.3 Calibrated efficiency: 41–59%
+
+Qwen2.5-Coder-1.5B, 28 layers split 14/14, measured **3.88–5.49 tok/s** (§23, and a
+2026-10-21 run at 3.88 tok/s over 619 generated tokens). It streams ~1.5 GB/token, so:
+
+$$\text{effective} = 1.5\,\text{GB} \times (3.88 \ldots 5.49)\,\text{tok/s} = 5.8 \ldots 8.2\ \text{GB/s}$$
+
+against a 14 GB/s single-die ceiling ⇒ **41–59% efficiency**. The losses are per-submit
+driver/worker-IPC overhead, CPU-side RoPE/softmax/KV work, D2D activation transfer and
+cache maintenance. Use this band for any projection on this SoC.
+
+### 24.4 Corrected projections
+
+Ceiling = $14 / \text{GB-per-token}$ for layer-pipeline dense models; efficiency band 0.41–0.59.
+
+| Model | GB/token | Plan claims | Ceiling | **Realistic** | Error |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Qwen2.5-Coder-1.5B | 1.5 | 4.18–5.49 | 9.3 | **3.8–5.5 (measured)** | calibrated ✓ |
+| DeepSeek-V2-Lite (MoE, expert-parallel) | 2.18 | 11.7 | 12.8 (28 GB/s) | **5.3–7.6** | ~2× |
+| TranslateGemma-4B | 4.2 | 5.0–9.0 | 3.3 | **1.4–2.0** | ~4× |
+| Qwen2.5-7B-abliterated | 7.6 | 10.5–12.0 | 1.8 | **0.8–1.1** | ~11× |
+| L3.1-8B-Stheno | 8.0 | 9.5–11.5 | 1.7 | **0.7–1.0** | ~11× |
+| dense 7B (as cited in `findings/SYSTEM_CAPABILITIES_AND_MODELS.md`) | 7.6 | 3.7 | 1.8 | **0.8–1.1** | ~4× |
+| gemma-3-12B INT8 | 12.1 | 1.2–2.5 | 1.2 | **0.5–0.7** | ~3× |
+| Mistral-Nemo-12B INT8 | 12.2 | 1.5–2.2 | 1.1 | **0.5–0.7** | ~3× |
+
+Consequences worth acting on:
+
+1. **The recorded "dense 7B INT8 ≈ 3.7 tok/s" is itself ~4× optimistic** — it was computed
+   as $28/7.6$ at 100% efficiency. Under layer-pipeline it is ~0.8–1.1 tok/s. Anything
+   downstream that ranked 7B models as interactive should be re-read with this in mind.
+2. **Dense ≥7B is not interactive on this SoC.** ≤3B dense, or MoE with expert parallelism,
+   are the only routes to >5 tok/s. This is the strongest argument for DeepSeek-V2-Lite in
+   the whole repository — and for splitting it by *expert*, not by *layer*.
+3. **MoE is the only architecture that can use both dies' bandwidth for the FFN**, which is
+   where ~80% of the bytes live. See `src/DeepSeek-V2-Lite/PLAN.md` §6.1.
+4. Projections in `src/rpg_uncensored/PLAN.md` (9.5–12 tok/s for 7–8B dense) are the most
+   divergent from silicon and would make an 8B roleplay model unusable interactively
+   (~1 tok/s). That plan's model choice should be revisited before any weights are fetched.
+
+### 24.5 Open measurement gaps
+
+The 41–59% band comes from a single model at a single context length. To tighten it:
+measure per-submit cost directly (one expert FFN, 100 submits), and re-measure a 1.5B and a
+3B model at matched context. `tools/e2e_regression.sh --host roma` now emits
+machine-readable `PERF`/`PPL` lines for exactly this. **Blocked at the time of writing:**
+SSH to `roma` began failing with `Permission denied (publickey,password)` on 2026-10-24
+after working earlier the same day, so no new on-board numbers were collected for this
+section — every figure above is either previously measured or derived from measurements.
+
