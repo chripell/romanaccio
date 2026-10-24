@@ -20,6 +20,7 @@ set(RUNTIME_SOURCES
     src/backend/dma_buffer.cpp
     src/backend/worker_pool.cpp
     src/backend/pipeline_executor.cpp
+    src/backend/direct_kernel_backend.cpp
     src/model/sha256.cpp
     src/model/model_manifest.cpp
     src/model/embedding_table.cpp
@@ -88,6 +89,10 @@ target_link_libraries(test_hardware_kv_cache PRIVATE es_runtime ${CMAKE_DL_LIBS}
 add_executable(test_deepseek_e2e tests/test_deepseek_e2e.cpp)
 target_link_libraries(test_deepseek_e2e PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 11 Direct Kernel Mode Test Executable
+add_executable(test_direct_kernel_mode tests/test_direct_kernel_mode.cpp)
+target_link_libraries(test_direct_kernel_mode PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -108,4 +113,5 @@ add_test(NAME test_layer_chaining COMMAND test_layer_chaining)
 add_test(NAME test_embedding_loader COMMAND test_embedding_loader)
 add_test(NAME test_hardware_kv_cache COMMAND test_hardware_kv_cache)
 add_test(NAME test_deepseek_e2e COMMAND test_deepseek_e2e)
+add_test(NAME test_direct_kernel_mode COMMAND test_direct_kernel_mode)
 

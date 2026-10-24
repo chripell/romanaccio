@@ -409,7 +409,16 @@ Development is structured into **11 independently verifiable milestones**:
 - **Documentation**:
   - DeepSeek & Qwen2 Open Runtime deployment guide (`docs/DEEPSEEK_QWEN2_RUNTIME_GUIDE.md`).
 
-### Milestone 11: Direct Kernel Mode Backend (L0' Zero-Vendor-Blob Engine) [PLANNED]
+### Milestone 11: Direct Kernel Mode Backend (L0' Zero-Vendor-Blob Engine) [PARTIALLY COMPLETED]
+- **Implementation Status** (2026-10-24):
+  - `src/backend/direct_kernel_backend.{hpp,cpp}`: blob-free allocation through the standard Linux dma-heap uAPI (`/dev/dma_heap/mmz_nid_<die>_part_0`, `DMA_HEAP_IOCTL_ALLOC` = `0xc0184800` over the 24-byte request struct), `mmap` of the returned dma-buf, cache maintenance via `DMA_BUF_IOCTL_SYNC` instead of `ES_SYS_MemFlushCache`, `/dev/npu*` open/enumerate, and `PREPARE_DMA`/`UNPREPARE_DMA`. No `dlopen` anywhere; `readelf -d libes_runtime.so` shows only `libstdc++/libm/libgomp/libgcc_s/libc` in `DT_NEEDED`.
+  - All 13 catalogued ioctls pinned as literal observed encodings with `static_assert`s on decoded dir/type/nr/size, so the table is verifiable on any host without a board.
+  - `ENABLE_DIRECT_KERNEL_MODE` switch added to `Makefile` (`make ENABLE_DIRECT_KERNEL_MODE=1`) and `CMakeLists.txt`.
+  - `tests/test_direct_kernel_mode.cpp` and `docs/DIRECT_KERNEL_IOCTL_SPEC.md` added; wired into both build systems.
+  - **New finding:** every NPU command encodes a **4-byte** payload size, including `PREPARE_DMA`, which the catalog annotates as `_IOWR('n', 0x0F, struct ES_DEV_BUF)` — but `ES_DEV_BUF` is 32 bytes and would encode as `0xc0206e0f`. Since the kernel dispatches on the full command word, the naive `_IOWR` would be rejected outright. The backend passes the buffer fd as `uint32_t`; that is a hypothesis, not verified fact.
+  - Verified: host suite green (13 encodings, node naming, graceful failure naming the missing node, blob-free `DT_NEEDED`); clean `riscv64-linux-gnu-` cross-compile.
+  - **Not verified on silicon:** the board run was attempted and blocked — SSH to `roma` failed with `Permission denied (publickey,password)` even though it worked earlier in the same session. So dma-heap allocation, the mapping round-trip and the `PREPARE_DMA` payload hypothesis are all unconfirmed. The test *reports* `PREPARE_DMA`'s result rather than asserting it, on purpose: asserting a guess would either fake a pass or fail the suite for a reason that is not a code defect.
+  - **Not implemented:** `SUBMIT_MODEL` (needs `struct npu_model_desc`, not yet recovered — without it there is no `modelId` for `SUBMIT_TASK`, and this is the blocker for a fully blob-free inference path), firmware mailbox/completion handling (`PROCESS_REPORT` wait queues), and any integration — `DmaBuffer`/`WorkerPool` still use the `dlopen` path, so this backend is standalone and additive.
 - **Motivation & Objectives**:
   - Eliminate the last proprietary vendor userspace binary blob (`libedla_runtime.so.1.0` and `libes_memory.so`) by implementing direct kernel ioctls to `/dev/npu0` and `/dev/npu1` and standard Linux DMA-heap buffer allocation.
 - **Scope**:

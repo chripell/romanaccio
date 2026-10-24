@@ -7,6 +7,13 @@ CC             = $(CROSS_COMPILE)gcc
 CXXFLAGS      += -std=c++17 -O3 -fopenmp -Wall -Wextra -fPIC -pthread -Iinclude
 LDFLAGS       += -fopenmp -ldl -pthread
 
+# Layer 0' (Milestone 11): build the direct kernel ioctl backend into the library.
+# make ENABLE_DIRECT_KERNEL_MODE=1
+ENABLE_DIRECT_KERNEL_MODE ?= 0
+ifeq ($(ENABLE_DIRECT_KERNEL_MODE),1)
+CXXFLAGS      += -DES_ENABLE_DIRECT_KERNEL_MODE=1
+endif
+
 BUILD_DIR      = build
 SRC_DIR        = src
 TEST_DIR       = tests
@@ -16,6 +23,7 @@ SRCS           = $(SRC_DIR)/backend/driver_wrapper.cpp \
                  $(SRC_DIR)/backend/dma_buffer.cpp \
                  $(SRC_DIR)/backend/worker_pool.cpp \
                  $(SRC_DIR)/backend/pipeline_executor.cpp \
+                 $(SRC_DIR)/backend/direct_kernel_backend.cpp \
                  $(SRC_DIR)/model/sha256.cpp \
                  $(SRC_DIR)/model/model_manifest.cpp \
                  $(SRC_DIR)/model/embedding_table.cpp \
@@ -40,12 +48,13 @@ TEST_CHAIN     = $(BUILD_DIR)/test_layer_chaining
 TEST_EMBED     = $(BUILD_DIR)/test_embedding_loader
 TEST_KVHW      = $(BUILD_DIR)/test_hardware_kv_cache
 TEST_E2E_DS    = $(BUILD_DIR)/test_deepseek_e2e
+TEST_DKMODE    = $(BUILD_DIR)/test_direct_kernel_mode
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
 TOOL_CHAT      = $(BUILD_DIR)/eswin-chat
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TOOL_FETCH) $(TOOL_CHAT)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TOOL_FETCH) $(TOOL_CHAT)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -116,7 +125,12 @@ $(TEST_E2E_DS): $(TEST_DIR)/test_deepseek_e2e.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS)
+$(TEST_DKMODE): $(TEST_DIR)/test_direct_kernel_mode.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
@@ -137,6 +151,8 @@ test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_KVHW)
 	@echo "\nRunning Milestone 10 DeepSeek/Qwen2 End-to-End test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_E2E_DS)
+	@echo "\nRunning Milestone 11 Direct Kernel Mode test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DKMODE)
 
 clean:
 	rm -rf $(BUILD_DIR)
