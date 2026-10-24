@@ -171,6 +171,24 @@ static void test_context_length_parsing() {
         TEST_ASSERT(m.config.context_length == 4096, "context_length should take precedence over token_num");
     }
 
+    // A real vendor ENNP config.json carries token_num at the DOCUMENT ROOT and has no
+    // nested "config" object at all (rootfs-roma/.../qwen2_0_5b_1k_int8/config.json).
+    {
+        eswin::ModelManifest m;
+        std::string json = R"({"name":"Vendor","model_name":"qwen2","token_num":1024,
+                               "model_list":[{"device_id":0,"block_models":["b0.model"]}]})";
+        TEST_ASSERT(m.load_from_string(json, err), "Vendor root-level parse failed: " + err);
+        TEST_ASSERT(m.config.context_length == 1024, "root-level token_num not honoured");
+    }
+
+    // Nested config wins over a stale root-level value.
+    {
+        eswin::ModelManifest m;
+        std::string json = R"({"name":"Both","token_num":1024,"config":{"context_length":8192}})";
+        TEST_ASSERT(m.load_from_string(json, err), "Parse failed: " + err);
+        TEST_ASSERT(m.config.context_length == 8192, "nested config should win over root");
+    }
+
     // Serialize round-trip keeps the value
     {
         eswin::ModelManifest m;

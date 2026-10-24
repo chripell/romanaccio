@@ -31,13 +31,27 @@ bool ModelManifest::load_from_string(const std::string &json_str, std::string &e
         config.rope_theta = static_cast<float>(cfg["rope_theta"].as_double(10000.0));
         config.bos_token_id = static_cast<uint32_t>(cfg["bos_token_id"].as_int(0));
         config.eos_token_id = static_cast<uint32_t>(cfg["eos_token_id"].as_int(0));
+    }
 
-        // Context window: accept the open-package name plus the vendor/legacy spellings
-        // so an existing ENNP config.json drops in without editing.
-        static const char *ctx_keys[] = {"context_length", "max_seq_len", "kv_cache_len", "token_num"};
+    // Context window. Open packages nest it under "config"; the vendor ENNP
+    // config.json carries "token_num" at the document root and has no nested config
+    // object at all, so both locations are honoured, config taking precedence.
+    static const char *ctx_keys[] = {"context_length", "max_seq_len", "kv_cache_len", "token_num"};
+    bool ctx_found = false;
+    if (root.has("config") && root["config"].is_object()) {
+        const auto &cfg = root["config"];
         for (const char *k : ctx_keys) {
             if (cfg.has(k)) {
                 config.context_length = static_cast<uint32_t>(cfg[k].as_int(2048));
+                ctx_found = true;
+                break;
+            }
+        }
+    }
+    if (!ctx_found) {
+        for (const char *k : ctx_keys) {
+            if (root.has(k)) {
+                config.context_length = static_cast<uint32_t>(root[k].as_int(2048));
                 break;
             }
         }
