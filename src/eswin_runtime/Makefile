@@ -18,6 +18,8 @@ SRCS           = $(SRC_DIR)/backend/driver_wrapper.cpp \
                  $(SRC_DIR)/backend/pipeline_executor.cpp \
                  $(SRC_DIR)/model/sha256.cpp \
                  $(SRC_DIR)/model/model_manifest.cpp \
+                 $(SRC_DIR)/model/embedding_table.cpp \
+                 $(SRC_DIR)/model/safetensors_loader.cpp \
                  $(SRC_DIR)/model/downloader.cpp \
                  $(SRC_DIR)/nlp/sampler.cpp \
                  $(SRC_DIR)/nlp/tokenizer.cpp \
@@ -34,12 +36,13 @@ TEST_NLP       = $(BUILD_DIR)/test_tokenizer_sampler
 TEST_SESSION   = $(BUILD_DIR)/test_transformer_session
 TEST_E2E       = $(BUILD_DIR)/test_runtime_e2e
 TEST_CHAIN     = $(BUILD_DIR)/test_layer_chaining
+TEST_EMBED     = $(BUILD_DIR)/test_embedding_loader
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
 TOOL_CHAT      = $(BUILD_DIR)/eswin-chat
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TOOL_FETCH) $(TOOL_CHAT)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TOOL_FETCH) $(TOOL_CHAT)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -95,7 +98,12 @@ $(TEST_CHAIN): $(TEST_DIR)/test_layer_chaining.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN)
+$(TEST_EMBED): $(TEST_DIR)/test_embedding_loader.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
@@ -110,6 +118,8 @@ test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_E2E)
 	@echo "\nRunning Milestone 7 Multi-Layer Block Chaining test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_CHAIN)
+	@echo "\nRunning Milestone 8 Embedding & Weights Loader test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_EMBED)
 
 clean:
 	rm -rf $(BUILD_DIR)

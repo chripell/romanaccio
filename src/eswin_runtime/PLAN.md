@@ -320,7 +320,14 @@ Development is structured into **11 independently verifiable milestones**:
 - **Documentation**:
   - Pipeline execution architecture guide (`docs/MULTI_LAYER_PIPELINE_GUIDE.md`).
 
-### Milestone 8: Zero-Copy Embedding & Weight Memory Management (`embedding.bin`, Safetensors, GGUF) [PLANNED]
+### Milestone 8: Zero-Copy Embedding & Weight Memory Management (`embedding.bin`, Safetensors, GGUF) [COMPLETED]
+- **Implementation Status** (2026-10-24):
+  - `src/model/embedding_table.{hpp,cpp}`: `mmap(PROT_READ, MAP_SHARED)` + `MADV_WILLNEED`, fp32/fp16/bf16 rows decoded to fp32 on lookup, bounds-checked `get_row()`/`gather()` (out-of-range tokens zero-fill), exact `rows x cols x elem` size validation, `open_auto()` precision inference that rejects ambiguous sizes, move-only ownership.
+  - `src/model/safetensors_loader.{hpp,cpp}`: zero-dependency container reader (8-byte LE header length, JSON header, dense payload) over the same mapping; validates every `data_offsets` range against the data section and `shape x dtype` before publishing a tensor; `to_f32()` for F64/F32/F16/BF16/I64/I32/I16/I8/U8/BOOL; `__metadata__` parsed; zero-copy `data()` accessor.
+  - `tests/test_embedding_loader.cpp` and `docs/WEIGHTS_AND_EMBEDDING_SPEC.md` added; wired into `Makefile` (`make test`) and `CMakeLists.txt` (`ctest`).
+  - Verified: suite green on host, including mapping the exact 466,747,392-byte Qwen2.5-Coder table (151936 x 1536 fp16) in **0.003 ms** against the PLAN's <5 ms target, and rejection of truncated files, shape/dtype mismatch, unknown dtype, oversized header length, missing files and zero dimensions. Clean `riscv64-linux-gnu-` cross-compile.
+  - Bug found and fixed while testing: `JsonValue::parse` only writes `err` on failure, so a caller reusing one error string saw a stale message attributed to the current file; both loaders now clear their out-param at entry.
+  - **Deferred**: GGUF (named in the milestone title) is not implemented — no ESWIN package in `deep/rootfs-roma` or on `roma` ships GGUF, so it was left out rather than shipped untested. RVV-vectorised fp16 unpacking is also not done; the portable scalar path is used on both host and RISC-V. `TransformerSession` still loads via its existing `std::vector` paths — switching it over is Milestone 10 work and needs a board run.
 - **Motivation & Objectives**:
   - Large language models require external embedding tables (e.g. 1.08 GB raw fp16 for DeepSeek-7B, 272 MB for Qwen2-0.5B). Currently, `TransformerSession` uses a fallback dummy constant (`0.01f`), producing uniform logits and gibberish sampling output if real weights are not mapped.
   - Implement an ultra-fast zero-copy memory-mapped embedding and weight manager supporting raw binary tables (`embedding.bin`), Hugging Face `safetensors`, and GGUF.

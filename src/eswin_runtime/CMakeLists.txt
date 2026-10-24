@@ -22,6 +22,8 @@ set(RUNTIME_SOURCES
     src/backend/pipeline_executor.cpp
     src/model/sha256.cpp
     src/model/model_manifest.cpp
+    src/model/embedding_table.cpp
+    src/model/safetensors_loader.cpp
     src/model/downloader.cpp
     src/nlp/sampler.cpp
     src/nlp/tokenizer.cpp
@@ -73,6 +75,10 @@ target_link_libraries(test_runtime_e2e PRIVATE es_runtime ${CMAKE_DL_LIBS} pthre
 add_executable(test_layer_chaining tests/test_layer_chaining.cpp)
 target_link_libraries(test_layer_chaining PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 8 Embedding & Weights Loader Test Executable
+add_executable(test_embedding_loader tests/test_embedding_loader.cpp)
+target_link_libraries(test_embedding_loader PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -90,4 +96,5 @@ add_test(NAME test_tokenizer_sampler COMMAND test_tokenizer_sampler)
 add_test(NAME test_transformer_session COMMAND test_transformer_session)
 add_test(NAME test_runtime_e2e COMMAND test_runtime_e2e)
 add_test(NAME test_layer_chaining COMMAND test_layer_chaining)
+add_test(NAME test_embedding_loader COMMAND test_embedding_loader)
 
