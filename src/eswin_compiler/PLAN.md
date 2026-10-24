@@ -198,6 +198,72 @@ Development is broken down into **6 small, independently reviewable and testable
 - **Documentation**:
   - Comprehensive `README.md`, CLI manual, and Developer Architecture Guide.
 
+### Milestone 7: Runtime-Bound Weight Surfaces (dynamic weight binding for MoE) [PLANNED]
+- **Motivation**:
+  - DeepSeek-V2-Lite needs 6 of 64 routed experts per layer, chosen at run time. A compiled
+    `.model` bakes weights into blobs, so the naive mapping is one loadable per
+    (layer, expert) = **1716 files**, 1716 `ES_NPU_LoadModelFromFile` calls, and an unknown
+    concurrent-`modelId` limit. See `src/DeepSeek-V2-Lite/PLAN.md` §6.4.
+  - `EsAAC` cannot produce the alternative: it **SIGSEGVs (exit 139)** on any ONNX graph with
+    a second dynamic input, verified with a minimal `MatMul` and a control `Add`
+    (§6.11 of that plan). So this capability has to come from *this* compiler, which emits
+    loadables directly.
+- **Evidence gathered (2026-10-24, `deep/artifacts/scratch/probe_weight_cube.py`)**:
+  - `backend/gemm_builder.py` already reproduces the vendor's binding scheme exactly. Its
+    `memory_list` has **Class A** entries (`contents`/`offsets` populated = blob-backed) and
+    **Class B** entries (`contents=[]`, `flags=5` input / `flags=9` output, `tensor_desc_id`
+    set) — matching `FINDINGS.md` §25 byte for byte.
+  - The weight region is Class A: `mem_id=1 flags=3 size=1,769,472 contents=[WsplitM_0_0,
+    WsplitM_1_1, WsplitM_2_2] offsets=[0, 589824, 1179648]` — three 589,824-byte M-slices.
+  - `relocs` target **only** the Class B tensors: `address_id=4` (input) at `kmd-task-surf_list`
+    offsets 3286/3290, 5334/5338, 7382/7386 and `address_id=5` (output) at 8470/8474, all
+    `write_id=15`, `interface=2`, `sub_interface=4`, as `reloc_type` 1/2 pairs (the low and
+    high halves of a 64-bit IOVA).
+  - **The weight `dla_data_cube`s were located**: `kmd-task-surf_list` +0, +1024, +2048
+    (1024-byte stride, one per M-slice), each `type=0` (DRAM), `address=1` (the address_list
+    index of the weight region), `offset` = 0 / 589824 / 1179648 (**the cube already carries
+    a slice-select offset**), `size=589824`, dims `[64,1,1,576]`. Companion `type=1`
+    (SRAM) cubes at +64 and +1088 with `address=3` are the `.sram.edma` staging destinations.
+- **Design**: emit the weight as a **Class B** entry — `contents=[]`, `flags=5`, a
+  `bind_id`, and a matching `TensorDescEntry` — so the whole expert blob is supplied per
+  submit and expert selection becomes `DevBuf.offset`. `MoERouter::expert_blob_offset()`
+  (Milestone 12 of `eswin_runtime`) already computes exactly that offset, per die.
+- **Open questions, ordered by cost to answer**:
+  1. **Does the driver honour a non-zero `DevBuf.offset` when resolving a Class B bind?**
+     Cheapest possible test and needs **no compiler change**: take an existing vendor or
+     `gemm_builder` loadable, bind its *input* tensor from one `mem_fd` at two different
+     offsets, and check the outputs differ. If offset is ignored, the whole design changes
+     (one buffer per expert instead of one blob), so answer this first.
+  2. **Where is the weight's 64-bit IOVA slot in the packet, and does it need a reloc pair?**
+     The cube's `address` field is an `address_list` *index* (int16), not an IOVA, while the
+     input/output relocs patch 64-bit values elsewhere (+1238 / +2326 within 2048-byte
+     blocks). Determine whether a Class B weight is resolved purely through
+     `address_list → mem_id → bind_id` (no reloc needed) or also requires a patched slot.
+  3. **Does the SPRAM staging path work for a runtime-bound weight?** The `type=1 addr_id=3`
+     edma cubes copy DRAM weight → SPRAM. Confirm the edma source address is derived from the
+     same resolution chain, otherwise the weight must stay in DRAM (`domain=0`) for MoE.
+- **Scope**:
+  - `backend/gemm_builder.py` / `backend/nvdla_builder.py`: add a runtime-bound weight mode
+    (Class B memory entry, `bind_id` allocation, weight `TensorDescEntry`, and relocs if
+    question 2 says they are needed).
+  - `backend/flatbuffer_emitter.py`: `ModelWriter` must round-trip a Class B weight without
+    dropping the (now empty) `contents`/`offsets` vectors — remember the FlatBuffers invariant
+    that all 8 root vectors are always serialized (`FINDINGS.md` §14).
+  - A `--dynamic-weights` compiler flag plus a per-tensor opt-in, so existing static paths
+    are untouched and bit-reproducible.
+- **Deliverables**: dynamic-weight emission in the GEMM/Conv path; a `bind_id` allocator
+  shared with the activation I/O; `tests/test_dynamic_weight_binding.py`.
+- **Testing Requirements**:
+  - Emit a minimal 1×1 Conv with a Class B weight at `bind_id=1`; run it on `roma` **twice
+    with two different weight buffers** and assert the outputs differ accordingly. This is
+    the acceptance test — everything else is inference until it passes.
+  - Then the real target: one loadable serving N experts by varying `DevBuf.offset`,
+    bit-matching N separately-compiled static loadables (cosine ≥ 0.9999 via `eswin-sim`).
+  - Verify `eswin-sim` executes the Class B weight path, so this stays testable off-board.
+- **Documentation**: weight-binding specification (Class A vs Class B, `bind_id` numbering,
+  cube/reloc offsets) appended to `findings/MODEL_FORMAT.md`.
+- **Status**: not started. Blocked on open question 1, which is a runtime-only experiment.
+
 ---
 
 ## 6. Coding Standards & Review Guidelines
