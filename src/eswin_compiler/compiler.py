@@ -79,6 +79,7 @@ class CompilerConfig:
     dtype: str = "float16"                # 'float16' or 'int8'
     batch_size: int = 1
     vocab_split_threshold: int = 2048     # Output channel threshold for dual-die tensor split
+    dynamic_weights: bool = False         # Emit weights as runtime-bound (Class B) tensors
 
 
 class EswinCompiler:
@@ -264,7 +265,27 @@ class EswinCompiler:
             raise ValueError(f"Graph '{graph.name}' contains no CONV nodes for NPU execution.")
 
         primary_conv = conv_nodes[0]
-        model = NVDLAConvBuilder.build_from_node(primary_conv, model_name=graph.name)
+        if self.config.dynamic_weights:
+            # Runtime-bound (Class B) weights are implemented in the 1x1 GEMM emitter,
+            # which is what LLM projections lower to via GemmToConv1x1Pass. The 2D conv
+            # emitter still bakes weights into blobs, so fail loudly rather than silently
+            # producing a static loadable the caller would then mis-submit.
+            w_shape = tuple(primary_conv.inputs[1].shape)
+            if len(w_shape) != 4 or w_shape[2] != 1 or w_shape[3] != 1:
+                raise ValueError(
+                    "--dynamic-weights requires a 1x1 convolution, got weight shape "
+                    f"{w_shape}; the 2D conv emitter does not support runtime-bound "
+                    "weights yet."
+                )
+            from backend.gemm_builder import NVDLAGEMMBuilder
+            model = NVDLAGEMMBuilder.build_from_node(
+                primary_conv, model_name=graph.name, dynamic_weight=True)
+            logger.info(
+                "Dynamic weights: loadable has NO weight blobs; supply the weight buffer "
+                "per submit as input slot 1 (inputFdNum=2)."
+            )
+        else:
+            model = NVDLAConvBuilder.build_from_node(primary_conv, model_name=graph.name)
         ModelWriter.write_file(model, out_path)
         logger.info("Emitted loadable: %s (%d bytes)", out_path.name, out_path.stat().st_size)
 
@@ -337,6 +358,19 @@ def main():
         default=None,
         help="Number of Transformer layers to compile (for testing/partial compile)."
     )
+    parser.add_argument(
+        "--dynamic-weights",
+        action="store_true",
+        help=(
+            "Emit weights as runtime-bound (Class B) tensors instead of baking them into "
+            "blobs. The caller supplies the weight buffer per submit, so ONE loadable can "
+            "serve many weight sets by varying DevBuf.offset - the MoE expert-selection "
+            "primitive (27 loadables instead of 1716 for DeepSeek-V2-Lite). Requires a 1x1 "
+            "convolution. The loadable gains a second input, so submit with inputFdNum=2 "
+            "(slot 0 activation, slot 1 weight). Verified byte-identical to the baked-in "
+            "blob on hardware; see FINDINGS.md section 27."
+        )
+    )
 
     args = parser.parse_args()
     model_path = Path(args.model)
@@ -349,7 +383,8 @@ def main():
         target=args.target,
         opt_level=args.opt_level,
         dtype=args.precision,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        dynamic_weights=args.dynamic_weights
     )
     compiler = EswinCompiler(config=cfg)
 

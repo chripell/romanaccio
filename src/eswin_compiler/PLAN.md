@@ -295,13 +295,28 @@ Development is broken down into **6 small, independently reviewable and testable
   its emitter-produced static counterpart on `roma`** (mean 31698.7018 both, 3072/3072 bytes).
   The existing compiler tests still pass (5 ok, 3 skipped for absent test-data fixtures).
 
+  **CLI flag and test suite: DONE (2026-10-24).** `compiler.py` takes `--dynamic-weights`,
+  carried on `CompilerConfig.dynamic_weights` (default `False`, so existing output is
+  unchanged) and consumed in `_compile_single_layer()`. It routes to `NVDLAGEMMBuilder` with
+  `dynamic_weight=True`, and **rejects a non-1×1 convolution with a clear error** rather than
+  silently emitting a static loadable the caller would then mis-submit with `inputFdNum=2` —
+  the 2D conv emitter still bakes weights into blobs.
+  `tests/test_dynamic_weight_binding.py` (8 tests, all passing) pins the emitted contract:
+  static stays Class A (`flags=3`, 3 contents, `bind_id=0`, no WEIGHT descriptor); dynamic is
+  Class B (`contents=[]`, `flags=5`, `bind_id=1`, `tensor_desc_id=2`, one `data_category=1`
+  descriptor sized `c_out × c_in`); no weight blobs and **no weight relocs** in either;
+  activation relocs for address ids 4 and 5 survive; the dynamic model is >10× smaller;
+  `ModelWriter` round-trips the empty `contents` and `bind_id`; both paths share task/memory/
+  address geometry with the weight address still referenced by the task; and the flag appears
+  in `--help`. The board bit-match remains `probe_weight_bitmatch.cpp`.
+
   Remaining work, in order:
-  1. A `--dynamic-weights` CLI flag and `tests/test_dynamic_weight_binding.py` so the
-     structural assertions and the board bit-match are repeatable rather than ad hoc.
-  2. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
+  1. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
      gate/up/down), which is what DeepSeek-V2-Lite actually needs — 2048→1408→2048, three
      runtime-bound weight tensors per expert rather than one. That also needs a `bind_id`
      allocator, since slots 1..3 would all be weights.
+  2. Extend `--dynamic-weights` to the 2D conv emitter, or lower spatial convs through the
+     GEMM path, so the flag is not 1×1-only.
   3. Wire the runtime side: a session path that keeps one expert blob resident per die and
      submits with `inputFdNum = 1 + n_weight_tensors`, taking each offset from
      `MoERouter::expert_blob_offset()`.
