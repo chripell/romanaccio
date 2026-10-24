@@ -364,3 +364,55 @@ path. Measure first-token latency and KV stability at 4K, not 16K, first.
   `PipelineExecutor`/`HardwareKvCache`/`EmbeddingTable`. Expert-parallel dispatch also wants
   concurrent submission to both dies for the *same* layer, which is a different synchronisation
   pattern from the pipeline handoff `PipelineExecutor` implements today.
+
+---
+
+## 6.9 Phase 0 result: config.json verified (2026-10-24)
+
+`deepseek-ai/DeepSeek-V2-Lite/config.json` fetched and read. **This closes §6.5 items 1, 2
+and 3, and corrects two numbers in §6.3 that I had wrong.**
+
+| Field | Value | Consequence |
+| :--- | :--- | :--- |
+| `num_hidden_layers` / `first_k_dense_replace` / `moe_layer_freq` | 27 / 1 / 1 | **26 MoE layers** + 1 dense layer, confirmed |
+| `intermediate_size` (dense layer 0) | **10944** | §6.5 said 768 — wrong. Layer 0 MLP is 67.3 M params (62.6 MiB INT8), not 4.7 M |
+| `hidden_size` | 2048 | as assumed |
+| `moe_intermediate_size` | 1408 | as assumed; expert = 3 × 2048 × 1408 = 8.65 M params = 8.05 MiB INT8 |
+| `n_routed_experts` / `n_shared_experts` / `num_experts_per_tok` | 64 / 2 / 6 | 8 active FFNs per MoE layer, as assumed |
+| **`scoring_func`** | **`softmax`** | §4's Softmax was **right**; §6.5 item 2 resolved |
+| **`norm_topk_prob`** | **`false`** | top-6 weights are used **unnormalised** (sum < 1). Silently rescales the residual if assumed otherwise |
+| `topk_method` / `n_group` / `topk_group` | `greedy` / 1 / 1 | group-limited top-k is **degenerate** — plain top-6 over 64 |
+| `routed_scaling_factor` | 1.0 | no-op, but implement it |
+| **`q_lora_rank`** | **`None`** | **No query-side low-rank compression** in V2-Lite. One `q_proj` 2048→3072, not q_a/q_b. Simpler graph than §6.3 assumed |
+| **`qk_nope_head_dim`** | **128** (not 64) | q head = 128 + 64 = **192**; §6.5 item 3 was wrong |
+| `qk_rope_head_dim` / `v_head_dim` | 64 / 128 | partial RoPE rotates **64 of 192** q dims; kv_b_proj = 512 → 16×(128+128) = 4096 |
+| `num_key_value_heads` | 16 | MLA expands the latent to all 16 heads |
+| `kv_lora_rank` | 512 | latent KV = 512 + 64 = 576/token/layer ⇒ §6.3's 486 MiB at 16K stands |
+| **`torch_dtype`** | **`bfloat16`** | HF weights are bf16, not fp16. Milestone 8 `EmbeddingTable` already handles `Bf16`; the export path must convert deliberately (bf16→fp16 loses range) |
+| **`rope_scaling`** | `type: yarn, factor: 40, original_max_position_embeddings: 4096, mscale: 0.707` | At a **4K target the context equals the YaRN original max**, so interpolation should not engage — but `mscale` attention scaling may still apply. Must be checked against the HF reference, not assumed away |
+| `rope_theta` | 10000 | not 1e6 (that is Qwen2.5-Coder) |
+| `vocab_size` / `tie_word_embeddings` | 102400 / **false** | LM head is a separate 102400×2048 matrix; 51200/die = 200×256 ✓ hardware-aligned |
+| `hidden_act` / `attention_bias` | `silu` / `false` | SwiGLU experts, no attention biases (unlike Qwen2) |
+| `max_position_embeddings` | 163840 | model supports far more than we can compile for |
+
+**Corrected attention size:** with `q_lora_rank=None` and `qk_nope_head_dim=128`, per layer
+= q_proj 6.29 M + kv_a 1.18 M + kv_b 2.10 M + o_proj 4.19 M = **13.76 M**, so 27 layers =
+371.5 M params = **0.35 GiB INT8** — not the 0.23 GiB in §6.3 (which assumed a q_a/q_b
+split and a 64-dim nope head). The plan's original 1.80 GiB is therefore ~5× high, not 7.8×.
+
+**Corrected per-token traffic:** attention 0.35 + dense layer 0 MLP 0.06 + 208 active
+experts 1.68 + LM head 0.20 = **2.28 GiB/token**. At 28 GB/s and the calibrated 41–59%
+efficiency band this gives **5.0–7.2 tok/s** (§6.2 said 5.3–7.6; the conclusion and the
+recommended ≥5 tok/s gate are unchanged).
+
+Cross-check: 371.5 M + 67.3 M + 26×66×8.65 M + 209.7 M + 209.7 M = **15.69 B params**, which
+matches the published 15.71 B. The arithmetic is now closed.
+
+**Model download status:** `deepseek-ai/DeepSeek-V2-Lite` is ungated and downloading to
+`deep/models/DeepSeek-V2-Lite/`. The other five planned repos
+(`google/gemma-3-12b-it`, `Rin247/gemma-4-12B-it-Uncensored-Aquarion-INT8`,
+`litert-community/TranslateGemma-4B-IT`, `Sao10K/L3.1-8B-Stheno-v3.3`,
+`huihui-ai/Qwen2.5-7B-Instruct-abliterated`) all return **401 Unauthorized** because the
+host `hf` CLI is **not logged in** — this is an auth problem, not evidence the repos are
+missing. They need `hf auth login` with a token that has accepted each model's licence
+(gemma repos are licence-gated even for valid tokens).
