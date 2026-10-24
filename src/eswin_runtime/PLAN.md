@@ -435,6 +435,40 @@ Development is structured into **11 independently verifiable milestones**:
 - **Documentation**:
   - Direct kernel ioctl specification and firmware mailbox protocol (`docs/DIRECT_KERNEL_IOCTL_SPEC.md`).
 
+### Milestone 12: MoE Router & Expert-Parallel Dispatch (DeepSeek-V2-Lite Phase 2) [COMPLETED]
+- **Implementation Status** (2026-10-24):
+  - `src/llm/moe_router.{hpp,cpp}`: host-side gate GEMM, scoring, top-k selection and
+    per-die dispatch grouping. Semantics come from the verified `DeepSeek-V2-Lite/config.json`
+    (`scoring_func: softmax`, `norm_topk_prob: false`, `topk_method: greedy`,
+    `n_group/topk_group: 1/1`, `routed_scaling_factor: 1.0`, `attention_bias: false`), not
+    from assumption. Sigmoid scoring and `GroupLimitedGreedy` are implemented for the
+    V3 family even though V2-Lite does not use them.
+  - Allocation-free `route()` (all scratch sized in `init()`), OpenMP over experts,
+    deterministic tie-breaking toward the lower expert index (`std::sort` is not stable, so
+    the index is part of the comparator).
+  - Addressing helpers for the "weights as a dynamic input tensor" execution model:
+    `expert_blob_offset(layer, expert, bytes_per_expert)` yields the `DevBuf.offset` for one
+    expert inside **its own die's** blob, so one loadable per layer can run any of 64 experts
+    by changing an offset instead of a model. Offsets are per-die-relative by design, since
+    each die has a separate `DmaBuffer`/`mem_fd`.
+  - `tests/test_moe_router.cpp` added; wired into `Makefile` (`make test`) and
+    `CMakeLists.txt` (`ctest`).
+  - **Verified on `roma`**: 64×2048 gate, top-6 ⇒ **53.4 µs average per layer**, inside the
+    <60 µs target; 1.39 ms/token over 26 MoE layers = **0.87% of a 6.25 tok/s budget**, so
+    routing is confirmed not to be the bottleneck. x86 host measures 47.5 µs. Both show a
+    multi-ms worst-case outlier from scheduler preemption (3.4 ms board / 10.6 ms host),
+    which is the argument for pinning the routing thread in the decode loop.
+  - Differential verification: 200 random tokens matched against an independent
+    double-precision reference written inline in the test (no shared code with the router) on
+    expert set, ordering, weights and argmax. Plus sigmoid/scaling, gate bias, group masking
+    with the degenerate case, per-die offset density and collision checks, repeat-call
+    determinism, and 11 rejected invalid configurations. Clean `riscv64-linux-gnu-` cross-compile.
+  - **Outstanding**: no RVV-vectorised gate kernel (scalar+OpenMP already meets target, so
+    this is optimisation rather than a gap); no golden comparison against HF's exact
+    `DeepseekV2MoE` gating path — the inline reference covers selection semantics but not
+    the library's code. Not yet called from `TransformerSession`; the MoE decode loop itself
+    is DeepSeek-V2-Lite Phase 3/4 work.
+
 ---
 
 ## 6. Coding Standards & Review Guidelines

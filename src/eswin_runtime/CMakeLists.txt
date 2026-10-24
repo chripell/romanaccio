@@ -30,6 +30,7 @@ set(RUNTIME_SOURCES
     src/nlp/tokenizer.cpp
     src/llm/kv_cache.cpp
     src/llm/hardware_kv_cache.cpp
+    src/llm/moe_router.cpp
     src/llm/transformer_session.cpp
     src/api/es_runtime.cpp
 )
@@ -93,6 +94,10 @@ target_link_libraries(test_deepseek_e2e PRIVATE es_runtime ${CMAKE_DL_LIBS} pthr
 add_executable(test_direct_kernel_mode tests/test_direct_kernel_mode.cpp)
 target_link_libraries(test_direct_kernel_mode PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# DeepSeek-V2-Lite Phase 2 MoE Router Test Executable
+add_executable(test_moe_router tests/test_moe_router.cpp)
+target_link_libraries(test_moe_router PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -114,4 +119,5 @@ add_test(NAME test_embedding_loader COMMAND test_embedding_loader)
 add_test(NAME test_hardware_kv_cache COMMAND test_hardware_kv_cache)
 add_test(NAME test_deepseek_e2e COMMAND test_deepseek_e2e)
 add_test(NAME test_direct_kernel_mode COMMAND test_direct_kernel_mode)
+add_test(NAME test_moe_router COMMAND test_moe_router)
 
