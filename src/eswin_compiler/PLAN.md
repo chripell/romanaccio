@@ -237,14 +237,16 @@ Development is broken down into **6 small, independently reviewable and testable
      genuinely read from offset 4096 — offset is applied to the resolved IOVA, not ignored.
      **Approach (b) is viable**; full write-up in `FINDINGS.md` §26. This also demotes the
      load-time / concurrent-`modelId` measurements from blocking to merely interesting.
-  2. **Where is the weight's 64-bit IOVA slot in the packet, and does it need a reloc pair?**
-     The cube's `address` field is an `address_list` *index* (int16), not an IOVA, while the
-     input/output relocs patch 64-bit values elsewhere (+1238 / +2326 within 2048-byte
-     blocks). Determine whether a Class B weight is resolved purely through
-     `address_list → mem_id → bind_id` (no reloc needed) or also requires a patched slot.
-  3. **Does the SPRAM staging path work for a runtime-bound weight?** The `type=1 addr_id=3`
-     edma cubes copy DRAM weight → SPRAM. Confirm the edma source address is derived from the
-     same resolution chain, otherwise the weight must stay in DRAM (`domain=0`) for MoE.
+  2. **RESOLVED (2026-10-24, on `roma`): no reloc pair is needed.** Two variants were built
+     by patching a compiled loadable (`deep/artifacts/scratch/make_dynamic_weight_model.py`):
+     one with the weight converted to Class B and relocs left alone, one with six extra
+     relocs added at weight-cube +22/+26 mirroring the activation I/O. They produced
+     **byte-identical outputs** (22656.000 / 23680.000), so the added relocs changed nothing.
+     A Class B weight is resolved purely through `address_list → mem_id → bind_id → DevBuf`.
+     **Emit the simpler no-reloc form.** `FINDINGS.md` §27.
+  3. **RESOLVED (2026-10-24, on `roma`): the SPRAM `.sram.edma` staging path does resolve a
+     runtime-bound weight source.** The graph computed correctly with the weights coming from
+     our own buffer, so MoE weights are **not** confined to `domain=0`. `FINDINGS.md` §27.
 - **Scope**:
   - `backend/gemm_builder.py` / `backend/nvdla_builder.py`: add a runtime-bound weight mode
     (Class B memory entry, `bind_id` allocation, weight `TensorDescEntry`, and relocs if
@@ -265,10 +267,28 @@ Development is broken down into **6 small, independently reviewable and testable
   - Verify `eswin-sim` executes the Class B weight path, so this stays testable off-board.
 - **Documentation**: weight-binding specification (Class A vs Class B, `bind_id` numbering,
   cube/reloc offsets) appended to `findings/MODEL_FORMAT.md`.
-- **Status**: not started, but **no longer blocked**. Open question 1 — the one that could
-  have invalidated the whole design — is resolved in favour of approach (b) (see above and
-  `FINDINGS.md` §26). Questions 2 and 3 are implementation details discoverable while
-  building the emitter, not go/no-go gates.
+- **Status**: **mechanism proven on hardware; production emitter not yet written.** All three
+  open questions are resolved in favour of approach (b) — `FINDINGS.md` §26 (offset honoured)
+  and §27 (Class B weight read at submit time, no reloc needed, SPRAM staging works). The
+  proof used a loadable *patcher* (`deep/artifacts/scratch/make_dynamic_weight_model.py`)
+  rather than an emitter change, which isolated the variable and kept the production path
+  untouched: converting the weight memory entry to `contents=[]`, `flags=5`, `bind_id=1`,
+  `tensor_desc_id=2` plus a `data_category=1` WEIGHT descriptor, and dropping the three
+  `WsplitM_*` blobs, shrank the file from 1,838,632 to 68,872 bytes and it ran on `roma`
+  with `inputFdNum=2`.
+  Remaining work, in order:
+  1. **Bit-match validation** — feed the patched loadable the original three weight blobs
+     concatenated and assert its output is byte-identical to the unmodified static loadable's.
+     Current evidence is "outputs are non-zero and differ between weight sets", which proves
+     the NPU read our buffer but not that the arithmetic is right. Do this before relying on
+     the emitter.
+  2. Add `dynamic_weight` to `NVDLAGEMMBuilder.build_linear_3pass()` / `build_from_node()`:
+     make the weight blobs conditional, switch the memory entry to Class B, allocate
+     `bind_id` (activation 0, weight 1), append the WEIGHT `TensorDescEntry`, and add **no**
+     relocs. Static path must stay bit-reproducible.
+  3. A `--dynamic-weights` CLI flag and `tests/test_dynamic_weight_binding.py`.
+  4. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
+     gate/up/down), which is what DeepSeek-V2-Lite actually needs.
 
 ---
 

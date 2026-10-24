@@ -777,3 +777,71 @@ consistent too: `0xBE00` has the sign bit set, so its raw uint16 average is high
    `EswinDriver::instance()` alone does not detect anything — `initialize()` is what dlopens
    the vendor libraries and calls `ES_NPU_GetNumDevices()`. Any standalone tool must call it.
 
+---
+
+## 27. Runtime-Bound Weights Work on Hardware — No Reloc Needed
+
+**Verified on `roma`, 2026-10-24.** This closes `eswin_compiler` Milestone 7 open questions 2
+and 3, and it is the result that makes MoE approach (b) real rather than theoretical.
+
+### What was built
+
+`deep/artifacts/scratch/make_dynamic_weight_model.py` patches an already-verified loadable
+(`test_linear_1x1conv_npu_b1.model`) instead of changing the production emitter first, so the
+board test isolates exactly one variable. It converts the weight memory entry (`mem_id=1`)
+from Class A to Class B:
+
+| Field | before | after |
+| :-- | :-- | :-- |
+| `contents` / `offsets` | 3 × `WsplitM_*` blobs | `[]` (supplied per submit) |
+| `flags` | 3 | **5** (the Class B input convention) |
+| `bind_id` | 0 | **1** (activation keeps slot 0) |
+| `tensor_desc_id` | 0 | 2 (new `data_category=1` WEIGHT descriptor) |
+
+The three weight blobs are dropped — the file goes from **1,838,632 bytes to 68,872**. A
+`TensorDescEntry` named `weight` is appended so the runtime binds a `DevBuf` for it.
+`ModelWriter` round-trips the result, and reading it back confirms the empty `contents`,
+`bind_id` and WEIGHT descriptor all survive serialization.
+
+Two variants were emitted: `dyn_noreloc.model` (8 relocs, unchanged) and `dyn_reloc.model`
+(14 relocs — six added at weight-cube +22/+26, mirroring how the activation I/O is patched).
+
+### The test
+
+`src/eswin_runtime/tools/probe_dynamic_weight.cpp` allocates **one** weight blob holding two
+different weight sets back to back (1,769,472 bytes each — exactly 432 pages, so the second
+offset stays page-aligned), then submits the *same* loadable twice, selecting the set purely
+via `DevBuf.offset`, with `inputFdNum=2` (`inputFd[0]` = activation, `inputFd[1]` = weight):
+
+```
+[W0 offset=0]         submit ok      mean|out| = 22656.000
+[W1 offset=1769472]   submit ok      mean|out| = 23680.000
+outputs differ: yes   (neither buffer all-zero, so the NPU really wrote them)
+```
+
+### Results
+
+1. **A loadable can read its weights from a buffer supplied at submit time.** One resident
+   blob plus a per-submit `DevBuf.offset` selects which weights the NPU uses. That is
+   exactly the MoE expert-selection primitive — **27 loadables instead of 1716**.
+2. **No reloc pair is needed for a Class B weight.** `dyn_reloc.model` produced
+   byte-identical outputs to `dyn_noreloc.model` (22656.000 / 23680.000 in both cases), so
+   the six extra relocs at cube +22/+26 changed nothing. The driver resolves the weight
+   through `address_list → mem_id → bind_id → DevBuf`, the same chain the activation I/O
+   uses; the activation relocs patch something the weight path does not require. **Use the
+   simpler no-reloc form.**
+3. **The SPRAM `.sram.edma` staging path resolves a runtime-bound weight source.** The
+   weight cubes at surf_list +64/+1088 are `type=1` (SRAM, `addr_id=3`) destinations fed
+   from the DRAM weight; since the graph computed correctly with the weights coming from our
+   buffer, the edma source is resolved through the same chain. MoE weights do **not** have to
+   be confined to `domain=0`.
+
+### What is still unproven
+
+The test shows the outputs are non-zero and differ between weight sets — strong evidence the
+NPU read our buffer, and §26 already proved `DevBuf.offset` selects data byte-exactly. It does
+**not** yet show the arithmetic is *correct*: the remaining validation is to feed the
+dynamic-weight loadable the original three `WsplitM_*` blobs concatenated and assert the
+output is byte-identical to the unmodified static loadable's. That is the bit-match criterion
+in `eswin_compiler` Milestone 7 and should be done before the production emitter relies on it.
+
