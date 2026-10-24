@@ -836,12 +836,35 @@ outputs differ: yes   (neither buffer all-zero, so the NPU really wrote them)
    buffer, the edma source is resolved through the same chain. MoE weights do **not** have to
    be confined to `domain=0`.
 
-### What is still unproven
+### Bit-exact confirmation
 
-The test shows the outputs are non-zero and differ between weight sets — strong evidence the
-NPU read our buffer, and §26 already proved `DevBuf.offset` selects data byte-exactly. It does
-**not** yet show the arithmetic is *correct*: the remaining validation is to feed the
-dynamic-weight loadable the original three `WsplitM_*` blobs concatenated and assert the
-output is byte-identical to the unmodified static loadable's. That is the bit-match criterion
-in `eswin_compiler` Milestone 7 and should be done before the production emitter relies on it.
+The test above shows outputs are non-zero and differ between weight sets — strong evidence the
+NPU read our buffer, but "outputs differ" is also what garbage looks like. So the arithmetic
+was verified separately with `src/eswin_runtime/tools/probe_weight_bitmatch.cpp`:
+
+- The original three `WsplitM_*` blobs were extracted and concatenated in exactly the layout
+  the Class A memory entry declared (`WsplitM_0_0` @0, `WsplitM_1_1` @589824,
+  `WsplitM_2_2` @1179648 = 1,769,472 bytes) and loaded into a DMA blob.
+- The **unmodified static** loadable (weights baked in, `inputFdNum=1`) and the **Class B**
+  loadable (weight blobs deleted, weight supplied at submit as `inputFd[1]`, `inputFdNum=2`)
+  were run against the same varied deterministic activation — six distinct fp16 values
+  cycling, so the GEMM is genuinely exercised rather than multiplying a constant by a
+  constant. Models were loaded one at a time so a mismatch could not be blamed on two
+  resident models.
+
+```
+mean|static | = 35379.1686
+mean|dynamic| = 35379.1686
+byte-identical over 3072 bytes: YES
+```
+
+**A runtime-bound weight reproduces the baked-in blob result bit-for-bit.** Combined with §26
+(`DevBuf.offset` selects data byte-exactly) this means the full MoE primitive is validated on
+silicon: one loadable per layer, one resident expert blob per die, expert selection by
+offset, numerically identical to compiling each expert separately. The `eswin_compiler`
+Milestone 7 emitter change is safe to build on.
+
+Note this validates the *binding*, not the 3-pass GEMM template's numerics in general — the
+static loadable is the reference, so any pre-existing error in it is common to both sides and
+cancels out of the comparison. That is exactly what this test needs to establish.
 

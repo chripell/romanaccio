@@ -276,19 +276,26 @@ Development is broken down into **6 small, independently reviewable and testable
   `tensor_desc_id=2` plus a `data_category=1` WEIGHT descriptor, and dropping the three
   `WsplitM_*` blobs, shrank the file from 1,838,632 to 68,872 bytes and it ran on `roma`
   with `inputFdNum=2`.
+  **Bit-match validation: DONE (2026-10-24, on `roma`).** `probe_weight_bitmatch.cpp` fed the
+  Class B loadable the original three `WsplitM_*` blobs concatenated in the layout the Class A
+  entry declared, and ran it against the unmodified static loadable with the same varied
+  deterministic activation. Output is **byte-identical over all 3072 bytes**
+  (`mean|static| = mean|dynamic| = 35379.1686`). So the binding is not merely read, it is
+  *faithful* — the earlier "outputs differ" evidence is now upgraded to bit-exact equality,
+  and the emitter change is safe to build on. `FINDINGS.md` §27.
+
   Remaining work, in order:
-  1. **Bit-match validation** — feed the patched loadable the original three weight blobs
-     concatenated and assert its output is byte-identical to the unmodified static loadable's.
-     Current evidence is "outputs are non-zero and differ between weight sets", which proves
-     the NPU read our buffer but not that the arithmetic is right. Do this before relying on
-     the emitter.
-  2. Add `dynamic_weight` to `NVDLAGEMMBuilder.build_linear_3pass()` / `build_from_node()`:
+  1. Add `dynamic_weight` to `NVDLAGEMMBuilder.build_linear_3pass()` / `build_from_node()`:
      make the weight blobs conditional, switch the memory entry to Class B, allocate
      `bind_id` (activation 0, weight 1), append the WEIGHT `TensorDescEntry`, and add **no**
-     relocs. Static path must stay bit-reproducible.
-  3. A `--dynamic-weights` CLI flag and `tests/test_dynamic_weight_binding.py`.
-  4. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
-     gate/up/down), which is what DeepSeek-V2-Lite actually needs.
+     relocs. Static path must stay bit-reproducible. The patcher
+     (`make_dynamic_weight_model.py`) is a working reference for every field value.
+  2. A `--dynamic-weights` CLI flag and `tests/test_dynamic_weight_binding.py`. The test
+     should assert the emitted structures off-board (Class B entry, `bind_id`, WEIGHT
+     descriptor, no weight blobs, no weight relocs) and re-run the bit-match on `roma`.
+  3. Generalise beyond the 3-pass GEMM template to the expert-FFN archetype (SwiGLU
+     gate/up/down), which is what DeepSeek-V2-Lite actually needs — 2048→1408→2048, three
+     runtime-bound weight tensors per expert rather than one.
 
 ---
 
