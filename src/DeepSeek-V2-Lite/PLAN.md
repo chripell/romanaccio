@@ -473,3 +473,60 @@ inline double-precision reference covers selection semantics but not HF's exact
 the `rpg_uncensored` and `gemma-4-12B` plans need to be re-checked — note `gemma-4` is not a
 model family that exists, and the plan's own parameter table matches Gemma **3**.
 `deepseek-ai/DeepSeek-V2-Lite` is ungated and downloading normally.
+
+---
+
+## 6.11 Phase 0 result: EsAAC rejects dynamic weight inputs (2026-10-24) — approach (b) is closed via the vendor compiler
+
+§6.4's decisive experiment was run. **Result: approach (b) is not reachable through
+`EsAAC`, so the 27-loadable design needs the open compiler, not the vendor one.**
+
+Probe (`deep/artifacts/scratch/probe_dynamic_weight.py`, opset 13, static shapes, per the
+EsAAC constraints): one `MatMul` `[1,2048] × [2048,1408]`, emitted twice — weight as an
+initializer (11.5 MB ONNX) and weight as a second graph input (131 bytes ONNX, no embedded
+weights).
+
+| Probe | EsAAC result |
+| :--- | :--- |
+| `MatMul`, W as **initializer** | **compiles in 1.3 s** ✅ |
+| `MatMul`, W as **graph input** | **SIGSEGV, exit 139, core dumped**, no `.model` |
+| same + `--fix-shape` | SIGSEGV |
+| same + `--batchsize=1` | SIGSEGV |
+| same + both flags | SIGSEGV |
+| `Add` with **two dynamic inputs** (control) | SIGSEGV |
+
+The control matters: the crash is not specific to MatMul weights. `EsAAC`'s frontend
+segfaults on a graph with a **second dynamic input** at all, and no flag combination tested
+changes that. The identical graph with the weight folded in as an initializer compiles
+cleanly, so the shapes and the op are fine — the second runtime input is the trigger.
+
+**Why this is not proof that dynamic weights are impossible.** Vendor packages demonstrably
+contain multi-input loadables: the Qwen2-0.5B block inspected in §6.5 has **four** input
+tensors (hidden, token step, V cache, K cache). The difference is that those extra inputs
+are the KV-cache pair, which is produced by the LLM-specific flags (`--kv-cache-len`,
+`--kv-layers-desc`). The evidence therefore says EsAAC's multi-input support is tied to its
+LLM KV-cache path, not that the loadable format cannot express a runtime-bound weight.
+
+**Consequences for the plan:**
+
+1. **Approach (b) moves to `eswin_compiler`.** Our open compiler emits loadables directly
+   (`schema/loadable.fbs`, `backend/flatbuffer_emitter.py`) and is not bound by EsAAC's
+   frontend. Emitting the expert weight as a `tensor_desc_list` entry with a `reloc_list`
+   binding — rather than as a blob — is the mechanism, and it is exactly what
+   `MoERouter::expert_blob_offset()` was written to feed (`DevBuf.offset`). This becomes the
+   highest-value compiler work item, and it needs its own milestone in
+   `src/eswin_compiler/PLAN.md`.
+2. **Approach (a) is the fallback and is now on the critical path.** If the open compiler
+   cannot bind a weight at submit time, we are back to 1716 per-expert loadables, which
+   makes the §6.4 load-time and concurrent-`modelId` measurements mandatory rather than
+   optional. Those are still unrun.
+3. **Verify before building on this.** The probe used a bare `MatMul`. Before concluding
+   anything about the *runtime* (as opposed to the compiler frontend), inspect a
+   vendor-compiled multi-input loadable and confirm whether its non-activation inputs are
+   `tensor_desc_list` entries with relocations or blobs. An attempt to retrieve the
+   compiled static probe failed (0-byte transfer — the output path was wrong, EsAAC's
+   naming was not confirmed), so **this inspection is outstanding**.
+
+**Not run:** the load-time / concurrent-`modelId` / per-submit-overhead measurements
+(§6.4 items 2 and 3). Per-submit overhead remains the other open risk: ~318 submits per
+token means anything above ~0.3 ms caps throughput below 10 tok/s regardless of bandwidth.
