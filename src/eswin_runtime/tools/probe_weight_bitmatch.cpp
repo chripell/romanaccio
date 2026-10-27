@@ -33,9 +33,17 @@ using namespace eswin;
 
 namespace {
 
-constexpr size_t kInSize = 1152;         // 576 x fp16
-constexpr size_t kOutSize = 3072;        // 1536 x fp16
-constexpr size_t kWeightSize = 1769472;  // 3 x 589824
+// Geometry of the loadable under test. These default to the 1536x576 3-pass GEMM
+// reference, but are overridable from argv (see main) so the same probe validates any
+// Class B conversion — notably the 576 -> 1536 -> 576 SwiGLU expert FFN, whose single
+// weight region is 5,308,416 bytes and whose activation is 1152 in / 1152 out.
+//
+// Deliberately mutable file-scope values rather than per-function parameters: every
+// existing use below then reads the resolved geometry with no further plumbing, which
+// keeps this probe auditable. Not a pattern for the library itself.
+static size_t kInSize = 1152;         // 576 x fp16
+static size_t kOutSize = 3072;        // 1536 x fp16
+static size_t kWeightSize = 1769472;  // 3 x 589824
 
 struct Buf {
     uint64_t fd = 0;
@@ -139,12 +147,45 @@ double mean_u16(const void *p, size_t bytes) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        std::printf("usage: %s <static.model> <dynamic.model> <weights.bin>\n", argv[0]);
+        std::printf("usage: %s <static.model> <dynamic.model> <weights.bin> "
+                    "[in_bytes out_bytes weight_bytes]\n"
+                    "  sizes default to the 1536x576 3-pass GEMM reference; pass them "
+                    "explicitly for other loadables\n"
+                    "  (SwiGLU expert FFN: 1152 1152 5308416)\n", argv[0]);
         return 1;
     }
     const char *static_model = argv[1];
     const char *dynamic_model = argv[2];
     const char *weights_bin = argv[3];
+
+    // Optional geometry override. All three must be supplied together to avoid silently
+    // mixing a GEMM default with one overridden value.
+    if (argc > 4) {
+        if (argc != 7) {
+            std::printf("FAIL: expected 3 sizes (in out weight), got %d extra arg(s)\n",
+                        argc - 4);
+            return 1;
+        }
+        const size_t in_b = std::strtoull(argv[4], nullptr, 10);
+        const size_t out_b = std::strtoull(argv[5], nullptr, 10);
+        const size_t w_b = std::strtoull(argv[6], nullptr, 10);
+        if (in_b == 0 || out_b == 0 || w_b == 0) {
+            std::printf("FAIL: sizes must all be non-zero (got %zu %zu %zu)\n",
+                        in_b, out_b, w_b);
+            return 1;
+        }
+        // A weight region that is not page-aligned cannot be selected by DevBuf.offset
+        // without re-testing alignment assumptions, so refuse rather than mis-measure.
+        if (w_b % 4096 != 0) {
+            std::printf("FAIL: weight size %zu is not 4096-byte aligned\n", w_b);
+            return 1;
+        }
+        kInSize = in_b;
+        kOutSize = out_b;
+        kWeightSize = w_b;
+        std::printf("geometry override: in=%zu out=%zu weight=%zu\n",
+                    kInSize, kOutSize, kWeightSize);
+    }
 
     EswinDriver &drv = EswinDriver::instance();
     if (!drv.initialize()) { std::printf("SKIP: no NPU hardware\n"); return 2; }

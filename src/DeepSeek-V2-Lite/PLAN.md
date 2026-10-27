@@ -342,12 +342,18 @@ concurrently loaded `modelId`s is unknown. This must be measured, not assumed.
       2026-10-24 in favour of (b)**: `EsAAC` segfaults on any second dynamic graph input,
       but the `.model` *format* supports runtime-bound tensors and the driver honours
       `DevBuf.offset` bit-exactly (§6.11, §6.12, FINDINGS §25–§27).
-- [ ] Measure `ES_NPU_LoadModelFromFile` time and concurrent-`modelId` limits on `roma`.
-      **Demoted, no longer gating** — approach (b) avoids the 1716-loadable path entirely,
-      so this is now optional diligence rather than a decision input.
-- [ ] Measure per-submit overhead for one expert FFN (100 submits). **Still the live
-      risk**: ~318 submits/token means anything above ~0.3 ms each caps throughput under
-      10 tok/s regardless of bandwidth.
+- [x] Measure `ES_NPU_LoadModelFromFile` time and concurrent-`modelId` limits on `roma`.
+      **Measured 2026-10-27: 104–214 ms per model load** for a 5.3 MB FFN, so approach (a)
+      means ~180–370 s of startup — ruled out by measurement, not by taste. **≥40 models
+      load concurrently with no saturation**, so a hybrid (resident loadables for hot
+      experts, runtime-bound weights for the tail) remains available. `FINDINGS.md` §28.
+- [x] Measure per-submit overhead for one expert FFN (100 submits). **2026-10-27:
+      0.233–0.305 ms/submit** (p95 0.246–0.332, one 0.874 ms outlier) on a small
+      576→1536→576 graph, i.e. a 318-submit/token ceiling of **10.3–13.5 tok/s**. Bandwidth
+      (§24: 5.0–7.2 tok/s) still binds, so the Phase 0 gate is **not** tripped — but the
+      margin is only ~1.4–1.9×, so batching experts into fewer larger graphs is worth
+      design effort. Treat these as a lower bound: V2-Lite experts are 2048→1408→2048 and
+      will cost more per submit.
 - [x] Read the real `config.json`: `first_k_dense_replace=1`, `n_routed_experts=64`,
       `n_shared_experts=2`, `num_experts_per_tok=6`, `norm_topk_prob=false`,
       `scoring_func=softmax`, `topk_method=greedy` (`n_group`/`topk_group`=1, so group

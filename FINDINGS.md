@@ -868,3 +868,60 @@ Note this validates the *binding*, not the 3-pass GEMM template's numerics in ge
 static loadable is the reference, so any pre-existing error in it is common to both sides and
 cancels out of the comparison. That is exactly what this test needs to establish.
 
+---
+
+## 28. SwiGLU FFN Bit-Exact, and Measured Submit/Load Cost
+
+**On `roma`, 2026-10-27.** Closes the last two open items from `eswin_compiler` Milestone 7
+and DeepSeek-V2-Lite Phase 0.
+
+### 28.1 The multi-weight FFN conversion is bit-exact
+
+§27 proved a single weight region. The FFN case now confirms it with
+`eswin_compiler/backend/dynamic_weight_binding.py` converting the **vendor**
+`test_swiglu_mlp_npu_b1.model` (one 5,308,416-byte region holding all nine gate/up/down
+slices):
+
+```
+geometry override: in=1152 out=1152 weight=5308416
+[static]  model_id=0 inputFdNum=1 submit ok
+[dynamic] model_id=1 inputFdNum=2 submit ok
+mean|static |=26572.0660  mean|dynamic|=26572.0660
+byte-identical over 1152 bytes: YES
+```
+
+So the conclusion generalises past one weight region, and `inputFdNum=2` with the weight at
+`bind_id=1` is how a caller must submit. `tools/probe_weight_bitmatch.cpp` now takes geometry
+as optional argv instead of hardcoding GEMM sizes, and refuses a weight size that is not
+4096-byte aligned, since unaligned would silently retest an assumption the method relies on.
+
+### 28.2 Per-submit cost straddles the 10 tok/s budget
+
+`tools/probe_submit_overhead.cpp`, one small FFN, two runs:
+
+| run | mean | p50 | p95 | max |
+| :-- | :-- | :-- | :-- | :-- |
+| 200 iters | **0.233 ms** | 0.232 | 0.246 | 0.24 |
+| 400 iters | **0.305 ms** | 0.298 | 0.332 | 0.874 |
+
+At 318 submits/token that is a **10.3–13.5 tok/s ceiling** against the 0.314 ms/submit budget
+line for 10 tok/s. Submission is therefore *not* the binding constraint — §24's bandwidth
+figure of 5.0–7.2 tok/s still dominates — but the margin is only ~1.4–1.9×, not comfortable.
+So per-expert-per-layer submission is viable, yet **batching experts into fewer larger graphs
+earns real design attention**: at ~0.3 ms/submit, submission consumes roughly half the
+per-token budget. The 0.233→0.305 spread and the 0.87 ms outlier mean this must be measured
+on the target geometry rather than reasoned about from one sample.
+
+**Caveat:** wall time around `submit_task()` on a *small* 576→1536→576 graph, so it includes
+that graph's execution and driver completion wait. V2-Lite experts are 2048→1408→2048 and
+will cost more per submit; treat these as a lower bound on driver overhead only.
+
+### 28.3 Load cost rules out approach (a) by measurement
+
+`ES_NPU_LoadModelFromFile` took **104–214 ms** for this 5.3 MB model. Approach (a) means 1716
+loadables → **~180–370 s startup**, which is precisely the number §6.4 said to measure before
+committing. It is measured now, and it rules (a) out rather than merely disliking it.
+
+**≥40 models load concurrently with no saturation**, so a hybrid — resident loadables for hot
+experts, runtime-bound weights for the tail — is available if blob capacity ever binds.
+

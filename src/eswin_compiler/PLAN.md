@@ -347,7 +347,17 @@ Development is broken down into **6 small, independently reviewable and testable
   multi-blob-region conversion as structurally sound but numerically unconfirmed.
 
   Remaining work, in order:
-  1. Board bit-match for the SwiGLU conversion (generalise `probe_weight_bitmatch.cpp`).
+  1. ~~Board bit-match for the SwiGLU conversion~~ **DONE (2026-10-27, on `roma`).**
+     `probe_weight_bitmatch.cpp` now takes geometry as optional argv (and rejects a
+     non-4096-aligned weight size); the converted vendor FFN is byte-identical to the static
+     one over all 1152 output bytes, so the converter is hardware-proven for a multi-blob
+     weight region and the 1716-loadable path is closed off. `FINDINGS.md` §28.
+  1b. Measured alongside it with `tools/probe_submit_overhead.cpp`: **0.233–0.305 ms/submit**
+     and **104–214 ms/model load** on a small FFN. At 318 submits/token that is a
+     10.3–13.5 tok/s ceiling — not the binding constraint (§24's 5.0–7.2 tok/s bandwidth
+     dominates), but only ~1.4–1.9× margin, so batching experts into fewer larger graphs is
+     worth real design effort. Load cost also rules out approach (a) by measurement
+     (~180–370 s startup), and ≥40 concurrent loaded models showed no saturation.
   2. Expose the converter through the CLI for pre-compiled loadables (`--convert-weights`),
      since it operates on vendor `.model` files that never pass through our emitter.
   3. Extend `--dynamic-weights` to the 2D conv emitter, or lower spatial convs through the
