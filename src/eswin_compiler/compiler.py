@@ -80,6 +80,9 @@ class CompilerConfig:
     batch_size: int = 1
     vocab_split_threshold: int = 2048     # Output channel threshold for dual-die tensor split
     dynamic_weights: bool = False         # Emit weights as runtime-bound (Class B) tensors
+    # The emitter handles exactly one operation per loadable. Without this flag a graph
+    # with more nodes is rejected instead of silently emitting a partial loadable.
+    allow_partial_graph: bool = False
 
 
 class EswinCompiler:
@@ -265,6 +268,27 @@ class EswinCompiler:
             raise ValueError(f"Graph '{graph.name}' contains no CONV nodes for NPU execution.")
 
         primary_conv = conv_nodes[0]
+
+        # The emitters consume exactly one CONV node, so every other node is silently
+        # discarded. Measured on the synthesised graphs: a SwiGLU block is 3 CONV + 1 MUL
+        # and an attention block is 5 CONV + RMSNorm + RoPE + Softmax, so each would emit a
+        # valid loadable holding ONE convolution while the success log named it that block.
+        # Refuse by default; allow_partial_graph keeps the old behaviour reachable but loud.
+        dropped = [n for n in graph.nodes if n is not primary_conv]
+        if dropped:
+            ops = ", ".join(sorted(str(n.op_type.name) for n in dropped))
+            detail = (f"{len(dropped)} of {len(graph.nodes)} node(s) would be dropped "
+                      f"({ops}); only the first CONV is emitted")
+            if not self.config.allow_partial_graph:
+                raise ValueError(
+                    f"Graph '{graph.name}': this emitter handles one operation per "
+                    f"loadable, but {detail}. Emitting anyway would produce a loadable "
+                    "that is not this block. Set CompilerConfig.allow_partial_graph=True "
+                    "(CLI: --allow-partial-graph) to accept a partial loadable knowingly."
+                )
+            logger.warning("Graph '%s': %s -- emitting a PARTIAL loadable "
+                           "(--allow-partial-graph).", graph.name, detail)
+
         if self.config.dynamic_weights:
             # Runtime-bound (Class B) weights are implemented in the 1x1 GEMM emitter,
             # which is what LLM projections lower to via GemmToConv1x1Pass. The 2D conv
@@ -465,6 +489,17 @@ def main():
             "this explicitly when the auto-detection is wrong or ambiguous."
         )
     )
+    parser.add_argument(
+        "--allow-partial-graph",
+        action="store_true",
+        help=(
+            "Emit a loadable for only the first operation of a multi-node graph. Off by "
+            "default: the emitters handle one CONV per loadable, so a SwiGLU (3 CONV) or "
+            "attention (5 CONV + RMSNorm/RoPE/Softmax) graph would otherwise produce a "
+            "valid-looking but incomplete loadable that the success log names after the "
+            "block it is not. Prefer splitting such graphs into one loadable per op."
+        )
+    )
 
     args = parser.parse_args()
     model_path = Path(args.model)
@@ -478,7 +513,8 @@ def main():
         opt_level=args.opt_level,
         dtype=args.precision,
         batch_size=args.batch_size,
-        dynamic_weights=args.dynamic_weights
+        dynamic_weights=args.dynamic_weights,
+        allow_partial_graph=args.allow_partial_graph
     )
     compiler = EswinCompiler(config=cfg)
 

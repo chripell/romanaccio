@@ -303,6 +303,15 @@ During implementation of Milestone 4:
 > against PyTorch should be treated as untested until this is fixed — assert on node count
 > rather than trusting the success log.
 >
+> **Status: guarded the same day.** Measured after lowering: MLP = 3 CONV + 1 MUL (3 of 4
+> nodes dropped) and attention = 5 CONV + RMSNorm + RoPE + Softmax (7 of 8 dropped). A graph
+> whose nodes cannot all be emitted now raises before writing anything;
+> `--allow-partial-graph` keeps the old path reachable but logs `PARTIAL`. Three tests that
+> had been passing against truncated loadables were made to opt in explicitly — including
+> `test_compiled_swiglu_mlp_execution`, which ran one convolution through the simulator and
+> called it a SwiGLU block. That is the mechanism by which this survived. Multi-op emission
+> is still unbuilt; the guard prevents the gap from being mistaken for coverage.
+>
 > The practical consequence: this block was reachable as the *conversion* target for
 > runtime-bound weights (§27, §28) precisely because a vendor loadable of it exists — not
 > because we can compile one.

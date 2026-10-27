@@ -48,7 +48,13 @@ class TestCompilerPipeline(unittest.TestCase):
         # Output dir
         out_dir = self.temp_path / "output_dual_die"
 
-        cfg = CompilerConfig(target="dual-die", opt_level=2, dtype="float16", batch_size=1)
+        # allow_partial_graph: the emitter is single-operation, so a synthesized SwiGLU or
+        # attention block compiles to a loadable holding only the first CONV. This test
+        # asserts the LLM path emits its expected file set (naming, count, valid FlatBuffers,
+        # dual-die LM-head sizes), NOT block-level numerical correctness. The guard that
+        # rejects such graphs by default is tested in test_partial_graph_guard.py.
+        cfg = CompilerConfig(target="dual-die", opt_level=2, dtype="float16", batch_size=1,
+                             allow_partial_graph=True)
         compiler = EswinCompiler(config=cfg)
 
         # Compile first 2 layers

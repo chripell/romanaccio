@@ -63,7 +63,12 @@ class TestCompilerSimulatorIntegration(unittest.TestCase):
             json.dump(config, f)
 
         out_dir = self.temp_path / "out"
-        cfg = CompilerConfig(target="dual-die", opt_level=2, dtype="float16", batch_size=1)
+        # allow_partial_graph: the emitter is single-operation, so a synthesized SwiGLU or
+        # attention block compiles to a loadable holding only the first CONV. These tests
+        # exercise emission + simulator plumbing, NOT block-level numerical correctness.
+        # See tests/test_partial_graph_guard.py for the guard that rejects them by default.
+        cfg = CompilerConfig(target="dual-die", opt_level=2, dtype="float16", batch_size=1,
+                             allow_partial_graph=True)
         compiler = EswinCompiler(config=cfg)
 
         emitted_models = compiler.compile_safetensors_llm(
@@ -140,7 +145,12 @@ class TestCompilerSimulatorIntegration(unittest.TestCase):
             json.dump(config, f)
 
         out_dir = self.temp_path / "out2"
-        cfg = CompilerConfig(target="dual-die", opt_level=2, dtype="float16", batch_size=1)
+        # allow_partial_graph: the emitter is single-operation, so a synthesized SwiGLU or
+        # attention block compiles to a loadable holding only the first CONV. These tests
+        # exercise emission + simulator plumbing, NOT block-level numerical correctness.
+        # See tests/test_partial_graph_guard.py for the guard that rejects them by default.
+        cfg = CompilerConfig(target="dual-die", opt_level=2, dtype="float16", batch_size=1,
+                             allow_partial_graph=True)
         compiler = EswinCompiler(config=cfg)
 
         compiler.compile_safetensors_llm(

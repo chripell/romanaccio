@@ -370,16 +370,26 @@ Development is broken down into **6 small, independently reviewable and testable
      `dep_graph`/`op_list`/`surf_list` templates. Note this means FINDINGS §15's "complete
      SwiGLU MLP compilation capability" describes the *passes* (SDP fusion, LUT generation,
      SPRAM tiling), not a from-scratch emitter — corrected there on 2026-10-27.
-  6. **Fix the silent single-op truncation (found 2026-10-27, highest priority of the
-     emitter items because it is a correctness bug, not a missing feature).**
-     `_compile_single_layer()` uses `primary_conv = conv_nodes[0]` and ignores every other
-     node, yet `compile_safetensors_llm()` feeds it real multi-node `mlp_graph`/`attn_graph`
-     objects and logs `Emitted loadable: ..._mlp_l0...` on success. The result is a valid
-     one-convolution loadable silently standing in for a SwiGLU block or an attention block.
-     Cheapest correct stopgap: raise (or loudly warn) when `len(conv_nodes) > 1` until
-     multi-op emission exists, and add a test asserting node count rather than trusting the
-     success log. Until then, treat any numeric comparison of a *synthesized* MLP/attention
-     loadable against PyTorch as unverified.
+  6. **Silent single-op truncation: FIXED (2026-10-27).** `_compile_single_layer()` took
+     `primary_conv = conv_nodes[0]` and discarded the rest, while `compile_safetensors_llm()`
+     fed it real multi-node graphs and logged success — so a SwiGLU or attention "loadable"
+     contained exactly one convolution. Measured node counts after lowering: **MLP = 3 CONV +
+     1 MUL** (3 of 4 dropped) and **attention = 5 CONV + RMSNorm + RoPE + Softmax** (7 of 8
+     dropped).
+     Now guarded: any graph whose nodes would not all be emitted raises a `ValueError` naming
+     the dropped count and op types, before anything is written. `allow_partial_graph`
+     (CLI `--allow-partial-graph`) keeps the old behaviour reachable but logs a `PARTIAL`
+     warning, so nothing is silent either way. Covered by
+     `tests/test_partial_graph_guard.py` (9 tests): measured node counts asserted as
+     regression evidence, rejection for MLP and attention, **no artifact written on
+     rejection**, opt-in emits and warns, a genuine single-CONV graph still compiles (no
+     false positive), and `--dynamic-weights` cannot smuggle a multi-op graph past the guard.
+     Three existing tests that had been encoding the buggy behaviour now opt in explicitly
+     with a comment stating they verify emission/simulator plumbing, not block correctness —
+     notably `test_compiled_swiglu_mlp_execution` previously passed against a truncated
+     loadable, which is precisely how this survived.
+     Multi-op emission itself is still unbuilt (item 5); the guard only stops it from being
+     mistaken for something that works.
 
 ---
 
