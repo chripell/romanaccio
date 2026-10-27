@@ -277,7 +277,10 @@ class EswinCompiler:
                     f"{w_shape}; the 2D conv emitter does not support runtime-bound "
                     "weights yet."
                 )
-            from backend.gemm_builder import NVDLAGEMMBuilder
+            try:
+                from backend.gemm_builder import NVDLAGEMMBuilder
+            except ImportError:  # package-relative execution
+                from .backend.gemm_builder import NVDLAGEMMBuilder
             model = NVDLAGEMMBuilder.build_from_node(
                 primary_conv, model_name=graph.name, dynamic_weight=True)
             logger.info(
