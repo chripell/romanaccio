@@ -123,7 +123,10 @@ With the board configured for **27.0 GiB total NPU MMZ** (13.5 GiB on Die 0, 13.
 ## 5. Phased Implementation Roadmap
 
 ### Phase 1: Architecture Ingestion & Sub-Model Decomposition (Milestone 1–2)
-- [ ] Ingest `deepseek-ai/DeepSeek-V2-Lite` weights and config from Hugging Face.
+- [x] Ingest `deepseek-ai/DeepSeek-V2-Lite` weights and config from Hugging Face.
+      *(2026-10-24: 4/4 shards, 31,412,968,448 bytes, verified against
+      `model.safetensors.index.json`; `deep/models/DeepSeek-V2-Lite/`. Note
+      `torch_dtype` is **bfloat16**, not fp16 — see §6.9.)*
 - [ ] Export ONNX subgraphs:
   - `mla_block_layer_N.onnx`: Layer norm + MLA latent projection + attention score.
   - `shared_expert_layer_N.onnx`: 2 shared FFN blocks.
@@ -133,11 +136,24 @@ With the board configured for **27.0 GiB total NPU MMZ** (13.5 GiB on Die 0, 13.
 - [ ] Compile `.model` blocks using `EsAAC` / `eswin_compiler`.
 
 ### Phase 2: Host Router & Dynamic Expert Dispatcher in C++ (Milestone 3)
-- [ ] Implement `src/llm/moe_router.hpp` and `src/llm/moe_router.cpp` in `eswin_runtime`:
-  - Fast AVX/RVV dot-product kernel for $W_{\text{gate}} \cdot x$.
-  - Top-$k$ selection ($k=6$) with softmax normalization.
-  - Zero-copy dispatch of active expert jobs to `WorkerPool` on Die 0 and Die 1.
-- [ ] Benchmark CPU routing latency: target $< 60\,\mu\text{s}$ per layer.
+- [x] Implement `src/llm/moe_router.hpp` and `src/llm/moe_router.cpp` in `eswin_runtime`
+      *(2026-10-24, `eswin_runtime` Milestone 12; differentially tested against an
+      independent double-precision reference)*:
+  - ~~Fast AVX/RVV dot-product kernel~~ → shipped as **scalar + OpenMP**. Meets the target,
+    so RVV is optimisation rather than a gap.
+  - Top-$k$ selection ($k=6$): done, but **this plan's "with softmax normalization" was
+    wrong** — `norm_topk_prob=false`, so the selected weights stay raw and sum to **less
+    than 1**. Renormalising them would silently rescale every expert's contribution to the
+    residual. Both modes are now implemented and asserted.
+  - Per-die grouping (`die_experts[2]`) and the `expert_blob_offset()` addressing exist,
+    but **`WorkerPool` dispatch is not wired** — the router is never called from
+    `TransformerSession`.
+- [x] Benchmark CPU routing latency: target $< 60\,\mu\text{s}$ per layer.
+      **Measured 53.4 µs average on `roma`** (RISC-V 1.4 GHz); x86 host 47.5 µs, so the
+      board is within ~12% of host speed. Over 26 MoE layers that is 1.39 ms/token =
+      **0.87% of a 6.25 tok/s budget**, confirming routing is not the bottleneck. Multi-ms
+      worst-case outliers on both platforms come from scheduler preemption, which argues for
+      pinning the routing thread in the decode loop.
 
 ### Phase 3: Simulator Differential Verification (Milestone 4)
 - [ ] Ingest MLA and expert blocks into `eswin_simulator`.
@@ -147,10 +163,18 @@ With the board configured for **27.0 GiB total NPU MMZ** (13.5 GiB on Die 0, 13.
 - [ ] Validate end-to-end token forward pass in software simulation.
 
 ### Phase 4: Physical Hardware Deployment on Board `roma` (Milestone 5)
-- [ ] Reconfigure U-Boot MMZ memory to **27 GiB** (Config A: `0x360000000` per die).
-- [ ] Deploy compiled DeepSeek-V2-Lite model package with `manifest.json`.
+- [ ] ~~Reconfigure U-Boot MMZ memory to **27 GiB** (Config A: `0x360000000` per die).~~
+      **Dropped as a prerequisite**: the corrected budget in §6.3 fits the **default
+      22 GiB** (11 GiB/die) with ~3.5 GiB headroom per die, so the DTB/`fdt mmz` change
+      comes off the critical path. Revisit only for replicated attention *and* 32K context.
+- [ ] Deploy compiled DeepSeek-V2-Lite model package with `manifest.json` (a vendor
+      `config.json` also loads directly now, via `eswin_runtime` Milestone 10).
 - [ ] Run verification inference with `eswin-chat`:
-  - Assert sustained generation speed $\ge 10.0\text{ tokens/second}$.
+  - ~~Assert sustained generation speed $\ge 10.0\text{ tokens/second}$~~ -> **>= 5.0
+    tok/s.** Per §6.2, at the measured 41-59% bandwidth efficiency the projection is
+    5.0-7.2 tok/s, so a 10 tok/s gate would fail a *correctly built* engine. Enforce it
+    with `eswin_runtime/tools/e2e_regression.sh --host roma --record`, which captures
+    throughput and perplexity in one run.
   - Validate chain-of-thought `<think>` reasoning without looping.
   - Measure first-token latency and KV-cache stability over 4K context.
 
@@ -314,12 +338,24 @@ concurrently loaded `modelId`s is unknown. This must be measured, not assumed.
 ## 6.6 Revised roadmap
 
 **Phase 0 — Decide the execution model (before any weights are downloaded).**
-- [ ] Dynamic-weight-input experiment (§6.4.1) → picks approach (a) or (b).
+- [x] Dynamic-weight-input experiment (§6.4.1) → picks approach (a) or (b). **Resolved
+      2026-10-24 in favour of (b)**: `EsAAC` segfaults on any second dynamic graph input,
+      but the `.model` *format* supports runtime-bound tensors and the driver honours
+      `DevBuf.offset` bit-exactly (§6.11, §6.12, FINDINGS §25–§27).
 - [ ] Measure `ES_NPU_LoadModelFromFile` time and concurrent-`modelId` limits on `roma`.
-- [ ] Measure per-submit overhead for one expert FFN (100 submits).
-- [ ] Read the real `config.json`: confirm `first_k_dense_replace`, `n_routed_experts`,
-      `n_shared_experts`, `num_experts_per_tok`, `norm_topk_prob`, gate activation,
-      `kv_lora_rank`, `qk_rope_head_dim`, `v_head_dim`, `vocab_size`.
+      **Demoted, no longer gating** — approach (b) avoids the 1716-loadable path entirely,
+      so this is now optional diligence rather than a decision input.
+- [ ] Measure per-submit overhead for one expert FFN (100 submits). **Still the live
+      risk**: ~318 submits/token means anything above ~0.3 ms each caps throughput under
+      10 tok/s regardless of bandwidth.
+- [x] Read the real `config.json`: `first_k_dense_replace=1`, `n_routed_experts=64`,
+      `n_shared_experts=2`, `num_experts_per_tok=6`, `norm_topk_prob=false`,
+      `scoring_func=softmax`, `topk_method=greedy` (`n_group`/`topk_group`=1, so group
+      top-k is degenerate), `kv_lora_rank=512`, `qk_rope_head_dim=64`,
+      `qk_nope_head_dim=128`, `v_head_dim=128`, `q_lora_rank=null`, `vocab_size=102400`,
+      `moe_intermediate_size=1408`, `intermediate_size=10944`, `rope_theta=10000`
+      (YaRN scaled), `torch_dtype=bfloat16`. See §6.9 for the consequences, including two
+      numbers this document had wrong.
 - [ ] **Gate:** if approach (a) startup exceeds ~2 min *or* per-submit overhead implies
       < 4 tok/s, stop and re-scope (e.g. fewer experts resident, or a smaller MoE).
 
