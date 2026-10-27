@@ -127,13 +127,27 @@ With the board configured for **27.0 GiB total NPU MMZ** (13.5 GiB on Die 0, 13.
       *(2026-10-24: 4/4 shards, 31,412,968,448 bytes, verified against
       `model.safetensors.index.json`; `deep/models/DeepSeek-V2-Lite/`. Note
       `torch_dtype` is **bfloat16**, not fp16 — see §6.9.)*
-- [ ] Export ONNX subgraphs:
-  - `mla_block_layer_N.onnx`: Layer norm + MLA latent projection + attention score.
-  - `shared_expert_layer_N.onnx`: 2 shared FFN blocks.
-  - `routed_expert_layer_N_expert_E.onnx`: Compact single-expert FFN blocks.
-  - `lm_head_d0.onnx` and `lm_head_d1.onnx`: Dual-die logit projection.
-- [ ] Quantize all subgraphs to INT8 using symmetric per-channel quantization.
-- [ ] Compile `.model` blocks using `EsAAC` / `eswin_compiler`.
+- [~] Export ONNX subgraphs — **expert FFN done and hardware-verified (2026-10-27)**; MLA
+      and LM head still to do:
+  - [ ] `mla_block_layer_N.onnx`: Layer norm + MLA latent projection + attention score.
+        Needs partial RoPE (64 of 192 q dims) and `q_lora_rank=None`, i.e. a single
+        `q_proj` 2048→3072 — see §6.9.
+  - [x] `shared_expert_layer_N.onnx`: same FFN shape as a routed expert, so covered by
+        `export_expert_ffn.py`.
+  - [x] `routed_expert_layer_N_expert_E.onnx`: `export_expert_ffn.py` emits
+        `Conv, Conv, Sigmoid, Mul, Mul, Conv` at the real 2048→1408→2048 geometry, opset 13,
+        static 4D shapes, weights as initializers. **EsAAC compiles it (exit 0, 3.26 s)**,
+        `--convert-weights` makes the 17,522,688-byte weight region runtime-bound
+        (18,028,624 → 503,128 bytes), and the result is **byte-identical to EsAAC's static
+        output on `roma`**. `FINDINGS.md` §29.
+  - [ ] `lm_head_d0.onnx` and `lm_head_d1.onnx`: Dual-die logit projection.
+- [ ] Quantize all subgraphs to INT8 using symmetric per-channel quantization. **Now
+      mandatory, not optional:** §29 measures one fp16 expert weight region at 17,522,688
+      bytes, so 66 experts × 26 MoE layers = **30.1 GiB at fp16**, which does not fit the
+      ~27 GiB budget of §6.3. INT8 roughly halves that.
+- [ ] Compile `.model` blocks using `EsAAC` / `eswin_compiler`. *(Expert FFN verified via
+      EsAAC; note EsAAC writes to `/tmp/model_files/<name>_npu_b1.model`, not the `-o`
+      path — §29.)*
 
 ### Phase 2: Host Router & Dynamic Expert Dispatcher in C++ (Milestone 3)
 - [x] Implement `src/llm/moe_router.hpp` and `src/llm/moe_router.cpp` in `eswin_runtime`

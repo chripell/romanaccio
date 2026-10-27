@@ -961,3 +961,60 @@ committing. It is measured now, and it rules (a) out rather than merely dislikin
 **≥40 models load concurrently with no saturation**, so a hybrid — resident loadables for hot
 experts, runtime-bound weights for the tail — is available if blob capacity ever binds.
 
+---
+
+## 29. DeepSeek-V2-Lite Expert FFN Compiles, Converts, and Is Bit-Exact on Hardware
+
+**On `roma` + `simulator`, 2026-10-27.** The full Phase 1 path for a V2-Lite MoE expert now
+works end to end, and it does **not** require a from-scratch multi-op emitter.
+
+### The chain that was proven
+
+1. **Export** — `src/DeepSeek-V2-Lite/export_expert_ffn.py` emits the real geometry
+   (hidden 2048, `moe_intermediate_size` 1408, 8,650,752 params) as opset-13 ONNX with
+   static 4D shapes and Linear lowered to 1×1 Conv: `Conv, Conv, Sigmoid, Mul, Mul, Conv`.
+   SiLU is expressed as `gate * sigmoid(gate)` because opset 13 has no SiLU op, matching the
+   vendor SwiGLU decomposition in §8. Weights are **initializers**, deliberately — EsAAC
+   segfaults on a second dynamic input (§6.11-era probe).
+2. **Compile** — vendor `EsAAC --gen-fp16-model=yes` accepts it: exit 0 in **3.26 s**,
+   producing `expert_ffn_npu_b1.model` (18,028,624 bytes). So EsAAC handles multi-op SwiGLU
+   fine; its limit is only *dynamic* inputs, not multiple operations.
+3. **Convert** — `compiler.py --convert-weights` turned the single weight region
+   (`mem_id=1`, `flags=3`, **30 blobs** = 10 M-slices × 3 projections) into Class B:
+   `bind_id=1`, `tensor_desc_id=2`, **18,028,624 → 503,128 bytes (35.8× smaller)**, with the
+   17,522,688-byte weight blob written out separately. Auto-detection picked exactly
+   `mem_id=1` and correctly ignored the 4 MiB `domain=1` SPRAM staging region (56 contents)
+   and the `flags=34` task streams.
+4. **Verify on hardware** — `probe_weight_bitmatch` with geometry `4096 4096 17522688`:
+
+```
+[static]  model_id=0 inputFdNum=1  submit ok
+[dynamic] model_id=1 inputFdNum=2  submit ok
+mean|static | = 30199.7681
+mean|dynamic| = 30199.7681
+byte-identical over 4096 bytes: YES
+```
+
+The converted loadable is byte-identical to EsAAC's own static output at the true
+DeepSeek-V2-Lite expert shape, not just the SmolLM-sized reference.
+
+### What this changes
+
+- **Milestone 7 item 5 (native multi-op emitter) is no longer on the critical path for
+  V2-Lite.** EsAAC supplies the multi-op command streams; our toolchain supplies the
+  runtime binding it cannot. The 27-loadable MoE design is reachable today. A native emitter
+  is still worth having for independence from the vendor blob, but it stops being a blocker.
+- Weight region size for one V2-Lite expert is **17,522,688 bytes** (fp16). 66 experts ×
+  26 MoE layers = 30.1 GiB at fp16, i.e. the experts must be INT8 to fit the ~27 GiB budget
+  in §6.3 — this measurement is the first hard number on that and says fp16 does not fit.
+- The `mem_id=1` region holding **all 30 slices of all three projections** reconfirms §27's
+  finding at V2-Lite scale: one region, one `bind_id`, one `DevBuf.offset` per expert.
+
+### Gotcha: EsAAC's output path
+
+`EsAAC -o expert_ffn.model` does **not** write to the `-o` path or the CWD. Output lands in
+**`/tmp/model_files/expert_ffn_npu_b1.model`** (with an intermediate at
+`/tmp/build/build_npu_b1/expert_ffn.model`). Both earlier probes silently "produced nothing"
+for this reason — the compile succeeded and the retrieval glob missed. Always locate output
+with `find / -name '*.model' -newermt '-N minutes'` inside the container.
+
