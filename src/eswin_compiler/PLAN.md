@@ -369,7 +369,17 @@ Development is broken down into **6 small, independently reviewable and testable
      `linear3p_*` command-stream templates, so emitting an FFN from scratch needs new
      `dep_graph`/`op_list`/`surf_list` templates. Note this means FINDINGS §15's "complete
      SwiGLU MLP compilation capability" describes the *passes* (SDP fusion, LUT generation,
-     SPRAM tiling), not a from-scratch emitter — worth correcting there.
+     SPRAM tiling), not a from-scratch emitter — corrected there on 2026-10-27.
+  6. **Fix the silent single-op truncation (found 2026-10-27, highest priority of the
+     emitter items because it is a correctness bug, not a missing feature).**
+     `_compile_single_layer()` uses `primary_conv = conv_nodes[0]` and ignores every other
+     node, yet `compile_safetensors_llm()` feeds it real multi-node `mlp_graph`/`attn_graph`
+     objects and logs `Emitted loadable: ..._mlp_l0...` on success. The result is a valid
+     one-convolution loadable silently standing in for a SwiGLU block or an attention block.
+     Cheapest correct stopgap: raise (or loudly warn) when `len(conv_nodes) > 1` until
+     multi-op emission exists, and add a test asserting node count rather than trusting the
+     success log. Until then, treat any numeric comparison of a *synthesized* MLP/attention
+     loadable against PyTorch as unverified.
 
 ---
 

@@ -280,6 +280,33 @@ During implementation of Milestone 4:
    - SwiGLU MLP Block executed natively on Die 0 hardware NPU (`/dev/npu0`):
      - `min = 0.2560 ms, max = 0.6410 ms, avg = 0.3184 ms` (**3,140.67 frames/sec**), satisfying the Milestone 4 performance requirement ($\le 0.35$ ms).
 
+> **Correction (2026-10-27).** The heading's "SwiGLU Execution" is accurate; "SwiGLU MLP
+> compilation capability" elsewhere in the compiler plan for this milestone is **not**. Items
+> 1–3 are real and tested (`lut_generator.py`, `fusion_sdp.py`, `sram_tiler.py`), and item 4
+> measured a genuinely SwiGLU-shaped block — but the loadable benchmarked,
+> `artifacts/test_swiglu_mlp_npu_b1.model`, was compiled by the **vendor `EsAAC`**, not by
+> `eswin_compiler`. Our emitter produces one operation per loadable: both
+> `NVDLAConvBuilder.build_from_node` and `compile_eir_to_model` act on `conv_nodes[0]` and
+> ignore the rest of the graph, so gate+SiLU+mul+up+down cannot yet be emitted as one
+> loadable. `backend/hw_templates.py` only carries `kmd_*`/`umd_*` and `linear3p_*`
+> command-stream templates; a multi-op FFN needs new `dep_graph`/`op_list`/`surf_list`
+> templates. Tracked as remaining work in `src/eswin_compiler/PLAN.md` Milestone 7.
+>
+> **Latent defect found while writing this (2026-10-27).** The single-op limit is not merely
+> unexercised — it **silently truncates**. `compile_safetensors_llm` builds a genuine
+> multi-node `mlp_graph` (gate + SiLU + mul + up + down) and `attn_graph`, then hands each to
+> `_compile_single_layer`, which takes `conv_nodes[0]` and discards the remainder while
+> logging `Emitted loadable: ..._mlp_l0_...model` as if the block had been compiled. So the
+> LLM path reports SwiGLU and attention loadables that contain one convolution each. Nothing
+> errors, which is why it survived: the emitted files are valid loadables, just not the graph
+> that was asked for. Any numerical comparison of a *synthesized* MLP/attention loadable
+> against PyTorch should be treated as untested until this is fixed — assert on node count
+> rather than trusting the success log.
+>
+> The practical consequence: this block was reachable as the *conversion* target for
+> runtime-bound weights (§27, §28) precisely because a vendor loadable of it exists — not
+> because we can compile one.
+
 ---
 
 ## 16. DSP Submodel Partitioning & Vector Core Offload

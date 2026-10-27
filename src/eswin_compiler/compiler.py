@@ -310,6 +310,73 @@ class EswinCompiler:
         }
 
 
+def convert_loadable_weights(
+    loadable_path: Path,
+    out_dir: Path,
+    mem_ids: Optional[List[int]] = None,
+) -> List[Path]:
+    """Rewrite a compiled loadable's weights as runtime-bound (Class B) tensors.
+
+    Emits ``<stem>_classb.model`` plus one ``<stem>_weights_mem<N>.bin`` per converted
+    region. The reference bytes are what a caller must bind so the converted loadable
+    reproduces the original numerics exactly — the bit-match contract of FINDINGS.md
+    sections 27 and 28 — and they are read *before* conversion, since converting clears
+    the region's ``contents``.
+    """
+    try:
+        from backend.flatbuffer_emitter import ModelReader, ModelWriter
+        from backend.dynamic_weight_binding import (
+            extract_weight_blob,
+            find_weight_regions,
+            make_weights_runtime_bound,
+        )
+    except ImportError:  # package-relative execution
+        from .backend.flatbuffer_emitter import ModelReader, ModelWriter
+        from .backend.dynamic_weight_binding import (
+            extract_weight_blob,
+            find_weight_regions,
+            make_weights_runtime_bound,
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model = ModelReader.read_file(str(loadable_path))
+
+    regions = find_weight_regions(model, mem_ids)
+    if not regions:
+        detail = (f" for the explicit mem ids {mem_ids}" if mem_ids
+                  else " (auto-detection is a name heuristic)")
+        raise ValueError(
+            f"No Class A weight region found in {loadable_path.name}{detail}; "
+            "pass --weight-mem-id to select one"
+        )
+
+    reference = {r.id: extract_weight_blob(model, r) for r in regions}
+    bound = make_weights_runtime_bound(model, mem_ids)
+    out_model = out_dir / f"{loadable_path.stem}_classb.model"
+    ModelWriter.write_file(model, out_model)
+    logger.info(
+        "Converted %d weight region(s): %s -> %s (%s -> %s bytes)",
+        len(bound), loadable_path.name, out_model.name,
+        f"{loadable_path.stat().st_size:,}", f"{out_model.stat().st_size:,}",
+    )
+
+    emitted = [out_model]
+    for b in bound:
+        data = reference[b.mem_id]
+        ref_path = out_dir / f"{loadable_path.stem}_weights_mem{b.mem_id}.bin"
+        ref_path.write_bytes(data)
+        emitted.append(ref_path)
+        logger.info(
+            "  mem_id=%d bind_id=%d tensor_desc_id=%d size=%d dropped %d blob(s) -> %s",
+            b.mem_id, b.bind_id, b.tensor_desc_id, b.size, len(b.dropped_blobs),
+            ref_path.name,
+        )
+    logger.info("Submit the converted loadable with inputFdNum=%d: slot 0 activation, "
+                "then one slot per converted weight region at its bind_id.",
+                1 + len(bound))
+    return emitted
+
+
 def main():
     """Command-line interface entry point."""
     parser = argparse.ArgumentParser(
@@ -371,6 +438,30 @@ def main():
             "blob on hardware; see FINDINGS.md section 27."
         )
     )
+    parser.add_argument(
+        "--convert-weights",
+        action="store_true",
+        help=(
+            "Convert an ALREADY-COMPILED .model in place of compiling: rewrite every Class A "
+            "weight memory region as a runtime-bound (Class B) tensor and drop its weight "
+            "blobs, writing <stem>_classb.model plus a <stem>_weights_mem<N>.bin reference "
+            "blob per converted region. This is the only path that accepts a .model input, "
+            "because loadables are this compiler's output format, not its input. Needed for "
+            "vendor-compiled models, which never pass through our emitter."
+        )
+    )
+    parser.add_argument(
+        "--weight-mem-id",
+        type=int,
+        action="append",
+        default=None,
+        metavar="ID",
+        help=(
+            "With --convert-weights: convert only these memory ids. Repeatable. By default "
+            "the weight regions are auto-detected by blob name, which is a heuristic - pass "
+            "this explicitly when the auto-detection is wrong or ambiguous."
+        )
+    )
 
     args = parser.parse_args()
     model_path = Path(args.model)
@@ -396,8 +487,17 @@ def main():
             out_files = compiler.compile_safetensors_llm(
                 model_path, out_dir, num_layers_to_compile=args.num_layers
             )
+        elif model_path.suffix.lower() == ".model":
+            if not args.convert_weights:
+                logger.error(
+                    "%s is a loadable, which is this compiler's output format, not an input. "
+                    "Use --convert-weights to rewrite its weights as runtime-bound tensors.",
+                    model_path,
+                )
+                sys.exit(1)
+            out_files = convert_loadable_weights(model_path, out_dir, args.weight_mem_id)
         else:
-            logger.error("Unrecognized model format: %s. Expected .onnx, .safetensors, or directory.", model_path)
+            logger.error("Unrecognized model format: %s. Expected .onnx, .safetensors, .model or directory.", model_path)
             sys.exit(1)
 
         print("\n" + "=" * 60)
