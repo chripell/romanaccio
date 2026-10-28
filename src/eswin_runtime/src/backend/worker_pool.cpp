@@ -530,11 +530,72 @@ bool WorkerPool::unprepare_buffer(uint16_t die_id, const DmaBuffer &buf) {
     return m_channels[die_id]->send_request(req, resp);
 }
 
+const char *describe_slice_error(SliceError err) {
+    switch (err) {
+        case SliceError::Success:           return "ok";
+        case SliceError::NullBuffer:        return "slice has no buffer";
+        case SliceError::TooManyBuffers:    return "more slices than the task has buffer slots";
+        case SliceError::UnalignedOffset:   return "slice offset is not page-aligned";
+        case SliceError::RangeExceedsBuffer:return "slice extends past the end of its buffer";
+        case SliceError::EmptySlice:        return "slice length is zero";
+    }
+    return "unknown slice error";
+}
+
+SliceError fill_ipc_buffers(const std::vector<DmaBufferSlice> &slices,
+                           IpcBufferDesc *out, size_t cap, size_t &out_count) {
+    static_assert(sizeof(size_t) <= sizeof(uint64_t),
+                  "slice offset/size must fit the uint64_t IPC fields");
+    out_count = 0;
+    if (slices.size() > cap) {
+        out_count = cap;
+        return SliceError::TooManyBuffers;
+    }
+
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const DmaBufferSlice &s = slices[i];
+        if (!s.buffer) {
+            out_count = i;
+            return SliceError::NullBuffer;
+        }
+
+        const size_t total = s.buffer->size();
+        if (s.offset > total) {
+            out_count = i;
+            return SliceError::RangeExceedsBuffer;
+        }
+        if (s.offset % kSliceAlignment != 0) {
+            out_count = i;
+            return SliceError::UnalignedOffset;
+        }
+
+        const size_t length = s.size ? s.size : (total - s.offset);
+        if (length == 0) {
+            out_count = i;
+            return SliceError::EmptySlice;
+        }
+        // Compared against the remaining bytes, never as offset+length, so a huge length
+        // cannot wrap around the check.
+        if (length > total - s.offset) {
+            out_count = i;
+            return SliceError::RangeExceedsBuffer;
+        }
+
+        out[i].mem_fd   = s.buffer->mem_fd();
+        out[i].offset   = s.offset;
+        out[i].size     = length;
+        out[i].reserved = 0;
+        out_count = i + 1;
+    }
+
+    return SliceError::Success;
+}
+
 bool WorkerPool::submit_task(
     uint16_t die_id,
     uint32_t model_id,
-    const std::vector<DmaBuffer*> &inputs,
-    const std::vector<DmaBuffer*> &outputs,
+    const std::vector<DmaBufferSlice> &inputs,
+    const std::vector<DmaBufferSlice> &outputs,
     uint64_t *out_elapsed_ns
 ) {
     if (die_id >= m_channels.size() || !m_channels[die_id]) return false;
@@ -542,24 +603,24 @@ bool WorkerPool::submit_task(
     IpcRequest req{};
     req.cmd = IpcCmd::SubmitTask;
     req.model_id = model_id;
-    req.input_count = static_cast<uint8_t>(inputs.size());
-    req.output_count = static_cast<uint8_t>(outputs.size());
 
-    for (size_t i = 0; i < inputs.size() && i < 10; ++i) {
-        if (inputs[i]) {
-            req.inputs[i].mem_fd = inputs[i]->mem_fd();
-            req.inputs[i].offset = 0;
-            req.inputs[i].size   = inputs[i]->size();
-        }
+    size_t n_inputs = 0, n_outputs = 0;
+    bool failed_in_inputs = true;
+    SliceError err = fill_ipc_buffers(inputs, req.inputs, kIpcBufferSlots, n_inputs);
+    if (err == SliceError::Success) {
+        err = fill_ipc_buffers(outputs, req.outputs, kIpcBufferSlots, n_outputs);
+        failed_in_inputs = false;
+    }
+    if (err != SliceError::Success) {
+        const size_t slot = failed_in_inputs ? n_inputs : n_outputs;
+        std::cerr << "[Master] submit_task rejected (die " << die_id << ", model " << model_id
+                  << "): " << describe_slice_error(err) << " at "
+                  << (failed_in_inputs ? "input[" : "output[") << slot << "]" << std::endl;
+        return false;
     }
 
-    for (size_t i = 0; i < outputs.size() && i < 10; ++i) {
-        if (outputs[i]) {
-            req.outputs[i].mem_fd = outputs[i]->mem_fd();
-            req.outputs[i].offset = 0;
-            req.outputs[i].size   = outputs[i]->size();
-        }
-    }
+    req.input_count = static_cast<uint8_t>(n_inputs);
+    req.output_count = static_cast<uint8_t>(n_outputs);
 
     IpcResponse resp{};
     if (m_channels[die_id]->send_request(req, resp)) {
@@ -569,6 +630,21 @@ bool WorkerPool::submit_task(
         return true;
     }
     return false;
+}
+
+bool WorkerPool::submit_task(
+    uint16_t die_id,
+    uint32_t model_id,
+    const std::vector<DmaBuffer*> &inputs,
+    const std::vector<DmaBuffer*> &outputs,
+    uint64_t *out_elapsed_ns
+) {
+    std::vector<DmaBufferSlice> in_slices, out_slices;
+    in_slices.reserve(inputs.size());
+    out_slices.reserve(outputs.size());
+    for (const DmaBuffer *b : inputs) in_slices.push_back(DmaBufferSlice{b});
+    for (const DmaBuffer *b : outputs) out_slices.push_back(DmaBufferSlice{b});
+    return submit_task(die_id, model_id, in_slices, out_slices, out_elapsed_ns);
 }
 
 } // namespace eswin

@@ -11,6 +11,7 @@
 # C/C++ build artifacts and compiled binaries
 build/
 build-*/
+build_*/
 bin/
 *.o
 *.obj

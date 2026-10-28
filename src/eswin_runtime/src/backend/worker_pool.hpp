@@ -85,6 +85,66 @@ struct ModelInfo {
 };
 
 // =============================================================================
+// Buffer Slices (Milestone 13)
+// =============================================================================
+
+/**
+ * @brief Buffer slots per task: mirrors NpuTask's inputFd[10]/outputFd[10].
+ *
+ * This is a driver-struct limit, not a convention, so exceeding it is rejected
+ * instead of silently truncated (the previous code set input_count from the vector
+ * size and then filled only 10 slots, handing the driver uninitialized descriptors).
+ */
+inline constexpr size_t kIpcBufferSlots = 10;
+
+/**
+ * @brief Required alignment of a slice's start inside its buffer.
+ *
+ * Every offset proven to be honoured by silicon is page-aligned: offset 1,769,472 and
+ * 8,908,800 both selected the right expert (FINDINGS #26, #27, #30). Sub-page offsets are
+ * untested, so they are refused loudly rather than trusted to quietly read the wrong bytes.
+ */
+inline constexpr size_t kSliceAlignment = 4096;
+
+/**
+ * @brief A window inside a DmaBuffer, submitted as one task tensor without copying.
+ *
+ * Lets one resident blob serve many models: expert selection for MoE is just a different
+ * offset (see MoERouter::expert_blob_offset()), which is what keeps DeepSeek-V2-Lite at 27
+ * loadables per die instead of 1,716.
+ */
+struct DmaBufferSlice {
+    const DmaBuffer *buffer = nullptr;
+    size_t offset = 0;
+    size_t size = 0;  ///< 0 means "rest of the buffer" (buffer->size() - offset).
+};
+
+/** @brief Rejection reasons for a slice vector; Success means fully marshalled. */
+enum class SliceError : int {
+    Success = 0,
+    NullBuffer,          ///< A slice has no buffer; the descriptor would be meaningless.
+    TooManyBuffers,      ///< More slices than the driver struct has slots.
+    UnalignedOffset,     ///< Offset is not a multiple of kSliceAlignment.
+    RangeExceedsBuffer,  ///< The slice would read past the end of its buffer.
+    EmptySlice,          ///< Zero-length slice.
+};
+
+const char *describe_slice_error(SliceError err);
+
+/**
+ * @brief Validate a slice vector and write its IPC descriptors. Pure, so it is testable
+ *        off-board (host-fallback submit_task simulates and never marshals).
+ *
+ * @param slices   Input or output slices for one task.
+ * @param out      Destination array, at least @p cap entries.
+ * @param cap      Slots available in @p out (pass kIpcBufferSlots).
+ * @param out_count On Success the number of slices written; on failure the index of the
+ *                  offending slice, which is why it is written on every return path.
+ */
+SliceError fill_ipc_buffers(const std::vector<DmaBufferSlice> &slices,
+                            IpcBufferDesc *out, size_t cap, size_t &out_count);
+
+// =============================================================================
 // Worker Daemon Interface
 // =============================================================================
 
@@ -162,12 +222,31 @@ public:
 
     /**
      * @brief Dispatches a synchronous task execution to the target NPU die.
+     *
+     * Whole-buffer convenience form: every tensor is bound at offset 0 for the buffer's
+     * full size. It delegates to the slice overload, so existing callers keep exactly the
+     * wire content they produced before.
      */
     bool submit_task(
         uint16_t die_id,
         uint32_t model_id,
         const std::vector<DmaBuffer*> &inputs,
         const std::vector<DmaBuffer*> &outputs,
+        uint64_t *out_elapsed_ns = nullptr
+    );
+
+    /**
+     * @brief Dispatches a task whose tensors are windows inside larger buffers.
+     *
+     * This is the MoE dispatch path: one resident per-die expert blob, and each submit binds
+     * the expert the router selected. Preparation stays whole-buffer (the SMMU maps mem_fd,
+     * not a range), so a blob is prepared once and sliced many times.
+     */
+    bool submit_task(
+        uint16_t die_id,
+        uint32_t model_id,
+        const std::vector<DmaBufferSlice> &inputs,
+        const std::vector<DmaBufferSlice> &outputs,
         uint64_t *out_elapsed_ns = nullptr
     );
 

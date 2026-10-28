@@ -51,12 +51,13 @@ TEST_KVHW      = $(BUILD_DIR)/test_hardware_kv_cache
 TEST_E2E_DS    = $(BUILD_DIR)/test_deepseek_e2e
 TEST_DKMODE    = $(BUILD_DIR)/test_direct_kernel_mode
 TEST_MOE       = $(BUILD_DIR)/test_moe_router
+TEST_SLICE     = $(BUILD_DIR)/test_buffer_slice
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
 TOOL_CHAT      = $(BUILD_DIR)/eswin-chat
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TOOL_FETCH) $(TOOL_CHAT)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TEST_SLICE) $(TOOL_FETCH) $(TOOL_CHAT)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -137,7 +138,12 @@ $(TEST_MOE): $(TEST_DIR)/test_moe_router.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE)
+$(TEST_SLICE): $(TEST_DIR)/test_buffer_slice.cpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TEST_SLICE)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
@@ -162,6 +168,8 @@ test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DKMODE)
 	@echo "\nRunning DeepSeek-V2-Lite Phase 2 MoE Router test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_MOE)
+	@echo "\nRunning Milestone 13 BufferSlice marshalling test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_SLICE)
 
 clean:
 	rm -rf $(BUILD_DIR)

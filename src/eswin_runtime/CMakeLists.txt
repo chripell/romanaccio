@@ -98,6 +98,10 @@ target_link_libraries(test_direct_kernel_mode PRIVATE es_runtime ${CMAKE_DL_LIBS
 add_executable(test_moe_router tests/test_moe_router.cpp)
 target_link_libraries(test_moe_router PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 13 BufferSlice marshalling Test Executable
+add_executable(test_buffer_slice tests/test_buffer_slice.cpp)
+target_link_libraries(test_buffer_slice PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -120,4 +124,5 @@ add_test(NAME test_hardware_kv_cache COMMAND test_hardware_kv_cache)
 add_test(NAME test_deepseek_e2e COMMAND test_deepseek_e2e)
 add_test(NAME test_direct_kernel_mode COMMAND test_direct_kernel_mode)
 add_test(NAME test_moe_router COMMAND test_moe_router)
+add_test(NAME test_buffer_slice COMMAND test_buffer_slice)
 
