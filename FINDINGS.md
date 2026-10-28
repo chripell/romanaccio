@@ -1355,7 +1355,9 @@ Approach (b) assumed a single per-layer loadable could run any expert by changin
 
 - Giving both experts an **identical** quant table (thresholds merged to the per-blob maximum,
   so `shared0_table.json == shared1_table.json` byte for byte) still leaves the two Class B
-  loadables differing in **exactly 6 bytes out of 283,384**.
+  loadables differing in **exactly 6 bytes out of 283,384**. *(Pair-specific: §34.4 shows another
+  pair sharing those 6 bytes yet differing in 10. Judge interchangeability by whole-file
+  identity.)*
 - All 6 are in `kmd-task-op_list` (101,184 B) — **one per graph node**, at in-record offset 82
   within 5,952-byte op records (the last record is 3,968 B), values `0x18` (24) for expert 0 vs
   `0x19` (25) for expert 1. A weight-derived requantization shift.
@@ -1439,4 +1441,98 @@ ssh roma "cd /tmp/e2 && sudo ./probe_two_experts --static0 sx0_npu_b1.model \
     --static1s sx1_npu_b1.model --classb0 sx0_npu_b1_classb.model \
     --classb1s sx1_npu_b1_classb.model --blob two_expert_shared_blob.bin --load-repeats 10"
 ```
+
+---
+
+## 34. Milestone 14 Gate: the Loaded Command Stream Cannot Be Patched from User Space
+
+§33 left one route open — patch the handful of expert-specific stream bytes after load, so a
+layer needs one loadable instead of 64. `tools/probe_stream_patch.cpp` answers it: **the route is
+dead.** The stream copy that user space can reach is not the one the NPU fetches.
+
+### 34.1 First, a determinism control
+
+Before blaming weights for the differing bytes, rule out the compiler: expert 1's ONNX compiled
+under expert 0's filename is **md5-identical** to expert 1's own compile (`117755e9…`), and the
+reverse likewise (`a1b543ee…`). EsAAC output is a pure function of (weights, table) — no name,
+ordering or session state. So the differing bytes really are weight-derived, and patch tables can
+be generated offline and reproduced.
+
+### 34.2 Where the stream lives
+
+Phase 1 scanned everything readable through `/proc/self/mem` (104 regions, 67.1 MiB) with a
+planted-bait self-test — without which the first run silently parsed **zero** regions, because
+`/proc/self/maps`' `dev` field is `%x:%x` and one integer conversion cannot parse it. Result:
+two external full copies of the *most recently loaded* model's `op_list` in `[heap]`, and none of
+the other model's. Patching them changed nothing: they are leftover parse buffers.
+
+Phase 1 could not read 36 regions, all of them device mappings: `/dmabuf:npu` (2 MiB each),
+`/dmabuf:es_runtime` (17,400 KiB), `/dev/perf_count`. They are `rw-s`, so phase 2 scanned them by
+direct dereference under a SIGSEGV guard (36 regions, 0 faults). Searching a 64-byte window with
+the centre byte masked — relocation rewrites addresses inside the stream — found **exactly two
+near-perfect copies, one per loaded model**, each at the base of its own 2 MiB `/dmabuf:npu`
+mapping:
+
+```
+/dmabuf:npu 0x7fff7f317000-0x7fff7f517000 rw-s  centre=0x19  match 101136/101184 (99.95%)  <- B
+/dmabuf:npu 0x7fff81ba8000-0x7fff81da8000 rw-s  centre=0x18  match 101136/101184 (99.95%)  <- A
+```
+
+The 48 non-matching bytes are the applied relocations. Ownership cannot be read from the match
+score (both streams differ in only a few bytes, so both score 99.95%); it comes from the patch-site
+values themselves.
+
+### 34.3 Patching it does nothing, and neither does destroying it
+
+- Wrote all 6 bytes `0x19 → 0x18` in B's device copy, readback 6/6, called
+  `ES_SYS_MemFlushCacheAll` (returned 0), re-submitted B on A's weight region: output
+  **byte-identical to the unpatched run** (`nonzero=1986`).
+- Patching alone cannot distinguish "not fetched" from "fetched but this field is consumed at load
+  time", so the liveness control XOR-corrupted **64 bytes** at stream offset 17,940 of the same
+  copy, flushed, and re-ran B on its *own* region: output still **byte-identical** to B's golden
+  (`nonzero=2031`). Bytes were restored afterwards.
+
+A copy the NPU ignores when 64 bytes of it are inverted is not the copy it fetches. The live
+stream is kernel-side (or in a mapping not exposed to this process), so **post-load patching from
+user space is impossible** and Milestone 14's patch route is closed. Note the corollary: the
+driver copies the stream at load and never re-reads user memory, which is also why per-expert
+loadables cost a full 34.25 ms each.
+
+### 34.4 What replaces it: loadables are shared per *stream class*
+
+Since patching is out, the question becomes how many distinct loadables a layer actually needs.
+Eight real experts of layer 1, all compiled against **one** merge-max table
+(`make_quant_table.py --merge-max`, thresholds widened to the per-blob maximum so every expert gets
+a byte-identical table):
+
+| table | distinct Class B loadables | class sizes |
+|-------|---------------------------|-------------|
+| merge-max over the 8 experts | **3** | 6 / 1 / 1 |
+| same, thresholds rounded up to powers of two | 4 | 5 / 1 / 1 / 1 |
+
+- Experts 0 and 1 — whose loadables differed under the narrower 2-expert table of §33 — are now
+  **byte-identical files**. Widening the shared table converges signatures.
+- Power-of-two thresholds did **not** help (4 classes vs 3), so the remaining spread comes from the
+  weight data, not from threshold rounding.
+- Interchangeability must be judged on the **whole file**, not on the 6 bytes §33 identified:
+  experts 4 and 6 share that 6-byte signature yet differ in **10** `kmd-task-op_list` bytes
+  (values 22/24 → 23/25, offsets 49,682…97,298). Those 6 were simply where experts 0 and 1
+  happened to differ. Identical files, on the other hand, need no board test at all — the same
+  bytes cannot compute differently.
+
+So §33.2's "exactly 6 bytes" is pair-specific; the general statement is *a small, weight-derived
+set of per-op requant bytes in `kmd-task-op_list`*, and the usable invariant is whole-file
+identity.
+
+### 34.5 Revised MoE shape and the number that decides it
+
+One resident weight blob per die + `DevBuf.offset` expert selection (proven byte-exact, §33.1) +
+**one loadable per stream class**, all classes resident. Against the measured ceiling of 62
+models/die (§33.3), feasibility reduces to a single unmeasured number: **how many distinct stream
+classes exist across all 26 MoE layers when every expert shares one global table.** Every MoE
+layer has the same 2048→1408→2048 graph, so classes may well repeat across layers; if the total is
+≤ ~60, MoE needs no patching and no per-expert loading. If it is in the hundreds, INT8 MoE on this
+driver has no viable dispatch path and the design has to change (fp16 does not fit either: 30.1
+GiB, §30). Measuring it means compiling experts across several layers against one global table and
+counting file hashes — cheap in compute, mostly transfer time.
 

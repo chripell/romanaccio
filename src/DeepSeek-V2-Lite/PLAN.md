@@ -307,7 +307,8 @@ selection**: which 6 of 64 experts run is decided by the router at run time. Thr
 | :--- | :--- | :--- | :--- |
 | **(a) One loadable per expert** | 1664 routed + 52 shared | optimal (only selected experts read) | **Measured and ruled out**: a Class B loadable is only 283 KB but load+unload costs **34.25 ms** and at most **62** stay resident per die, so 64×26 loads/token ≈ 56 s/token (FINDINGS §33.3) |
 | **(b) One loadable per layer, all 64 experts, weights as a dynamic input tensor bound at a runtime-chosen `DevBuf.offset`** | 27 | optimal | **Half true**: offset selection is byte-exact with real experts (§33.1), but one loadable is *not* expert-interchangeable — 6 weight-derived bytes in `kmd-task-op_list` change the result to cos 0.958 (§33.2) |
-| **(d) One loadable per layer + patch those 6 bytes per expert switch** | 27 | optimal | **The remaining route.** 26 loadables fit under the 62 ceiling, the weight blob stays resident, and the patch is a few bytes. Unproven: needs the loaded stream located in device memory and the NPU shown to honour a post-load patch |
+| **(d) One loadable per layer + patch those 6 bytes per expert switch** | 27 | optimal | **Measured and ruled out** (§34.3): the `op_list` copy reachable from user space is not the one the NPU fetches — patching it changed nothing, and XOR-corrupting 64 bytes of it left the output byte-identical. The driver takes its own copy at load |
+| **(e) One loadable per *stream class*** — experts whose Class B files are byte-identical share one loadable, offsets select within it | classes × 26 | optimal | **Current route.** 8 real experts of layer 1 under one merge-max table gave only **3 classes (6/1/1)**, and identical files need no board test. Feasibility hinges on the class count across all 26 layers vs the 62-model/die ceiling |
 | (c) Compute all 64 experts | 27 | 64× worse (13.4 GiB/token) | Destroys the entire MoE advantage — never |
 
 (b) was attractive because `DevBuf` already carries `{mem_fd, offset, size}`: one big weight
@@ -316,9 +317,12 @@ input offset*. The offset half is now **proven on silicon with real DeepSeek-V2-
 (two experts in one 17,817,600-byte blob, each reproducing its own static loadable byte for
 byte). The single-loadable half is **falsified**: with per-channel weight quantization EsAAC
 bakes one requant shift byte per graph node into `kmd-task-op_list`, and those bytes depend on
-the expert's weights. `per_tensor` quantization would remove them but makes EsAAC SIGSEGV.
-Since patching those 6 bytes makes two experts' loadables byte-identical, (d) is (b) plus a
-6-byte write — which is why it is now the plan rather than a fallback.
+the expert's weights. `per_tensor` quantization would remove them but makes EsAAC SIGSEGV, and
+patching the loaded stream is impossible because the copy user space can reach is not the one the
+NPU fetches (§34.3). What survives is (e): the shift bytes only take a few distinct values, so
+**many experts compile to byte-identical loadables** and can share one — 6 of 8 real experts did.
+Offsets then select the expert inside one resident blob, which is the part already proven
+byte-exact on silicon.
 
 **Why (a) is risky — now measured, not assumed:** Class B conversion shrinks a loadable from
 9.19 MB to 283 KB, but load+unload still costs **34.25 ms** (p50 34.20, min 33.86, max 34.72),

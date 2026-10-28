@@ -551,36 +551,33 @@ Development is structured into **11 independently verifiable milestones**:
 
 ---
 
-### Milestone 14: Per-Expert Command-Stream Patching (the only remaining MoE route) [PLANNED — gated on one experiment]
-- **Why**: FINDINGS §33 falsified "one loadable per layer, offset selects the expert" for INT8.
-  Two real DeepSeek-V2-Lite experts compiled with a **byte-identical** quant table produce Class B
-  loadables that differ in **exactly 6 bytes of 283,384** — one per graph node, in
-  `kmd-task-op_list` at in-record offset 82, values `0x18` vs `0x19`, a weight-derived requant
-  shift. Patching them makes the two files identical (same md5). Binding expert 1's weight region
-  into expert 0's loadable gives cos 0.958 / maxdiff 82 — plausible-looking and wrong.
-- **The alternatives are measured dead**: per-expert loadables cost 34.25 ms to load+unload
-  (64×26 per token ≈ 56 s/token), and only **62 models stay resident per die** — a 63rd load
-  fails and the next unload/submit **Oopses the kernel** in `eic7700_npu`
-  (`destroy_frame` ← `npu_release_frame`, dereferencing `ERR_PTR(-EINVAL)` from
-  `io_tensor_to_io_addr`). `per_tensor` quantization, which would remove the coupling, makes
-  EsAAC SIGSEGV.
-- **Gate (do this before writing any patcher)**: prove the NPU honours a post-load edit.
-  1. Load one Class B loadable, locate its `kmd-task-op_list` in device memory — candidates:
-     scan the worker's MMZ mappings for the known 101,184-byte stream signature, or reverse
-     `libedla_runtime`'s load path to see where blobs are copied.
-  2. Patch the 6 bytes to the other expert's values, submit with that expert's weight slice, and
-     require a **byte-exact** match against that expert's static loadable (`probe_two_experts`
-     already computes exactly this comparison).
-  3. If the driver copies/checksums/pre-translates the stream at load, this route dies too, and
-     MoE falls back to a per-layer macro-graph design — say so plainly rather than patching
-     around it.
-- **If it works**: the compiler side must emit a per-expert patch table (offsets + values, or the
-  rule that generates them) next to each weight region, and the runtime applies it on expert
-  switch. 26 loadables per die ≤ 62 ✓, one resident weight blob, patch cost ≈ nanoseconds.
-- **Deliverables**: `tools/probe_stream_patch.cpp` for the gate; then
-  `ExpertStreamPatcher` in `src/llm/`, a compiler `--emit-patch-table` output, and a
-  `test_stream_patch` suite that validates offsets/values against two compiled experts off-board.
-- **Do not** preload near the 62-model ceiling in any test: it crashes the board (§33.4).
+### Milestone 14: Per-Expert Command-Stream Patching [GATE ANSWERED 2026-10-28 — route is DEAD, see FINDINGS §34]
+- **The gate result**: the loaded `kmd-task-op_list` *was* located — one 99.95%-matching copy per
+  model at the base of its own 2 MiB `/dmabuf:npu` mapping (`rw-s`, writable), the 48 differing
+  bytes being applied relocations. Patching all 6 expert-specific bytes there (plus
+  `ES_SYS_MemFlushCacheAll`) changed nothing, and the liveness control settles why: XOR-corrupting
+  **64 bytes** of that copy left the output byte-identical to the golden. The NPU does not fetch
+  this copy at submit; the driver took its own at load. **User-space post-load patching is
+  impossible**, so do not build a patcher.
+- Two traps worth keeping: a `/proc/self/maps` scanner must parse `dev` as `%x:%x` (a single
+  integer conversion silently yields **zero** regions — the planted-bait self-test is what caught
+  it), and stream ownership cannot be read from a match score, since two experts' streams differ
+  in only a few bytes and both score 99.95%.
+- **Replacement route (Milestone 15)**: one resident weight blob + offset selection (proven
+  byte-exact, §33.1) + **one loadable per stream class**, where a class is a set of experts whose
+  Class B files are byte-identical — identical files need no board test, since the same bytes
+  cannot compute differently. Measured: 8 real experts of layer 1 under one merge-max table gave
+  **3 classes (6/1/1)**; power-of-two thresholds gave 4, so widening the shared table helps and
+  threshold rounding does not.
+- **The one number that decides feasibility**: distinct stream classes across all 26 MoE layers
+  under a single global table, versus the measured ceiling of **62 resident models per die**
+  (§33.3, exceeding which Oopses the kernel). Every MoE layer shares the 2048→1408→2048 graph, so
+  classes may repeat across layers. ≤ ~60 ⇒ MoE works with no patching and no per-expert loads;
+  hundreds ⇒ INT8 MoE has no viable dispatch path on this driver and the design must change.
+- **Deliverables for the measurement**: `make_quant_table.py --merge-max` across a global expert
+  set; a compile-and-hash sweep (EsAAC is deterministic — verified: same weights under a different
+  filename give an md5-identical loadable, so hashes are reproducible class IDs); and a residency
+  test that loads one loadable per class and stays well under 60.
 
 ---
 
