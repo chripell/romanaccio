@@ -90,12 +90,24 @@ def is_weight_blob(name: str) -> bool:
     return "weight" in low or "splitm" in low
 
 
+def is_task_blob(name: str) -> bool:
+    """True for KMD/UMD command streams, which must never be unbound from a loadable."""
+    return any(mk in name for mk in _TASK_MARKERS)
+
+
 def find_weight_regions(model: LoadableModel,
                         mem_ids: Optional[Sequence[int]] = None) -> List[MemoryEntry]:
     """Class A, DRAM-resident memory entries that hold weight blobs.
 
     Pass `mem_ids` to select explicitly; the auto-detection is a name heuristic and should
     be verified against the emitted model rather than trusted blindly.
+
+    A region qualifies when at least one of its blobs looks like a weight and none is a
+    command stream. It deliberately does NOT require every blob to be weight-like: an INT8
+    loadable interleaves per-slice `CvtPrecision_QuantM*` blobs with the `W_*splitM_*`
+    weights inside the same region (measured: 16 weight blobs + 16 quant blobs in one
+    8,908,800-byte region). Those quant blobs carry that expert's scales, so they must
+    travel with the weights - extracting "just the weights" would produce garbage.
     """
     out = []
     for e in model.memory_list:
@@ -105,8 +117,11 @@ def find_weight_regions(model: LoadableModel,
             continue                      # already Class B
         if e.domain != 0:
             continue                      # SPRAM staging, not a weight source
-        if mem_ids is None and not all(is_weight_blob(c) for c in e.contents):
-            continue
+        if mem_ids is None:
+            if any(is_task_blob(c) for c in e.contents):
+                continue
+            if not any(is_weight_blob(c) for c in e.contents):
+                continue
         out.append(e)
     return out
 
@@ -125,10 +140,34 @@ def next_bind_id(model: LoadableModel) -> int:
     return candidate
 
 
+def infer_weight_data_type(model: LoadableModel) -> int:
+    """Best available guess at the weight element type, taken from the model itself.
+
+    A Class A weight region carries no dtype - it is just named blobs - so the type has to
+    come from somewhere. The activation input descriptor is the right proxy: EsAAC emits
+    weights and activations in the same precision, measured on both variants of the
+    DeepSeek-V2-Lite expert FFN (fp16 model: input dtype 2 HALF, weights fp16; INT8 model:
+    input dtype 4 INT8, weight region exactly half the fp16 size).
+
+    Prefers the descriptor bound to a Class B *input* memory entry (flags 5), then any
+    FEATURE descriptor, then HALF.
+    """
+    input_mem_ids = {e.id for e in model.memory_list
+                     if not e.contents and e.flags == CLASS_B_INPUT_FLAGS}
+    for t in model.tensor_descs:
+        if t.mem_id in input_mem_ids and t.data_category == DATA_CATEGORY_FEATURE:
+            return t.data_type
+    for t in model.tensor_descs:
+        if t.data_category == DATA_CATEGORY_FEATURE:
+            return t.data_type
+    return DATA_TYPE_HALF
+
+
 def make_weights_runtime_bound(
     model: LoadableModel,
     mem_ids: Optional[Sequence[int]] = None,
     name_prefix: str = "weight",
+    data_type: Optional[int] = None,
 ) -> List[BoundWeight]:
     """Converts weight regions in @p model from Class A to Class B, in place.
 
@@ -137,6 +176,10 @@ def make_weights_runtime_bound(
     tensor descriptor sized to the whole region. Returns one `BoundWeight` per region so the
     caller can build the submit-time `DevBuf` list.
 
+    @param data_type Element type for the new descriptor. None infers it from the model's
+           activation descriptor (see infer_weight_data_type), which is what keeps an INT8
+           loadable from being described as fp16.
+
     The caller must then supply each region per submit as
     `inputFd[bound.bind_id] = {mem_fd, offset, bound.size}`.
     """
@@ -144,6 +187,7 @@ def make_weights_runtime_bound(
     if not regions:
         return []
 
+    resolved_dtype = infer_weight_data_type(model) if data_type is None else data_type
     next_desc_id = max((t.id for t in model.tensor_descs), default=-1) + 1
     blob_by_name: Dict[str, int] = {b.name: i for i, b in enumerate(model.blobs)}
 
@@ -175,7 +219,7 @@ def make_weights_runtime_bound(
             size=region.size,
             offset=0,
             data_format=DATA_FORMAT_NCHW,
-            data_type=DATA_TYPE_HALF,
+            data_type=resolved_dtype,
             data_category=DATA_CATEGORY_WEIGHT,
             pixel_format=PIXEL_FORMAT_FEATURE,
             pixel_mapping=0,

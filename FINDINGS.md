@@ -1018,3 +1018,90 @@ DeepSeek-V2-Lite expert shape, not just the SmolLM-sized reference.
 for this reason — the compile succeeded and the retrieval glob missed. Always locate output
 with `find / -name '*.model' -newermt '-N minutes'` inside the container.
 
+---
+
+## 30. INT8 Without EsQuant: Synthesizing `--quant-stats` Ourselves
+
+**On `simulator` + `roma`, 2026-10-28.** §29 made INT8 mandatory (fp16 experts need 30.1 GiB).
+The vendor route is EsQuant → `table.json` → `EsAAC --quant-stats`, but the EsQuant wheel here
+is image-dataset oriented (`cv2`, `DatasetImageList`, `ImagenetOpencv`) and needs its own
+container. **It is not needed** — the table format is simple enough to generate directly.
+
+### The `--quant-stats` schema, decoded
+
+From the release sample `EIC7x_Release_20250730_nn/sample/yolov3/esaac/table.json`:
+
+```json
+{ "version": "1.0",
+  "model_info": {"inputs": [...], "input_data_type": ["int8"],
+                 "outputs": [...], "output_data_type": ["int8"]},
+  "node_info":  {"<node>": {"data_type": "int8", "input_blob_names": [...],
+                            "output_blob_names": [...], "optimization_option": "option2",
+                            "bias_mode": 1, "quantized_method": "per_channel",
+                            "psum_trunc": 0}},
+  "blob_info":  {"<tensor>": {"int8_step": ..., "int16_step": ...,
+                              "max": ..., "threshold": ...}} }
+```
+
+**`int8_step == threshold / 127` in all 247 blob entries — 0 violations.** INT8 here is
+strict symmetric absmax with no zero-point, so a per-tensor `threshold` fully defines the
+scale. (`int16_step` does *not* follow `threshold/32767` — 202 of 247 differ — so only the
+INT8 relation was relied on.)
+
+`src/DeepSeek-V2-Lite/make_quant_table.py` generates this: weights from their own absmax,
+activations from an onnxruntime calibration pass with every intermediate tensor exposed as a
+graph output.
+
+### Result on the real V2-Lite expert FFN
+
+`EsAAC --input-model=expert_ffn.onnx --quant-stats=expert_ffn_table.json` → **exit 0 in
+2.73 s**; `--inference-datatype` was not needed.
+
+| | fp16 | INT8 |
+| :-- | :-- | :-- |
+| loadable | 18,028,624 B | **9,192,744 B** |
+| weight region (`mem_id=1`) | 17,522,688 B, 30 blobs | **8,908,800 B, 32 blobs** |
+| activation descriptors | dtype 2 (HALF), 4096 B | **dtype 4 (INT8), 2048 B** |
+
+66 experts × 26 MoE layers × 8,908,800 B = **14.2 GiB**, versus 30.1 GiB at fp16. That fits
+the default 22 GiB MMZ (~7.1 GiB per die), so §29's "does not fit" problem is solved and the
+27 GiB U-Boot reconfiguration stays unnecessary.
+
+### Class B conversion of an INT8 loadable — and the classifier bug it exposed
+
+`--convert-weights` on the INT8 model gives 9,192,744 → **283,384 bytes** (32 blobs dropped),
+with the weight descriptor's `data_type` correctly inferred as **4 (INT8)** instead of the
+previously hardcoded HALF, and the board bit-match passes:
+
+```
+mean|static | = 20561.4922   mean|dynamic| = 20561.4922
+byte-identical over 2048 bytes: YES
+```
+
+The first attempt failed with "No Class A weight region found". Cause: **an INT8 region
+interleaves `CvtPrecision_QuantM*` blobs with the `W_*splitM_*` weights** (16 of each in one
+region), while the detector required *every* blob in a region to look like a weight. The rule
+is now "at least one weight-like blob and no command stream", covered by
+`tests/test_weight_region_detection.py` (7 tests).
+
+This matters beyond parsing: those quant blobs carry **that expert's scales**, so they must
+travel with the weights. Extracting "just the weights" from an INT8 expert would bind
+mismatched scales and yield plausible-looking wrong numbers — the same failure class as a
+wrong KV `token_n2`. Converting the whole region is what makes per-expert offset selection
+correct.
+
+### Caveats
+
+- **Calibration inputs are random normal, not real activations.** Post-RMSNorm hidden states
+  are roughly unit-scale so the ranges are plausible, but these thresholds are provisional
+  and accuracy must be re-checked on real V2-Lite hidden states. `--quant-stats` accepts the
+  table either way, so a bad threshold surfaces as silent accuracy loss, not an error.
+- `node_info` values (`option2`, `bias_mode 1`, `per_channel`, `psum_trunc 0`) are copied from
+  the vendor sample, not derived. EsAAC accepted them, but they were never varied, so their
+  effect is unmeasured.
+- **The `simulator` container's `/tmp` does not persist between sessions.** A missing
+  `expert_ffn.onnx` produced `Model expert_ffn.onnx has no graph` / `getBatchFromInputShape
+  failed`, which reads exactly like a frontend rejection and sent the investigation down a
+  wrong path until `ls` showed the file was simply gone. Verify the input exists before
+  interpreting an EsAAC parse error.
+

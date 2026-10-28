@@ -141,10 +141,19 @@ With the board configured for **27.0 GiB total NPU MMZ** (13.5 GiB on Die 0, 13.
         (18,028,624 → 503,128 bytes), and the result is **byte-identical to EsAAC's static
         output on `roma`**. `FINDINGS.md` §29.
   - [ ] `lm_head_d0.onnx` and `lm_head_d1.onnx`: Dual-die logit projection.
-- [ ] Quantize all subgraphs to INT8 using symmetric per-channel quantization. **Now
-      mandatory, not optional:** §29 measures one fp16 expert weight region at 17,522,688
-      bytes, so 66 experts × 26 MoE layers = **30.1 GiB at fp16**, which does not fit the
-      ~27 GiB budget of §6.3. INT8 roughly halves that.
+- [x] Quantize all subgraphs to INT8 using symmetric per-channel quantization.
+      **Done for the expert FFN (2026-10-28), without EsQuant.** §29 made this mandatory
+      (fp16 experts need 30.1 GiB). `make_quant_table.py` synthesizes the EsAAC
+      `--quant-stats` table directly: the vendor schema is `int8_step == threshold/127`
+      across all 247 entries of the release sample, i.e. strict symmetric absmax, so no
+      proprietary tool is required. Loadable 18,028,624 → **9,192,744 B**; weight region
+      17,522,688 → **8,908,800 B**; activations dtype 2 → 4. **66 experts × 26 layers =
+      14.2 GiB, which fits the default 22 GiB MMZ (~7.1 GiB/die)** — so the 27 GiB U-Boot
+      reconfiguration is not needed after all. The INT8 loadable also converts to Class B
+      and is **byte-identical to its static counterpart on `roma`**. `FINDINGS.md` §30.
+      *Caveat: calibration used random-normal inputs, so thresholds are provisional and
+      accuracy must be re-checked against real hidden states — a bad threshold fails
+      silently as accuracy loss, not as an error.* Remaining: MLA and LM-head subgraphs.
 - [ ] Compile `.model` blocks using `EsAAC` / `eswin_compiler`. *(Expert FFN verified via
       EsAAC; note EsAAC writes to `/tmp/model_files/<name>_npu_b1.model`, not the `-o`
       path — §29.)*
