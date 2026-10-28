@@ -170,7 +170,9 @@ With the board configured for **27.0 GiB total NPU MMZ** (13.5 GiB on Die 0, 13.
     residual. Both modes are now implemented and asserted.
   - Per-die grouping (`die_experts[2]`) and the `expert_blob_offset()` addressing exist,
     but **`WorkerPool` dispatch is not wired** — the router is never called from
-    `TransformerSession`.
+    `TransformerSession`. The API gap that made this impossible is now closed: `DmaBufferSlice`
+    binds `{mem_fd, offset, length}` per tensor and is silicon-verified one blob/two experts
+    (runtime Milestone 13, `FINDINGS.md` §32), so wiring it up is ordinary code, not research.
 - [x] Benchmark CPU routing latency: target $< 60\,\mu\text{s}$ per layer.
       **Measured 53.4 µs average on `roma`** (RISC-V 1.4 GHz); x86 host 47.5 µs, so the
       board is within ~12% of host speed. Over 26 MoE layers that is 1.39 ms/token =

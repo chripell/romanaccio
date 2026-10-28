@@ -1163,6 +1163,7 @@ already propagates it correctly (309, 337, 369, 378 → `task.inputFd[i].offset`
 wire format and the task struct support offsets; only the master-side convenience API drops
 them. `MoERouter::expert_blob_offset()` is therefore unusable end-to-end today. The audit's
 `BufferSlice{buffer, offset, size}` overload is the right shape. **Not yet fixed.**
+*(Fixed and silicon-verified the same day — see §32.)*
 
 ### 1.3 `rcvd_fds` lacks reference counting — **plausible, NOT verified**
 
@@ -1224,4 +1225,101 @@ already-bound expert offset is cheaper in DRAM terms (same lines) but still burn
 The better answer is compiling a few macro-graph variants (e.g. 2/3/4 active experts per
 die) and dispatching to the variant matching the router's split, which is exact and wastes
 nothing.
+
+---
+
+## 32. Slice Binding Through the Worker Pool — One Resident Blob Serves Every Expert (Milestone 13)
+
+Audit finding 1.2 is closed: `WorkerPool` now binds `{mem_fd, offset, length}` per tensor.
+
+```cpp
+struct DmaBufferSlice { const DmaBuffer *buffer; size_t offset; size_t size; };  // size 0 = rest
+bool submit_task(uint16_t die_id, uint32_t model_id,
+                 const std::vector<DmaBufferSlice> &inputs,
+                 const std::vector<DmaBufferSlice> &outputs, uint64_t *out_elapsed_ns);
+```
+
+The old `std::vector<DmaBuffer*>` entry point is now an adapter that builds whole-buffer slices,
+so every silicon-validated caller emits the same descriptors as before (verified below, not
+assumed).
+
+### 32.1 Preparing the whole blob is enough — a slice needs no separate prepare
+
+Milestone 13 assumed the SMMU maps `mem_fd` rather than a range, but every prior silicon proof
+(§26, §27) had prepared exactly the `{fd, offset, size}` triple it submitted, so the assumption
+was untested. `tools/probe_prepare_scope.cpp` isolates it on `roma`, in one process, with the
+known-good harness (direct driver, `Cached`, explicit flushes), against the INT8 DeepSeek-V2-Lite
+expert FFN (`in=2048 out=4096 weight=8,908,800`):
+
+| run | prepare | submit | result |
+|-----|---------|--------|--------|
+| golden | static loadable, weights baked in | — | `nonzero=1694/4096 sum=216864` |
+| refA / refB | whole own buffer | whole own buffer | `216864` / `21767` (A′ is A rotated one page) |
+| W0 / WW | blob `[A \| A′]` prepared **once**, full 17,817,600 B | slice @0 / slice @W | `216864` / `21767` |
+| P0 / PW | each slice range prepared explicitly | slice @0 / slice @W | `216864` / `21767` |
+| over | whole | activation descriptor page-rounded to 4096 for a 2048-byte tensor | `216864` |
+
+All nine expectations met. Consequences:
+
+- **Both prepare scopes work.** Preparing a blob once and slicing it many times is correct, so
+  MoE dispatch does *not* need a prepare per expert switch — and finding 1.3 (missing
+  `rcvd_fds` refcount) therefore stays out of the hot path. It is still real, still unfixed,
+  and still leaks on repeated prepare of one `snd_fd`.
+- `DevBuf.size` is the **slice length** (§26) confirmed again.
+- An over-sized input descriptor (buffer page-rounded above the tensor) is harmless.
+
+### 32.2 End-to-end through `WorkerPool` (the code that actually changed)
+
+`tools/probe_buffer_slice.cpp` binds one expert two ways and requires the results to agree, so
+"outputs differ" is never mistaken for correctness:
+
+```
+cache mode: Cached            (identical numbers in NoCache)
+  ref A      nonzero=1694/4096 sum=216864 first4=02 fe 00 fd
+  ref B      nonzero= 176/4096 sum= 21767 first4=00 00 00 00
+  slice A    nonzero=1694/4096 sum=216864 first4=02 fe 00 fd
+  slice B    nonzero= 176/4096 sum= 21767 first4=00 00 00 00
+  ref A vs slice A: byte-identical      ref B vs slice B: byte-identical
+  ref A vs ref B  : different           slice A vs slice B: different
+```
+
+The two slice results match the whole-buffer references *and* the direct-driver golden of
+§29/§30 byte for byte, the inputs are untouched, and per-submit wall time through the worker is
+0.38–0.43 ms (first submit in a fresh process 0.6–1.2 ms). Rejections behave: unaligned offset,
+over-length, offset at the buffer end, null buffer, and an 11-input vector are each refused in
+the master before the worker sees them, and a good submit after the rejections still reproduces
+ref B — the guard is side-effect-free.
+
+### 32.3 A synthetic-input trap that cost a debugging cycle
+
+The first run of this probe returned **four byte-identical, all-zero outputs**, which looks
+exactly like a silently-unbound weight tensor. It was the activation: `memset(act, 0x11, …)` —
+a *uniform* input — makes this INT8 graph emit zeros regardless of the weights. The varied
+8-byte pattern the direct probes use produces `nonzero=1694/4096`. Rule for every future probe:
+**never bind-synthesize a tensor with a constant fill**, and always fingerprint outputs so an
+all-zero result is visible rather than inferred from equality.
+
+### 32.4 Two latent defects fixed on the way
+
+- `input_count`/`output_count` were set from the vector length while the fill loop stopped at 10,
+  so an 11-buffer submit handed the driver uninitialized descriptors that looked like
+  `{fd=0, offset=0, size=0}`. Now rejected up front (`kIpcBufferSlots`).
+- Null entries were silently skipped, leaving a zeroed descriptor in a counted slot. Now rejected;
+  every existing call site already guarantees non-null (`pipeline_executor.cpp:154/172`,
+  `transformer_session.cpp:656–663`, `es_runtime.cpp:197`), verified before changing the contract.
+
+### 32.5 Reproduce
+
+```bash
+cd src/eswin_runtime && make CROSS_COMPILE=riscv64-linux-gnu- -j8
+riscv64-linux-gnu-g++ -std=c++17 -O3 -Wall -Wextra -pthread -fPIC -Iinclude \
+    tools/probe_prepare_scope.cpp -o build/probe_prepare_scope -Lbuild -les_runtime -Wl,-rpath,'$ORIGIN'
+scp -q build/libes_runtime.so build/probe_* roma:/tmp/i8/
+ssh roma "cd /tmp/i8 && sudo ./probe_prepare_scope ./expert_int8.model ./expert_int8_classb.model ./expert_int8_weights_mem1.bin"
+ssh roma "cd /tmp/i8 && sudo ./probe_buffer_slice ./expert_int8_classb.model ./expert_int8_weights_mem1.bin"
+```
+
+`tests/test_buffer_slice.cpp` (12 cases) covers the marshalling off-board — host-fallback
+`submit_task` simulates and never marshals, which is why the pure `fill_ipc_buffers()` helper
+exists. Wired into `make test` and `ctest`.
 

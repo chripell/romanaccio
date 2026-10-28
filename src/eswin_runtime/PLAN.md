@@ -471,6 +471,86 @@ Development is structured into **11 independently verifiable milestones**:
 
 ---
 
+### Milestone 13: Slice-Binding DMA Buffers for Expert Dispatch (audit finding 1.2) [COMPLETED 2026-10-28 — silicon-verified, FINDINGS §32]
+- **Why it blocked MoE**: `WorkerPool::submit_task()` took `const std::vector<DmaBuffer*>`
+  and hardcoded `offset = 0` / `size = buffer->size()` (`worker_pool.cpp:513, 526, 551, 559`).
+  `MoERouter::expert_blob_offset()` computes exactly the offset needed to select an expert
+  inside one resident per-die blob, so **the router's arithmetic was unusable
+  end-to-end**. The worker side already propagates offsets correctly
+  (`worker_pool.cpp:309, 337, 369, 378` → `NpuTask::inputFd[i].offset`) and the IPC wire
+  format already carries `mem_fd`/`offset`/`size` per buffer — **only the master-side
+  convenience API drops them.** A plumbing gap, not a design problem.
+
+- **Semantics already settled empirically — do not re-derive**: `size` is the **slice
+  length**, not the allocation size. `probe_dynamic_weight` submitted a two-expert blob as
+  `DevBuf{fd, offset = 1,769,472, size = 1,769,472}` and the NPU read the second expert
+  correctly, producing different output from `offset = 0` (§26) and byte-identical output to
+  a separate buffer holding the same bytes (§27). INT8 reproduced it at `offset = 8,908,800`
+  (§30). So `{mem_fd, offset, length}` behaves as a slice.
+
+- **API to add** (keep the existing overload so every current caller stays untouched):
+  ```cpp
+  struct DmaBufferSlice {
+      const DmaBuffer *buffer = nullptr;
+      size_t offset = 0;
+      size_t size   = 0;   // 0 => buffer->size() - offset
+  };
+  bool submit_task(uint16_t die_id, uint32_t model_id,
+                   const std::vector<DmaBufferSlice> &inputs,
+                   const std::vector<DmaBufferSlice> &outputs,
+                   uint64_t *out_elapsed_ns = nullptr);
+  ```
+  The `std::vector<DmaBuffer*>` version becomes a thin adapter building slices with
+  `offset = 0`, `size = buffer->size()`. Do **not** modify existing call sites — that overload
+  is what every silicon-validated path currently uses.
+
+- **Required validation, in the master before sending:**
+  1. `buffer != nullptr` and `offset + size <= buffer->size()`. Overflow would make the NPU
+     read past a prepared MMZ region into a neighbouring allocation — the Issue #47 class of
+     corruption, so reject it rather than clamp it.
+  2. `offset % 4096 == 0` until proven otherwise. Every offset verified on silicon so far is
+     page-aligned; arbitrary offsets are **untested**, so fail loudly instead of silently
+     returning wrong numbers. Add an escape hatch only after measuring.
+  3. `offset`/`size` must fit the `uint64_t` IPC field (true for any realistic blob — assert,
+     don't branch).
+  4. Reuse the existing whole-buffer `prepare_buffer()`; do **not** add per-slice preparation.
+     Measured on `roma` (§32.1): preparing the 17,817,600-byte blob once and submitting slices of
+     it binds the right bytes exactly as well as preparing each range — both scopes work, so a
+     blob is prepared once and sliced many times. That also stays off finding 1.3's path, since
+     re-preparing one `snd_fd` is what overwrites `rcvd_fds[snd_fd]` and leaks the imported fd.
+
+- **Tested off-board**: host-fallback `submit_task` simulates and never marshals, so the
+  marshalling lives in the pure helper `fill_ipc_buffers(slices, out, cap, out_count)`.
+  `tests/test_buffer_slice.cpp` (12 cases) pins offset/size propagation, the `size == 0` default,
+  every rejection, and that the whole-buffer default still emits `offset = 0`,
+  `size = buffer->size()` — i.e. the pre-Milestone-13 wire content.
+
+- **Verified on-board** (`tools/probe_buffer_slice.cpp`, INT8 V2-Lite expert FFN, in both
+  `Cached` and `NoCache`): each slice reproduces the whole-buffer bind of the same bytes
+  byte-for-byte (`sum=216864` for the real expert, `sum=21767` for a page-rotated stand-in for
+  expert B), the two slices of one blob differ, both equal the direct-driver golden of §29/§30,
+  and all five malformed slice forms are refused in the master without disturbing the next good
+  submit. `tools/probe_prepare_scope.cpp` is the prepare-scope isolation run behind item 4.
+  Pitfall found while writing it: a *uniform* synthetic activation makes this INT8 graph return
+  all zeros regardless of the weights — indistinguishable from a binding failure (§32.3).
+
+- **Deliverables (all landed except the last)**: `DmaBufferSlice`, `SliceError`,
+  `kIpcBufferSlots`/`kSliceAlignment` and the slice overload in `worker_pool.{hpp,cpp}`; the
+  `std::vector<DmaBuffer*>` entry point is now a thin adapter; `tests/test_buffer_slice.cpp`
+  wired into `make test` and `ctest`; the two probes above. **Remaining**: the real call site in
+  the MoE decode loop, which needs Milestone 10's `TransformerSession` switch-over.
+
+- **Two latent defects fixed on the way** (§32.4): an over-capacity vector set `input_count` from
+  its own length while filling only 10 slots, handing the driver uninitialized descriptors; and
+  null entries were silently skipped instead of rejected. Every call site was checked before the
+  contract changed.
+
+- **Sequencing**: independent of the cache-mode question (finding 1.1), which is still blocked on
+  the empirical `MemFlushCache` direction test. Slicing as designed does *not* make 1.3 reachable
+  — one prepare per blob, many slices — so 1.3 stays a cleanup rather than a MoE blocker.
+
+---
+
 ## 6. Coding Standards & Review Guidelines
 
 1. **Clean C Interface**: The public header `es_runtime.h` must remain strictly C11 compliant with zero C++ syntax or standard library leaks.
