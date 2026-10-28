@@ -99,8 +99,20 @@ void TransformerSession::discover_and_load_layer_subgraphs(const std::string &mo
     m_layer_subgraphs.resize(n_layers);
 
     size_t max_gemm_bytes = 16384;
-    if (m_manifest.config.hidden_size * 2 * 2 > max_gemm_bytes) {
-        max_gemm_bytes = m_manifest.config.hidden_size * 2 * 2;
+    // These buffers carry whatever activation crosses the NPU, so they must be sized for
+    // the widest projection in the model, not a fixed floor. The previous rule
+    // (16384, or hidden_size * 4) silently overflowed DMA memory for any subgraph wider
+    // than that - an MLP intermediate is typically 4-8x hidden_size, e.g. 10944 for
+    // DeepSeek-V2-Lite's dense layer 0 versus hidden_size 2048. Oversized is cheap here
+    // (a few hundred KiB of MMZ); undersized corrupts neighbouring DMA allocations.
+    const size_t widest[] = {
+        static_cast<size_t>(m_manifest.config.hidden_size),
+        static_cast<size_t>(m_manifest.config.intermediate_size),
+    };
+    for (size_t elems : widest) {
+        // *2 for fp16, *2 again as headroom for multi-tensor subgraph outputs.
+        const size_t bytes = elems * 2 * 2;
+        if (bytes > max_gemm_bytes) max_gemm_bytes = bytes;
     }
 
     bool need_d0_gemm = false;

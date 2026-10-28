@@ -1105,3 +1105,123 @@ correct.
   wrong path until `ls` showed the file was simply gone. Verify the input exists before
   interpreting an EsAAC parse error.
 
+---
+
+## 31. Triage of the 2026-10-28 External Audit (`deep/BUGS.md`)
+
+An independent source-level audit raised seven findings. Each was checked against the code
+rather than accepted; results below, including where the audit's diagnosis or its
+recommended fix is wrong.
+
+### 1.1 `TransformerSession` cache mode — **perf bug confirmed, coherence bug NOT present, recommended fix is unsafe as written**
+
+Confirmed: all eight NPU buffers use `CacheMode::NoCache`
+(`transformer_session.cpp:175,176,181,182` for `m_d{0,1}_gemm_{in,out}`; `328–331` for
+`m_d{0,1}_{in,out}`), and the file contains **zero** `flush_cache()` calls.
+
+But the audit's framing is wrong in a way that matters. **`NoCache` memory needs no flush** —
+it is uncached, so CPU and NPU cannot disagree. There is no coherence bug today; there is a
+*performance* bug (uncached MMZ CPU reads run at 10–60 MB/s, and the logits read-back is
+76,032 × 2 bytes per die).
+
+The recommended fix — "switch to `Cached` and call `flush_cache()`" — **could introduce a
+real coherence bug**, because the direction of the vendor primitive is unknown:
+
+```
+$ riscv64-linux-gnu-nm -D --defined-only rootfs-roma/lib/libes_memory.so | grep ES_SYS_
+ES_SYS_MemAlloc, ES_SYS_MemFlushCache, ES_SYS_MemFlushCacheAll,
+ES_SYS_MemFlushCacheAllByNid, ES_SYS_MemFree, ES_SYS_Mmap, ES_SYS_Munmap,
+ES_SYS_RcvMemFd, ES_SYS_RetrieveMemNodeByFd/ByVaddr, ES_SYS_SplitMemFd, ES_SYS_GetMemSize
+```
+
+There is **no invalidate** — here or anywhere in `libedla_runtime.so.1.0` (0 matching
+symbols). `ES_SYS_MemFlushCache(uint64_t memFd)` takes no direction, offset or length, and
+disassembly shows it is a thunk (`j SYS_MemFlushCache@plt`) into another module, so its
+semantics are not recoverable from the signature. CPU→NPU needs *clean*; NPU→CPU needs
+*invalidate*. If `MemFlushCache` only cleans, then switching the logits buffer to `Cached`
+would let the CPU read **stale lines** for NPU-written data — turning a slow-but-correct
+path into a fast-but-wrong one, on the exact tensor that decides every sampled token.
+
+**Safe path:** determine the direction empirically before switching (write a known pattern
+from the NPU into a `Cached` buffer, read it back from the CPU with and without
+`MemFlushCache`, and check for staleness), or use `ES_SYS_MemFlushCacheAll`/`ByNid` if those
+are clean+invalidate. Note this also applies to code added in Milestone 7/9:
+`PipelineExecutor::copy_across_dies` and `HardwareKvCache` use `Cached` and flush after CPU
+*writes*, but `copy_across_dies` then CPU-reads a buffer the **NPU** wrote — if the
+primitive does not invalidate, that read is exposed to the same staleness. Unverified.
+
+**Sub-item 1.1.3 (`max_gemm_bytes`) — confirmed and FIXED.** The floor was
+`max(16384, hidden_size * 4)`, so any subgraph wider than that overflowed DMA memory
+silently; an MLP intermediate is typically 4–8× `hidden_size` (10944 vs 2048 for V2-Lite's
+dense layer 0). Now sized from `max(hidden_size, intermediate_size) * 4`. The precise fix —
+tracking each loaded subgraph's `ModelInfo` input/output sizes — is still worth doing.
+
+### 1.2 `WorkerPool::submit_task` cannot express `DevBuf.offset` — **confirmed, and it is the current MoE blocker**
+
+`worker_pool.cpp` hardcodes `offset = 0` at lines 513, 526, 551, 559, while the worker side
+already propagates it correctly (309, 337, 369, 378 → `task.inputFd[i].offset`). So the IPC
+wire format and the task struct support offsets; only the master-side convenience API drops
+them. `MoERouter::expert_blob_offset()` is therefore unusable end-to-end today. The audit's
+`BufferSlice{buffer, offset, size}` overload is the right shape. **Not yet fixed.**
+
+### 1.3 `rcvd_fds` lacks reference counting — **plausible, NOT verified**
+
+Not checked against `run_worker_loop()` in this pass. The described failure (re-prepare of
+one `snd_fd` overwriting the imported fd, and a single unprepare freeing a shared
+descriptor) is consistent with the map-based design, but treat it as unconfirmed.
+
+### 1.4 `NVDLAGEMMBuilder` geometry — **confirmed**
+
+`c_out_per_pass = c_out // 3` with `w2 = w_arr[2 * c_out_per_pass:, :]` takes the remainder,
+so for `c_out = 1408` the third slice has 470 rows against 469 for the first two, while
+`total_w_size = len(w0_packed) * 3` — **under-allocating the weight region**. Also confirmed
+that the `linear3p` KMD/UMD templates are emitted verbatim, so this builder is only correct
+for the 1536 × 576 geometry it was templated from.
+
+Sub-item 1.4.3 is also correct and is a consequence of the guard added in `31799bc`:
+`compile_safetensors_llm()` now always raises without `--allow-partial-graph`, because
+`synthesize_mlp_block` yields 3 CONV + 1 MUL. That was deliberate (silent truncation was
+worse), but the audit is right that the *real* fix is decomposing the LLM path into one
+single-op loadable per projection. **Not yet fixed.**
+
+### 1.5 `eswin-sim` blind to Class B loadables — **plausible, NOT verified**
+
+Not checked in this pass. The described dispatch (`if "W_0" in model.blobs` / `WsplitM_` /
+`w_gatesplitM_`) would indeed find nothing in a converted model, since `--convert-weights`
+strips exactly those blobs; and a hardcoded `* 2` bytes-per-element would mis-size INT8
+weights by 2×. If correct, this means dynamic-weight models are currently untestable
+off-board, which contradicts what `eswin_compiler/PLAN.md` Milestone 7 asks for. Worth
+verifying before relying on the simulator for MoE work.
+
+### 1.6 Quant table I/O precision — **legitimate design gap**
+
+`make_quant_table.py` sets `input_data_type`/`output_data_type` to `int8`, so the compiled
+graph has INT8 boundaries. Chaining subgraphs then requires the runtime to know each
+boundary's `int8_step` (= `threshold/127`) or to keep boundaries fp16. Neither is
+implemented, and the bias-initializer question under `bias_mode == 1` is genuinely open.
+This is a real gap for Phase 1, not just a nit.
+
+### 1.7 Documentation drift — **partly confirmed**
+
+Confirmed stale in `src/DeepSeek-V2-Lite/PLAN.md`: §6.7 still says the weights are not in
+`deep/models/` and that board SSH is failing. Both were true on 2026-10-24 and are not true
+now (§5 Phase 1 records 4/4 shards, 31.4 GB; `roma` ran benchmarks on 2026-10-27). §3's
+27 GiB topology diagram is superseded by §6.3 and §30 (INT8 experts need 14.2 GiB, which
+fits the default 22 GiB). README omissions and the absolute `deep/` symlinks were not
+checked.
+
+### On the audit's Priority 3 (batch experts into one submit)
+
+The mechanism is sound and consistent with measured facts: `NPU_TASK_S` has `inputFd[10]`,
+EsAAC compiles multi-op graphs (§29), and `DevBuf.offset` is honoured bit-exactly (§26), so
+`inputFd[1..k]` can all point at one per-die blob at different expert offsets. Reducing
+~318 submits/token toward ~54 is worth a lot at the measured 0.233–0.305 ms/submit (§28.2).
+
+**One correction:** the suggested fallback of binding "a zero-weight dummy slot (or scale by
+0.0)" when a die has fewer than *k* active experts does **not** save bandwidth — the NPU
+still streams those weight bytes, and streaming is the whole cost (§24). Duplicating an
+already-bound expert offset is cheaper in DRAM terms (same lines) but still burns compute.
+The better answer is compiling a few macro-graph variants (e.g. 2/3/4 active experts per
+die) and dispatching to the variant matching the router's split, which is exact and wastes
+nothing.
+

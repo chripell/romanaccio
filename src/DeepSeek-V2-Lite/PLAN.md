@@ -409,13 +409,22 @@ path. Measure first-token latency and KV stability at 4K, not 16K, first.
 
 ## 6.7 Open decisions needing the user
 
-1. **Weights are not local.** `deep/models/` holds only `qwen2_5_coder_1.5b` and `smollm`.
-   DeepSeek-V2-Lite is ~31 GiB fp16 / ~14.6 GiB INT8. Download, or work from a smaller MoE
-   first?
-2. **Board SSH is currently failing** (`Permission denied (publickey,password)` as of
-   2026-10-24, though it worked earlier the same day). Phase 0 is entirely board-dependent.
-3. **Target context length** (4K recommended first) — it fixes the compile and the memory
-   budget, and cannot be changed afterwards without recompiling.
+1. ~~**Weights are not local.**~~ **Resolved 2026-10-24:** all 4 shards (31,412,968,448
+   bytes) are in `deep/models/DeepSeek-V2-Lite/`, verified against
+   `model.safetensors.index.json`.
+2. ~~**Board SSH is currently failing.**~~ **Resolved:** `roma` was reachable again from
+   2026-10-27 onward and has since run the routing benchmark (§6.10), the fp16 and INT8
+   expert bit-matches (§29, §30 of `FINDINGS.md`) and the submit/load measurements (§28).
+3. **Target context length** (4K recommended first) — still open. It fixes the compile and
+   the memory budget, and cannot be changed afterwards without recompiling.
+4. **New, from the 2026-10-28 audit triage (`FINDINGS.md` §31):** whether to switch
+   `TransformerSession` off `CacheMode::NoCache`. It is a real performance problem (uncached
+   MMZ CPU reads are 10–60 MB/s and the logits read-back is 76,032 × 2 B per die), but the
+   vendor API exposes **no cache invalidate** — only `ES_SYS_MemFlushCache(memFd)`, a thunk
+   whose direction is not recoverable from its signature. Switching to `Cached` without
+   knowing whether that invalidates risks stale CPU reads of NPU-written logits, i.e.
+   trading a slow-but-correct path for a fast-but-wrong one. Needs an empirical direction
+   test first.
 
 ## 6.8 Knock-on work in the other components
 
