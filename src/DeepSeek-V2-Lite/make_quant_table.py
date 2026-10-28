@@ -29,6 +29,10 @@ states.
 
 Usage:
     python make_quant_table.py expert_ffn.onnx -o table.json [--samples 8] [--seed 0]
+
+    # one loadable serving every expert of a layer: reuse one activation calibration
+    python make_quant_table.py expert1.onnx -o expert1_shared.json \
+        --activations-from expert0_table.json
 """
 
 import argparse
@@ -85,20 +89,30 @@ def calibrate(model: onnx.ModelProto, input_name: str, shape, samples: int, seed
 
     rng = np.random.default_rng(seed)
     peaks = {n: 0.0 for n in out_names}
+    input_peak = 0.0
     for _ in range(samples):
         # Unit-normal, matching post-RMSNorm hidden states entering an expert FFN.
         x = rng.standard_normal(shape).astype(np.float32)
+        input_peak = max(input_peak, float(np.max(np.abs(x.astype(np.float64)))))
         for name, value in zip(out_names, sess.run(out_names, {input_name: x})):
             v = float(np.max(np.abs(np.asarray(value, dtype=np.float64))))
             if v > peaks[name]:
                 peaks[name] = v
+    # A graph input is not produced by any node, so expose_intermediates() never adds it and
+    # onnxruntime never reports it. Without this line the input silently fell back to a
+    # threshold of 1.0, which clips real post-RMSNorm hidden states (absmax ~3-5).
+    peaks[input_name] = max(peaks.get(input_name, 0.0), input_peak)
     return peaks
 
 
-def build_table(model: onnx.ModelProto, peaks, dtype: str = "int8") -> dict:
+def build_table(model: onnx.ModelProto, peaks, dtype: str = "int8",
+                activations_from: dict | None = None,
+                merge_max: dict | None = None,
+                quant_method: str = "per_channel") -> dict:
     g = model.graph
     input_names = [i.name for i in g.input]
     output_names = [o.name for o in g.output]
+    initializer_names = {i.name for i in g.initializer}
 
     blob_info = {}
 
@@ -126,9 +140,46 @@ def build_table(model: onnx.ModelProto, peaks, dtype: str = "int8") -> dict:
         if name not in blob_info:
             add_blob(name, peak)
 
+    # Shared-activation mode: one loadable has to serve every expert of a layer, and the
+    # activation thresholds are baked into its command streams, so they cannot be per-expert.
+    # Take them from a reference table instead; weight thresholds stay this expert's own,
+    # because the weight region carries its own scales and is bound at submit time.
+    if activations_from is not None:
+        ref = activations_from["blob_info"]
+        shared = []
+        for name in list(blob_info):
+            if name in initializer_names:
+                continue
+            if name not in ref:
+                raise SystemExit(f"reference table has no activation blob '{name}' -- it was "
+                                 f"calibrated from a different graph")
+            blob_info[name] = dict(ref[name])
+            shared.append(name)
+        print(f"  shared activation thresholds from reference: {', '.join(sorted(shared))}")
+
+    # Merge-max mode: widen every threshold this blob shares with the reference to the larger of
+    # the two. Run it once per expert against the others and all experts end up with an
+    # IDENTICAL table, which is what lets one compiled loadable serve all of them: measured on
+    # real V2-Lite experts, binding expert 1's region into expert 0's loadable does NOT reproduce
+    # expert 1's own result unless the weight thresholds match too (FINDINGS §33). Taking the max
+    # costs a little precision for the expert with the smaller absmax and buys interchangeability.
+    if merge_max is not None:
+        ref = merge_max["blob_info"]
+        widened = []
+        for name, entry in blob_info.items():
+            r = ref.get(name)
+            if r is None:
+                continue
+            if r["threshold"] > entry["threshold"]:
+                blob_info[name] = dict(r)
+                widened.append(name)
+        print(f"  widened to the reference maximum: "
+              f"{', '.join(sorted(widened)) if widened else '(none)'}")
+
     node_info = {}
     for node in g.node:
         entry = dict(NODE_TEMPLATE)
+        entry["quantized_method"] = quant_method
         entry["input_blob_names"] = [i for i in node.input if i]
         entry["output_blob_names"] = [o for o in node.output if o]
         node_info[node.name or f"{node.op_type}_{len(node_info)}"] = entry
@@ -153,6 +204,24 @@ def main() -> int:
     p.add_argument("-o", "--output", type=Path, default=Path("table.json"))
     p.add_argument("--samples", type=int, default=8, help="calibration runs (default 8)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--activations-from", type=Path, default=None,
+                   help="Take activation thresholds from this existing table instead of this "
+                        "model's own calibration, keeping this model's weight thresholds. Use "
+                        "it when one compiled loadable must serve several experts: the "
+                        "activation scales are baked into its command streams, while the weight "
+                        "scales travel inside the submit-time weight region.")
+    p.add_argument("--merge-max", type=Path, action="append", default=None, metavar="TABLE",
+                   help="Widen every shared blob's threshold to the maximum of this table's "
+                        "and the current one. Repeatable. Give every expert of a layer the same "
+                        "set of references and they all end up with an identical table, which is "
+                        "what makes one compiled loadable serve all of them.")
+    p.add_argument("--quant-method", choices=["per_channel", "per_tensor"],
+                   default="per_channel",
+                   help="Weight quantization granularity written into every node_info entry "
+                        "(default per_channel, mirroring the vendor sample). per_channel derives "
+                        "scales from the actual weight data, which leaves a weight-dependent "
+                        "requant shift in the compiled command stream and so pins a loadable to "
+                        "one expert; per_tensor is what lets a whole layer share one loadable.")
     args = p.parse_args()
 
     model = onnx.load(str(args.onnx_model))
@@ -168,7 +237,23 @@ def main() -> int:
           f"{args.samples} samples")
     peaks = calibrate(model, in_name, shape, args.samples, args.seed)
 
-    table = build_table(model, peaks)
+    ref_table = None
+    if args.activations_from:
+        ref_table = json.loads(args.activations_from.read_text())
+        print(f"activation thresholds from {args.activations_from.name}")
+
+    merged = None
+    if args.merge_max:
+        merged = {"blob_info": {}}
+        for path in args.merge_max:
+            for name, entry in json.loads(path.read_text())["blob_info"].items():
+                cur = merged["blob_info"].get(name)
+                if cur is None or entry["threshold"] > cur["threshold"]:
+                    merged["blob_info"][name] = entry
+        print(f"merge-max references: {', '.join(p.name for p in args.merge_max)}")
+
+    table = build_table(model, peaks, activations_from=ref_table, merge_max=merged,
+                        quant_method=args.quant_method)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(table, indent=2))
 

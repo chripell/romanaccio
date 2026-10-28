@@ -26,6 +26,10 @@ afterwards with `compiler.py --convert-weights`, not at export time.
 Usage:
     python export_expert_ffn.py [--hidden 2048] [--intermediate 1408]
                                 [--seed 0] [-o expert_ffn.onnx] [--zero-weights]
+
+    # real DeepSeek-V2-Lite weights instead of the synthetic ones:
+    python export_expert_ffn.py --safetensors ../../../../deep/models/DeepSeek-V2-Lite \
+                                --layer 1 --expert 0 -o expert0.onnx
 """
 
 import argparse
@@ -38,19 +42,25 @@ from onnx import TensorProto, helper, numpy_helper
 OPSET = 13
 
 
-def build_graph(hidden: int, intermediate: int, seed: int, zero_weights: bool):
-    """Builds the SwiGLU expert graph. Returns (graph, weight_arrays)."""
+def build_graph(hidden: int, intermediate: int, seed: int, zero_weights: bool,
+                real: dict | None = None):
+    """Builds the SwiGLU expert graph. Returns (graph, weight_arrays).
+
+    @param real When given, its W_gate/W_up/W_down replace the synthetic weights.
+    """
     rng = np.random.default_rng(seed)
 
-    def w(out_c: int, in_c: int) -> np.ndarray:
+    def w(out_c: int, in_c: int, name: str) -> np.ndarray:
+        if real is not None:
+            return real[name]
         if zero_weights:
             return np.zeros((out_c, in_c, 1, 1), dtype=np.float32)
         # Small init keeps activations inside fp16 range once EsAAC converts.
         return (rng.standard_normal((out_c, in_c, 1, 1)) * 0.02).astype(np.float32)
 
-    w_gate = w(intermediate, hidden)
-    w_up = w(intermediate, hidden)
-    w_down = w(hidden, intermediate)
+    w_gate = w(intermediate, hidden, "W_gate")
+    w_up = w(intermediate, hidden, "W_up")
+    w_down = w(hidden, intermediate, "W_down")
 
     x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, hidden, 1, 1])
     y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, hidden, 1, 1])
@@ -79,6 +89,51 @@ def build_graph(hidden: int, intermediate: int, seed: int, zero_weights: bool):
     return graph, {"W_gate": w_gate, "W_up": w_up, "W_down": w_down}
 
 
+def load_real_weights(model_dir: Path, layer: int, expert: int, hidden: int,
+                      intermediate: int) -> dict:
+    """Reads one expert's gate/up/down out of a HuggingFace safetensors checkpoint.
+
+    Reads only the three tensors it needs, via the shard index -- `load_file()` would pull a
+    whole 8.6 GB shard into RAM. torch is imported here rather than at module scope because
+    the checkpoint is bfloat16, which numpy cannot represent, while the synthetic path needs
+    neither torch nor safetensors.
+    """
+    import json
+
+    import torch  # noqa: F401  (needed for the bf16 dtype safetensors returns)
+    from safetensors import safe_open
+
+    index_path = model_dir / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise SystemExit(f"missing shard index: {index_path}")
+    weight_map = json.loads(index_path.read_text())["weight_map"]
+
+    prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+    wanted = {
+        "W_gate": (f"{prefix}.gate_proj.weight", (intermediate, hidden)),
+        "W_up": (f"{prefix}.up_proj.weight", (intermediate, hidden)),
+        "W_down": (f"{prefix}.down_proj.weight", (hidden, intermediate)),
+    }
+
+    handles: dict = {}
+    out = {}
+    for name, (tensor_name, expect) in wanted.items():
+        shard = weight_map.get(tensor_name)
+        if shard is None:
+            raise SystemExit(f"{tensor_name} is not in the shard index -- check --layer/--expert "
+                             f"(layer {layer} may be dense, not MoE)")
+        if shard not in handles:
+            handles[shard] = safe_open(str(model_dir / shard), framework="pt")
+        t = handles[shard].get_tensor(tensor_name)
+        if tuple(t.shape) != expect:
+            raise SystemExit(f"{tensor_name} is {tuple(t.shape)}, expected {expect}")
+        arr = t.to(torch.float32).numpy()
+        out[name] = np.ascontiguousarray(arr.reshape(expect[0], expect[1], 1, 1))
+        print(f"  {name:<7} <- {tensor_name}  {tuple(t.shape)} {str(t.dtype)} "
+              f"absmax={np.abs(arr).max():.6f}")
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -92,10 +147,24 @@ def main() -> int:
                         "numerics do not matter and a small file is wanted.")
     p.add_argument("--save-weights", type=Path, default=None,
                    help="Also write the fp32 weights as an .npz for golden comparison.")
+    p.add_argument("--safetensors", type=Path, default=None,
+                   help="Checkpoint directory to read real weights from (needs "
+                        "model.safetensors.index.json). Overrides --seed/--zero-weights.")
+    p.add_argument("--layer", type=int, default=1,
+                   help="Transformer layer to take the expert from (default 1; layer 0 is "
+                        "dense because first_k_dense_replace=1)")
+    p.add_argument("--expert", type=int, default=0, help="Routed expert index (default 0)")
     args = p.parse_args()
 
+    real = None
+    if args.safetensors:
+        print(f"reading real weights: layer {args.layer} expert {args.expert} "
+              f"from {args.safetensors}")
+        real = load_real_weights(args.safetensors, args.layer, args.expert, args.hidden,
+                                 args.intermediate)
+
     graph, weights = build_graph(args.hidden, args.intermediate, args.seed,
-                                args.zero_weights)
+                                args.zero_weights, real)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
     model.ir_version = 8
     onnx.checker.check_model(model)
