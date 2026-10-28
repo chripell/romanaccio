@@ -551,6 +551,39 @@ Development is structured into **11 independently verifiable milestones**:
 
 ---
 
+### Milestone 14: Per-Expert Command-Stream Patching (the only remaining MoE route) [PLANNED — gated on one experiment]
+- **Why**: FINDINGS §33 falsified "one loadable per layer, offset selects the expert" for INT8.
+  Two real DeepSeek-V2-Lite experts compiled with a **byte-identical** quant table produce Class B
+  loadables that differ in **exactly 6 bytes of 283,384** — one per graph node, in
+  `kmd-task-op_list` at in-record offset 82, values `0x18` vs `0x19`, a weight-derived requant
+  shift. Patching them makes the two files identical (same md5). Binding expert 1's weight region
+  into expert 0's loadable gives cos 0.958 / maxdiff 82 — plausible-looking and wrong.
+- **The alternatives are measured dead**: per-expert loadables cost 34.25 ms to load+unload
+  (64×26 per token ≈ 56 s/token), and only **62 models stay resident per die** — a 63rd load
+  fails and the next unload/submit **Oopses the kernel** in `eic7700_npu`
+  (`destroy_frame` ← `npu_release_frame`, dereferencing `ERR_PTR(-EINVAL)` from
+  `io_tensor_to_io_addr`). `per_tensor` quantization, which would remove the coupling, makes
+  EsAAC SIGSEGV.
+- **Gate (do this before writing any patcher)**: prove the NPU honours a post-load edit.
+  1. Load one Class B loadable, locate its `kmd-task-op_list` in device memory — candidates:
+     scan the worker's MMZ mappings for the known 101,184-byte stream signature, or reverse
+     `libedla_runtime`'s load path to see where blobs are copied.
+  2. Patch the 6 bytes to the other expert's values, submit with that expert's weight slice, and
+     require a **byte-exact** match against that expert's static loadable (`probe_two_experts`
+     already computes exactly this comparison).
+  3. If the driver copies/checksums/pre-translates the stream at load, this route dies too, and
+     MoE falls back to a per-layer macro-graph design — say so plainly rather than patching
+     around it.
+- **If it works**: the compiler side must emit a per-expert patch table (offsets + values, or the
+  rule that generates them) next to each weight region, and the runtime applies it on expert
+  switch. 26 loadables per die ≤ 62 ✓, one resident weight blob, patch cost ≈ nanoseconds.
+- **Deliverables**: `tools/probe_stream_patch.cpp` for the gate; then
+  `ExpertStreamPatcher` in `src/llm/`, a compiler `--emit-patch-table` output, and a
+  `test_stream_patch` suite that validates offsets/values against two compiled experts off-board.
+- **Do not** preload near the 62-model ceiling in any test: it crashes the board (§33.4).
+
+---
+
 ## 6. Coding Standards & Review Guidelines
 
 1. **Clean C Interface**: The public header `es_runtime.h` must remain strictly C11 compliant with zero C++ syntax or standard library leaks.

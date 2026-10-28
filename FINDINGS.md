@@ -1323,3 +1323,120 @@ ssh roma "cd /tmp/i8 && sudo ./probe_buffer_slice ./expert_int8_classb.model ./e
 `submit_task` simulates and never marshals, which is why the pure `fill_ipc_buffers()` helper
 exists. Wired into `make test` and `ctest`.
 
+---
+
+## 33. Two Real Experts in One Per-Die Blob: Offset Selection Works, Loadables Are Not Interchangeable
+
+§32 proved the slicing mechanism with a page-rotated stand-in. This uses the real thing:
+DeepSeek-V2-Lite **layer 1, routed experts 0 and 1**, weights read from the 31.4 GB checkpoint
+(`model.layers.1.mlp.experts.{0,1}.{gate,up,down}_proj.weight`, bfloat16 → fp32), exported to
+opset-13 ONNX, INT8-compiled by EsAAC from synthesized `--quant-stats` tables, converted to
+Class B, and concatenated into one **17,817,600-byte per-die blob** (2 × 8,908,800, both
+offsets page-aligned). Everything below is measured on `roma` through `WorkerPool`'s slice API
+with `tools/probe_two_experts.cpp`, and reproduces identically after a reboot.
+
+### 33.1 Offset selection with real weights: byte-exact
+
+| run | binding | vs its own static loadable |
+|-----|---------|---------------------------|
+| R1 | `classb(expert0)` + slice @0 | **BYTE-IDENTICAL** (cos 1.000000, maxdiff 0) |
+| R4 | `classb(expert1)` + slice @8,908,800 | **BYTE-IDENTICAL** (cos 1.000000, maxdiff 0) |
+| — | expert0 output vs expert1 output | differs, **cos 0.042** — genuinely different experts |
+
+Two real experts now live in one resident blob and are selected purely by `DevBuf.offset`.
+Output surface note: the graph declares `output (1,2048,1,1) INT8` = 2048 bytes inside a
+**4096-byte page-padded surface**; bytes [2048,4096) read back as zero. (§32's probe guessed
+fp16 here and decoded NaN — the tensor is int8.)
+
+### 33.2 The blocker: one loadable cannot serve two experts
+
+Approach (b) assumed a single per-layer loadable could run any expert by changing an offset.
+**It cannot**, and the reason is now pinned to the byte:
+
+- Giving both experts an **identical** quant table (thresholds merged to the per-blob maximum,
+  so `shared0_table.json == shared1_table.json` byte for byte) still leaves the two Class B
+  loadables differing in **exactly 6 bytes out of 283,384**.
+- All 6 are in `kmd-task-op_list` (101,184 B) — **one per graph node**, at in-record offset 82
+  within 5,952-byte op records (the last record is 3,968 B), values `0x18` (24) for expert 0 vs
+  `0x19` (25) for expert 1. A weight-derived requantization shift.
+- Every other blob is byte-identical: `kmd-task-dep_graph`, `surf_list`, `lut_list`,
+  `config_list`, `addr0`, and all five UMD streams.
+- Patching those 6 bytes makes expert 0's Class B file **byte-identical** to expert 1's
+  (both md5 `5922e28da803c23246bd970b788b0fc0`).
+- Binding expert 1's region into expert 0's loadable: **cos 0.958111, maxdiff 82**, output
+  magnitude 31.89 vs the correct 18.49 (≈1.7×) — close enough to look plausible, wrong enough
+  to poison a residual stream. Not usable.
+- `quantized_method: per_tensor`, which should remove weight-derived shifts, makes **EsAAC
+  SIGSEGV (exit 139)** — the same failure class as the second-dynamic-input crash (§6.11-era
+  probe). So the vendor compiler cannot be steered away from per-channel behaviour.
+
+### 33.3 What this does to the MoE plan
+
+| route | measured cost | verdict |
+|-------|---------------|---------|
+| 27 loadables, offset selects the expert | — | **falsified** for INT8 (§33.2) |
+| one loadable per (layer, expert) = 1664 | Class B load+unload **34.25 ms** mean (p50 34.20, min 33.86, max 34.72) | 64×26 loads/token ≈ **56 s/token** — impossible |
+| preload all variants resident | ceiling **62 loadables/die**, then load fails | 1664 ≫ 62 — impossible |
+| **one loadable per layer + patch 6 bytes per expert switch** | 26 loadables ≤ 62 ✓, one resident blob, patch ≈ ns | **the remaining route** |
+
+The patch route needs two things proven: locating the loaded `kmd-task-op_list` in device
+memory, and confirming the NPU honours a post-load patch (the driver may copy, checksum, or
+pre-translate the stream at load time). That is the next gate; until it is answered, treat
+"one loadable per layer" as unproven rather than assumed.
+
+Note the resident ceiling is per die and close to one layer's expert count: **32 experts/die
+would fit under 62**, so an expert-parallel split keeps a *single layer's* experts resident —
+but not 26 layers of them.
+
+### 33.4 Exceeding the model ceiling crashes the vendor driver
+
+Loading a 63rd Class B model fails cleanly, but the following unload/submit takes the kernel
+with it — a missing `ERR_PTR` check in the vendor module:
+
+```
+[NPU][DRIVER][ERROR](io_tensor_to_io_addr:143) err:import input dmabuf error!i=0
+Unable to handle kernel paging request at virtual address ffffffffffffffea   (= ERR_PTR(-EINVAL))
+Oops [#1]  CPU: 0 PID: 2826 Comm: probe_two_exper  6.6.92-eic7x-2025.07  DeepComputing FML13V03
+epc : destroy_frame.part.0+0x68/0x140 [eic7700_npu]
+ ra : npu_release_frame+0x18/0x62 [eic7700_npu]
+      kref_khandle_fn <- kernel_handle_decref <- npu_dev_ioctl <- __riscv_sys_ioctl
+```
+
+`io_tensor_to_io_addr` fails, an error pointer is stored where a frame is expected, and
+`destroy_frame` dereferences it. The worker's IPC channel then times out (30 s) and the die is
+unusable until reboot. **Do not preload past ~60 models per die**, and treat this as a candidate
+upstream bug report against `eic7700_npu`.
+
+### 33.5 Two quantization-tool fixes found on the way
+
+- `make_quant_table.py` never calibrated the graph **input**: `expose_intermediates()` only adds
+  tensors *produced by a node*, so `input` fell through to the `1.0` fallback threshold — which
+  would clip real post-RMSNorm hidden states (measured absmax **4.02**) to ±1.0 in every INT8
+  model compiled so far, including §30's. Now taken from the calibration samples.
+- Added `--merge-max TABLE` (widen shared thresholds to the maximum, so every expert of a layer
+  ends up with an identical table) and `--quant-method {per_channel,per_tensor}`. `per_tensor`
+  is emitted correctly but EsAAC rejects it (§33.2).
+
+### 33.6 Reproduce
+
+```bash
+V=/home/chri/aixigua/venv/bin/python; S=deep/artifacts/scratch
+cd src/DeepSeek-V2-Lite
+for e in 0 1; do
+  $V export_expert_ffn.py --safetensors $S/../../models/DeepSeek-V2-Lite --layer 1 --expert $e \
+     -o $S/expert$e.onnx --save-weights $S/expert${e}_w.npz
+  $V make_quant_table.py $S/expert$e.onnx -o $S/expert${e}_table.json --seed 0
+done
+$V make_quant_table.py $S/expert0.onnx -o $S/shared0_table.json --seed 0 --merge-max $S/expert1_table.json
+# container: EsAAC --input-model=sxN.onnx --quant-stats=shared_table.json   (2.7 s each, exit 0)
+cd ../eswin_compiler
+for m in sx0 sx1; do $V compiler.py -m $S/int8_2exp/${m}_npu_b1.model -o $S/int8_2exp --convert-weights; done
+cat $S/int8_2exp/sx{0,1}_npu_b1_weights_mem1.bin > $S/int8_2exp/two_expert_shared_blob.bin
+cd ../eswin_runtime && make CROSS_COMPILE=riscv64-linux-gnu- -j8
+riscv64-linux-gnu-g++ -std=c++17 -O3 -Wall -Wextra -pthread -fPIC -Iinclude \
+    tools/probe_two_experts.cpp -o build/probe_two_experts -Lbuild -les_runtime -Wl,-rpath,'$ORIGIN'
+ssh roma "cd /tmp/e2 && sudo ./probe_two_experts --static0 sx0_npu_b1.model \
+    --static1s sx1_npu_b1.model --classb0 sx0_npu_b1_classb.model \
+    --classb1s sx1_npu_b1_classb.model --blob two_expert_shared_blob.bin --load-repeats 10"
+```
+

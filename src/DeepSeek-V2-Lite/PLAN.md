@@ -305,17 +305,27 @@ selection**: which 6 of 64 experts run is decided by the router at run time. Thr
 
 | Approach | Files | Traffic/token | Verdict |
 | :--- | :--- | :--- | :--- |
-| **(a) One loadable per expert** | 1664 routed + 52 shared | optimal (only selected experts read) | Works, but see the load-time problem below |
-| **(b) One loadable per layer, all 64 experts, weights as a dynamic input tensor bound at a runtime-chosen `DevBuf.offset`** | 27 | optimal | **Best if the compiler supports dynamic weight inputs** |
+| **(a) One loadable per expert** | 1664 routed + 52 shared | optimal (only selected experts read) | **Measured and ruled out**: a Class B loadable is only 283 KB but load+unload costs **34.25 ms** and at most **62** stay resident per die, so 64×26 loads/token ≈ 56 s/token (FINDINGS §33.3) |
+| **(b) One loadable per layer, all 64 experts, weights as a dynamic input tensor bound at a runtime-chosen `DevBuf.offset`** | 27 | optimal | **Half true**: offset selection is byte-exact with real experts (§33.1), but one loadable is *not* expert-interchangeable — 6 weight-derived bytes in `kmd-task-op_list` change the result to cos 0.958 (§33.2) |
+| **(d) One loadable per layer + patch those 6 bytes per expert switch** | 27 | optimal | **The remaining route.** 26 loadables fit under the 62 ceiling, the weight blob stays resident, and the patch is a few bytes. Unproven: needs the loaded stream located in device memory and the NPU shown to honour a post-load patch |
 | (c) Compute all 64 experts | 27 | 64× worse (13.4 GiB/token) | Destroys the entire MoE advantage — never |
 
-(b) is attractive because `DevBuf` already carries `{mem_fd, offset, size}`: one big weight
+(b) was attractive because `DevBuf` already carries `{mem_fd, offset, size}`: one big weight
 blob per die plus a single loadable per layer, with expert selection reduced to *changing an
-input offset*. That eliminates 1700+ files and 1700+ `ES_NPU_LoadModelFromFile` calls.
+input offset*. The offset half is now **proven on silicon with real DeepSeek-V2-Lite weights**
+(two experts in one 17,817,600-byte blob, each reproducing its own static loadable byte for
+byte). The single-loadable half is **falsified**: with per-channel weight quantization EsAAC
+bakes one requant shift byte per graph node into `kmd-task-op_list`, and those bytes depend on
+the expert's weights. `per_tensor` quantization would remove them but makes EsAAC SIGSEGV.
+Since patching those 6 bytes makes two experts' loadables byte-identical, (d) is (b) plus a
+6-byte write — which is why it is now the plan rather than a fallback.
 
-**Why (a) is risky:** 1716 loadables at ~9 MiB each must all be loaded and kept resident.
-If each load costs 50–200 ms, startup is **1.5–6 minutes**, and the driver's limit on
-concurrently loaded `modelId`s is unknown. This must be measured, not assumed.
+**Why (a) is risky — now measured, not assumed:** Class B conversion shrinks a loadable from
+9.19 MB to 283 KB, but load+unload still costs **34.25 ms** (p50 34.20, min 33.86, max 34.72),
+and the driver accepts at most **62 resident models per die** — attempting a 63rd fails and the
+following unload/submit **crashes the kernel** in `eic7700_npu` (`destroy_frame` dereferencing
+an `ERR_PTR` from `io_tensor_to_io_addr`), needing a reboot. So neither per-token loading nor
+preloading 1664 variants is possible. See FINDINGS §33.3–§33.4.
 
 **Phase 0 (new, do this first — it is cheap and decides everything):**
 1. Export a single MoE expert FFN (2048→1408 SwiGLU→2048) to ONNX with the **weights as
