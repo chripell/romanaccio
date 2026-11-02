@@ -578,6 +578,36 @@ Development is structured into **11 independently verifiable milestones**:
   set; a compile-and-hash sweep (EsAAC is deterministic — verified: same weights under a different
   filename give an md5-identical loadable, so hashes are reproducible class IDs); and a residency
   test that loads one loadable per class and stays well under 60.
+- **MEASURED 2026-11-02 (FINDINGS §35)**: 104 real experts — 4 from each of the 26 MoE layers, one
+  shared table — give **15 classes**, and classes span layers (the largest covers 17 of them). The
+  marginal rate falls from 0.42 to 0.06 classes/expert across the sample; a log fit extrapolates to
+  **~25 classes for all 1664 experts**, i.e. inside the 62-model ceiling with ~2.5× margin. Widening
+  thresholds ×2/×4 changes nothing (the requant bytes are scale-invariant), so there is no
+  accuracy-vs-class-count lever to trade. Proven on silicon: layer 1's loadable computes layer 26's
+  expert **byte-identically** from one shared blob (`probe_two_experts --same-class`).
+
+---
+
+### Milestone 15: Class-Based Expert Dispatch (the route §35 made feasible) [PLANNED]
+- **Shape**: one resident INT8 weight blob per die (14.2 GiB total) + ~15–25 resident Class B
+  loadables (283 KB each) + `DevBuf.offset` expert selection (Milestone 13) + a compile-time
+  class→experts map. No patching, no per-expert loads, inside the 62-model ceiling.
+- **Compiler deliverable**: emit the class map next to the weight regions — for each
+  (layer, expert) the class id and the expert's offset in the per-die blob. `count_stream_classes.py`
+  already computes the grouping; it needs a machine-readable output mode (`--json`) rather than a
+  report, plus a guard that refuses to publish a map whose class count would not fit resident.
+- **Runtime deliverable**: `ExpertLoadableSet` in `src/llm/` — loads one model id per class at
+  session start (asserting the count stays under ~50, never near 62: §33.4), and answers
+  `model_id_for(layer, expert)` + `slice_for(layer, expert)` for the dispatch loop. Reuse
+  `MoERouter::expert_blob_offset()`; do not re-derive offsets.
+- **Then** the Milestone 10 `TransformerSession` switch-over can call the router for real.
+- **Risks to check before building**: (1) the 15→25 extrapolation samples 4 of 64 experts per
+  layer — a full sweep, or a rule predicting the requant bytes from weight statistics, would turn
+  the estimate into a measurement; (2) the shared table costs ×3–6 mean weight NMSE versus
+  per-expert tables (absolute ≤2.6e-3), which needs an end-to-end accuracy check on real hidden
+  states before it is trusted; (3) rare classes may need an LRU with 34 ms reloads if the tail is
+  heavier than the fit suggests.
+- **Do not** preload near the 62-model ceiling in any test: it Oopses the kernel (§33.4).
 
 ---
 

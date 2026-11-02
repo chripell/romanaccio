@@ -1536,3 +1536,114 @@ driver has no viable dispatch path and the design has to change (fp16 does not f
 GiB, §30). Measuring it means compiling experts across several layers against one global table and
 counting file hashes — cheap in compute, mostly transfer time.
 
+---
+
+## 35. The Class-Count Sweep: 104 Real Experts Collapse to 15 Loadables, and They Are Interchangeable
+
+§34.5 reduced MoE feasibility to one number. Measured: **4 experts from each of the 26 MoE layers
+of DeepSeek-V2-Lite (104 real experts, weights from the 31.4 GB checkpoint), all compiled against
+one shared table → 15 distinct Class B loadables.** Against the 62-models/die ceiling (§33.3) that
+is a 4× margin, so approach (e) is feasible and INT8 MoE dispatch has a viable shape.
+
+### 35.1 Class structure
+
+Class sizes: **22, 19, 14, 13, 9, 7, 6, 4, and seven singletons**.
+
+- **Classes span layers.** The largest (22 members) covers 17 different layers; 8 of the 15 classes
+  are multi-layer. Membership is a property of the expert's weight statistics, not of its layer, so
+  the total is *not* 26 × per-layer.
+- Seven singletons: rare classes exist, so the tail matters for the extrapolation below.
+
+### 35.2 The curve saturates
+
+Mean distinct classes over 40 random subsamples of the same 104 loadables:
+
+| n experts | 4 | 8 | 16 | 26 | 32 | 52 | 78 | 101 |
+|---|---|---|---|---|---|---|---|---|
+| classes | 3.5 | 5.1 | 7.9 | 9.6 | 10.1 | 11.4 | 13.7 | **15.0** |
+| marginal classes/expert | — | 0.42 | 0.35 | 0.17 | 0.09 | 0.07 | 0.09 | **0.06** |
+
+A log fit (`classes ≈ -2.6 + 3.7·ln n`) extrapolates to **~17 at 208 experts, ~20 at 416, ~22 at
+832, ~25 at all 1664.** The marginal rate falls seven-fold across the measured range, which is what
+makes the extrapolation defensible rather than hopeful.
+
+**Caveat, stated plainly:** this samples 4 of 64 experts per layer, and 15 → 25 is a fit, not a
+measurement. If the tail is heavier than the fit suggests, the fallback is an LRU over classes with
+34 ms reloads for the rare ones (§33.3) — not a redesign.
+
+### 35.3 Widening the table does not buy class convergence
+
+Compiling the same 16 experts with thresholds scaled ×2 and ×4 gives **the same 8 classes with the
+same members and the same byte values** (`[25] -> [24]`). The requant bytes are therefore
+**scale-invariant** — they depend on the relative shape of each expert's weight distribution, not on
+absolute scale. Two consequences:
+
+- There is **no accuracy-vs-class-count lever**. Do not widen thresholds hoping to merge classes.
+- A global table widened to cover all 1664 experts should leave the class structure intact, so the
+  15-class measurement does not depend on this sample's thresholds being final.
+
+The widening still has a price, measured with `quant_widening_cost.py` (quantize–dequantize NMSE,
+per-expert table vs shared global table, 16 real experts): **×3.1 mean on `W_gate`, ×4.1 on `W_up`,
+×5.7 on `W_down`, ×11.2 worst case** — but absolute NMSE stays ≤ 2.6e-3, i.e. the shared table costs
+roughly two-thirds of a bit of weight precision, not a collapse.
+
+### 35.4 Board proof that a class loadable serves another layer's expert
+
+Byte-identical files should be interchangeable by construction, but that was verified on silicon
+rather than assumed. Layer 1 expert 0 and layer 26 expert 0 are in the same class (both Class B
+files md5 `41d77f8e…`); their weight regions were concatenated into one 17,817,600-byte blob and
+dispatched through the Milestone 13 slice API:
+
+```
+R1  L1E0  classb + slice@0   == L1E0  static golden  BYTE-IDENTICAL (cos 1.000000)
+R4  L26E0 classb + slice@W   == L26E0 static golden  BYTE-IDENTICAL (cos 1.000000)
+R2  L1E0  classb + slice@W   == L26E0 static golden  BYTE-IDENTICAL (cos 1.000000)  <-- the claim
+    L1E0 output vs L26E0 output                      differs (cos 0.025686)
+```
+
+R2 is the whole design in one line: **layer 1's loadable computes layer 26's expert exactly**, from
+a shared blob, selected by offset alone. `probe_two_experts --same-class` asserts it.
+
+### 35.5 Resulting MoE shape
+
+One resident INT8 weight blob per die (14.2 GiB total, §30) + **~15–25 resident Class B loadables**
+(283 KB each, ~7 MB total) + `DevBuf.offset` expert selection + a class→experts map emitted at
+compile time. No patching, no per-expert loads, inside the 62-model ceiling with room to spare.
+
+### 35.6 Toolchain throughput facts (they shape what sweeps are possible)
+
+- The `ssh simulator` relay (socat → dropbear into the container) does **0.56 MB/s per stream** but
+  scales nearly linearly with parallel connections: 4 streams = 2.25 MB/s, 8 streams = 4.5 MB/s.
+  Always transfer in parallel; a serial 3.6 GB upload is ~100 min versus ~13 min at 8-way.
+- Direction is asymmetric: pulling 147 MB *out* of the container took ~1 s (~134 MB/s).
+- The container's own disk does 3.3–7.1 GB/s, so it is never the bottleneck.
+- Under 8-way parallelism 3 of 104 uploads failed transiently and succeeded on retry — count files
+  at the far end instead of trusting exit statuses.
+- EsAAC exits **0** even when it compiles nothing (`Model … has no graph`, after a truncated
+  upload), so every sweep must grep the logs, not the return codes.
+- Host `podman` is in a stale state (boot-ID mismatch after a reboot) and offers to delete
+  `/run/host-wayland/containers` and `/run/host-wayland/libpod/tmp` — those belong to the *running*
+  simulator container. Do not let it "fix" itself; the ssh path works.
+
+### 35.7 Reproduce
+
+```bash
+V=/home/chri/aixigua/venv/bin/python; S=deep/artifacts/scratch/sweep104
+cd src/DeepSeek-V2-Lite
+for L in $(seq 1 26); do for E in 0 1 2 3; do
+  $V export_expert_ffn.py --safetensors deep/models/DeepSeek-V2-Lite --layer $L --expert $E \
+     -o $S/onnx/L${L}E${E}.onnx
+done; done
+# one table: weight thresholds = max absmax over the whole sample (read straight from the
+# checkpoint), activation thresholds from a calibrated expert; EsAAC each with --quant-stats
+cd ../eswin_compiler && for m in $S/models/L*_npu_b1.model; do
+  $V compiler.py -m "$m" -o $S/models --convert-weights; done
+cd ../DeepSeek-V2-Lite && $V count_stream_classes.py $S/models
+$V quant_widening_cost.py $S/onnx --global-table $S/table104.json
+# board: same-class interchangeability across layers
+cd ../eswin_runtime && make CROSS_COMPILE=riscv64-linux-gnu- -j8
+ssh roma "cd /tmp/cls && sudo ./probe_two_experts --static0 L1E0_npu_b1.model \
+    --static1s L26E0_npu_b1.model --classb0 L1E0_npu_b1_classb.model \
+    --classb1s L26E0_npu_b1_classb.model --blob blob_L1E0_L26E0.bin --same-class"
+```
+
