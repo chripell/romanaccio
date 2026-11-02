@@ -114,6 +114,7 @@ struct Cfg {
     std::string out_dtype = "int8";   // INT8 graph; "fp16" for the fp16 reference loadables
     int load_repeats = 0;             // measure Class B load+unload cost
     int preload = 0;                  // how many Class B loadables stay resident at once
+    bool same_class = false;          // the two loadables are byte-identical: assert, don't expect
 };
 
 bool read_file(std::vector<uint8_t> &dst, const std::string &path) {
@@ -169,6 +170,7 @@ int main(int argc, char **argv) {
         else if (a == "--out-dtype") cfg.out_dtype = need("--out-dtype");
         else if (a == "--load-repeats") cfg.load_repeats = std::atoi(need("--load-repeats"));
         else if (a == "--preload")  cfg.preload = std::atoi(need("--preload"));
+        else if (a == "--same-class") cfg.same_class = true;
         else { std::printf("FAIL: unknown option '%s'\n", a.c_str()); return 1; }
     }
     if (cfg.static0.empty() || cfg.static1s.empty() || cfg.classb0.empty() || cfg.blob.empty()) {
@@ -305,11 +307,18 @@ int main(int argc, char **argv) {
     report(6, 1, "R3 classb1+own      == G1 expert1 own", 1);
     report(3, 4, "expert0 output      != expert1 output", -1);
     report(0, 2, "G0 static expert0   != G1s static expert1", -1);
-    // Measured, and the reason a layer cannot share one loadable across experts: the compiled
-    // kmd-task-op_list carries one weight-derived requant byte per node (6 bytes differ between
-    // two experts' Class B loadables, 0x18 vs 0x19, and nothing else in the 283,384-byte file).
-    // Binding expert 1's region into expert 0's loadable is close but wrong.
-    report(4, 2, "R2 cross-loadable (e1 region in e0 loadable) != G1s", -1);
+    // Measured, and the reason a layer cannot share one loadable across *arbitrary* experts: the
+    // compiled kmd-task-op_list carries weight-derived requant bytes (6 differ between two
+    // experts of one layer, 0x18 vs 0x19, and nothing else in the 283,384-byte file), so binding
+    // expert 1's region into expert 0's loadable is close but wrong (cos 0.958).
+    //
+    // With --same-class the two loadables are byte-identical by construction -- they came from the
+    // same stream class (FINDINGS §35: 104 real experts across all 26 MoE layers collapse to 15
+    // classes) -- so the cross-binding MUST reproduce the golden exactly. That is the end-to-end
+    // proof that one loadable per class can serve every expert in it, across layers.
+    report(4, 2, cfg.same_class ? "R2 CROSS-CLASS bind  == G1s (loadables interchangeable)"
+                                : "R2 cross-loadable (e1 region in e0 loadable) != G1s",
+           cfg.same_class ? 1 : -1);
 
     std::printf("\n--- reported, not required ---\n");
     report(4, 1, "R2 classb0+slice@W  vs G1 expert1 own table", 0);
