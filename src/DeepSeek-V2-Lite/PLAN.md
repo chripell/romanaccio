@@ -1,5 +1,15 @@
 # DeepSeek-V2-Lite MoE (16B / 2.4B Active) Dual-Die Acceleration Plan
 
+> **STATUS: PAUSED (2026-11-02), not blocked.** Active work moved to `src/LFM3/PLAN.md`.
+> The MoE dispatch research this plan spawned is **complete and banked**: offset-selected experts
+> are byte-exact on silicon with real weights, one loadable serves a whole *stream class*, and 104
+> real experts across all 26 MoE layers collapse to 15 interchangeable Class B loadables
+> (`FINDINGS.md` §33, §34, §35). What remains here is volume, not risk: MLA attention (never ported
+> on this hardware), exporting/compiling/converting 1664 experts, emitting the class map, and
+> wiring the router into `TransformerSession` (runtime Milestones 10 and 15).
+> Reuse rather than rebuild: `WorkerPool::submit_task(DmaBufferSlice)`, `MoERouter`,
+> `count_stream_classes.py`, `make_quant_table.py --merge-max`.
+
 ## 1. Executive Summary & Architectural Motivation
 
 ### 1.1 The Fundamental Breakthrough: Overcoming the Memory Wall
