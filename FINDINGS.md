@@ -1689,4 +1689,57 @@ In §34.2, `/proc/self/maps` showed that `libedla_runtime.so` / `eic7700_npu.ko`
 | **`lfm3_l00_mlp.model`** | `2048 → 7680 → 2048` | `91.88 MiB` (`96,346,744 B`) | `0.99999941` | `comparison successful` | **`avg = 2.5382 ms`** (`min = 2.485 ms`, `394.0 FPS`) |
 | **`lfm3_lm_head_d0_s0.model`** | `2048 → 16000` | `64.89 MiB` (`68,045,904 B`) | `0.99999996` | `comparison successful` | **`avg = 1.9056 ms`** (`min = 1.849 ms`, `524.8 FPS`) |
 
+---
+
+## 37. LFM3-1.7B Milestone 3.5: Batched (`T=64`) Prefill, `NC/16HW16` Input Layout & Shared-Weight Class B Archetype Breakthrough
+
+**On `simulator` + `roma`, 2026-11-03.** To eliminate the `~230 ms/tok` `T=1` prefill wall (`~15 minutes` for a 4K-token prompt) while staying strictly below the 62-model/die `eic7700_npu.ko` Oops limit (§33.4), we compiled and verified `T=64` batched layer subgraphs (`[1, C_in, 64, 1] -> [1, C_out, 64, 1]`) and discovered three foundational hardware invariants:
+
+### 37.1 Why $T > 1$ Graphs Require `NC/16HW16` Input (`[1, C_in//16, T, 16]`) and Emit `NCHW` Output (`[1, C_out, T, 1]`)
+
+- Feeding a planar `NCHW` `[1, 2048, 64, 1]` FP16 tensor into `l00_mlp_t64_npu_b1.model` on `EsSimulator` produced an output with the exact expected L2 norm (`175.05` vs `175.18`) but `cosine = 0.004`.
+- Inspecting `TensorDescListEntry` inside the compiled `T=64` loadable explained why:
+  - **Input (`id=0`, `c=2048, h=64, w=1`)**: `stride_0 = 2 B`, `stride_1 = 32 B` (`16` FP16 elements), `stride_2 = 2048 B` (`64 × 16` FP16 elements) — the NPU CDMA engine reads activation tensors in **`NC/16HW16` (`[1, C_in//16, T, 16]`)** layout! At $T=1$, `[1, C//16, 1, 16]` and `[1, C, 1, 1]` are identical in memory, masking the layout difference completely.
+  - **Output (`id=1`, `c=C_out, h=64, w=1`)**: `stride_0 = 2 B`, `stride_1 = 2 B`, `stride_2 = 128 B` (`64 × 2 B`) — because every `EsAAC`-compiled `1×1` Conv2D graph ends with a UMD `_Conv_cvtPrecisiontiling_M_Concat` task, the output is written in standard planar **`NCHW` (`[1, C_out, T, 1]`)** layout.
+- Packing the input as `[1, C_in//16, 64, 16]` made all four `T=64` subgraph archetypes (`conv_in_t64`, `conv_out_t64`, `attn_qkv_t64`, `mlp_t64`) pass `EsSimulator` (`model output comparison successful`) and achieve **`Cosine = 1.00000000` (`Max Abs Diff = 0.00000000`)** against 512 sequential `T=1` steps on `roma` (`/dev/npu0`).
+
+### 37.2 Route D — Shared-Weight Class B Archetype Breakthrough (`12` Resident Models/Die, Zero Swapping, Zero Duplicate Weights)
+
+Converting FP16 `T=1` and `T=64` loadables via `compiler.py --convert-weights` proved two major invariants (closing the open hypothesis in `src/LFM3/PLAN.md` §6.3):
+
+1. **FP16 Class B Loadables Are 100% Byte-Identical Across All Layers of the Same Shape**:
+   - `l00_mlp_t1_classb.model` and `l01_mlp_t1_classb.model` (`1,475,616 B`) have the **exact same MD5 (`7bc90162ba2b6a0f32dd6ef6e9d4fbd3`)**, and `l00_mlp_t64_classb.model` and `l01_mlp_t64_classb.model` have the **exact same MD5 (`73cbd9193fb2e4e45b6c590143796b58`)**.
+   - `l00_conv_out_t1_classb.model` (`2048 → 2048`) and `l02_attn_out_t1_classb.model` (`2048 → 2048`) (`147,352 B`) have the **exact same MD5 (`534e2a0621...`)** — meaning `13 × conv_out` and `11 × attn_out` share a single `lfm3_proj2048_{t1,t64}_classb.model` archetype!
+2. **NVDLA-Tiled Weight Blobs (`weights_mem1.bin`) Are 100% Invariant to $T$ (`T=1` == `T=64`) and 4096-Byte Aligned**:
+   - `l00_mlp_t1_weights_mem1.bin` and `l00_mlp_t64_weights_mem1.bin` (`94,863,360 B = 23,160 × 4096 B`) share the **exact same MD5 (`92b55249da56c7a5ac3357b25e297f60`)**.
+   - Running `probe_weight_bitmatch` on `roma` (`/dev/npu0`) with each `T=64` Class B archetype bound to its **`T=1` weight blob** reproduced the static `T=64` loadable **byte-for-byte (`YES`)** across all four archetypes:
+
+| Archetype (`T=64` Class B + `T=1` Weights) | Class B `.model` Size | Weight Region Size (`4K` Aligned) | Output Bytes Verified | `probe_weight_bitmatch` on `roma` (`/dev/npu0`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **`lfm3_conv_in_t64_classb.model`** (`2048 → 6144`) | `398,736 B` | `25,362,432 B` (`6,192 × 4K`) | `786,432 B` | `mean=31181.1766`, **`byte-identical: YES`** |
+| **`lfm3_proj2048_t64_classb.model`** (`2048 → 2048`) | `147,352 B` | `8,454,144 B` (`2,064 × 4K`) | `262,144 B` | `mean=30795.7491`, **`byte-identical: YES`** |
+| **`lfm3_attn_qkv_t64_classb.model`** (`2048 → 3072`) | `210,192 B` | `12,681,216 B` (`3,096 × 4K`) | `393,216 B` | `mean=30484.8495`, **`byte-identical: YES`** |
+| **`lfm3_mlp_t64_classb.model`** (`2048 → 7680 → 2048`) | `1,475,616 B` | `94,863,360 B` (`23,160 × 4K`) | `262,144 B` | `mean=30304.0937`, **`byte-identical: YES`** |
+
+- **Residency Impact (Route D)**: Instead of `36 + 36 = 72 > 62` layer loadables/die (which would require per-turn model swapping), each die only loads **8 shared Class B layer archetypes (`4` for `T=1` + `4` for `T=64`, `4.26 MiB` total) + 4 LM head slices = `12` resident models/die** (`50` models below the 62-model kernel Oops ceiling!), and binds both `T=1` and `T=64` to a single contiguous 4K-aligned per-die MMZ weight blob (`weights_die0.bin = 1.379 GiB`, `weights_die1.bin = 1.367 GiB`) via `DevBuf.offset`.
+
+### 37.3 Silicon `T=64` Latency & End-to-End 24-Layer Tri-Hybrid Prefill Benchmark on `roma` (`/dev/npu0`)
+
+| Subgraph Archetype (`FP16`) | `T=1` Silicon Latency | `64 × T=1` (Unbatched) | **`T=64` Silicon Latency (64 tok)** | **Per-Token NPU Cost at `T=64`** | **Measured Hardware Speedup** |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`conv_in`** (`2048 → 6144`) | `0.7710 ms` | `49.34 ms` | **`5.4085 ms`** (`min 5.38 ms`) | **`0.0845 ms/tok`** | **`9.12×`** |
+| **`proj2048`** (`conv_out` / `attn_out`) | `~0.35 ms` | `22.40 ms` | **`1.8969 ms`** (`min 1.86 ms`) | **`0.0296 ms/tok`** | **`11.81×`** |
+| **`attn_qkv`** (`2048 → 3072`) | `0.4701 ms` | `30.09 ms` | **`2.7907 ms`** (`min 2.75 ms`) | **`0.0436 ms/tok`** | **`10.78×`** |
+| **`mlp`** (`2048 → 7680 → 2048`) | `2.5382 ms` | `162.44 ms` | **`5.6101 ms`** (`min 5.56 ms`) | **`0.0876 ms/tok`** | **`28.95×`** |
+| **Full 24-Layer NPU Pass (64 tokens)** | `89.3 ms/tok` | `5,715 ms` | **`281.17 ms` / 64 tokens** | **`4.39 ms/tok`** | **`20.33×`** |
+
+Running the full 24-layer tri-hybrid prefill and decode suite (`src/LFM3/bench_prefill_t64.cpp`) on `roma` (`/dev/npu0`):
+- **SMMU Preparation Trap Avoided**: Calling `ES_NPU_Prepare` / `ES_NPU_Unprepare` per submit maps/unmaps `23,160` 4K pages (`94.86 MB`) per MLP call in `eic7700_npu.ko`. Preparing the parent `w_blob`, `act`, and `out` DMA buffers **once at startup** and passing `DevBuf{w_fd, w_offset, w_bytes, 0}` at submit time eliminates all per-submit SMMU ioctl overhead.
+- **MMZ 64-Bit Burst Staging & Subnormal Guard**: Staging `NC/16HW16` pack and `NCHW` $16 \times 16$-tiled unpack in cached L2 memory before/after a 64-bit `std::memcpy` to MMZ DMA memory, plus guarding attention softmax `diff > -20.0f` against RISC-V M-mode subnormal float emulation traps, yielded:
+  - **512-Token Teacher-Forced Differential Parity (`T=64` vs `512 × T=1` on Silicon)**: **`Cosine = 1.00000000`**, **`Max Abs Diff = 0.00000000`**, **`Final Conv State Max Diff = 0.00000000`** `[PASS]`.
+  - **512-Token 24-Layer Tri-Hybrid Prefill (`8 × T=64` chunks)**: **`6,143.24 ms` total (`12.00 ms/tok` = `83.3 prompt tokens/sec`, `NPU = 2,522.81 ms` [`4.93 ms/tok`], `CPU = 3,617.20 ms` [`7.06 ms/tok`])** — beating the Milestone 3.5 FP16 gate (`≤ 35 ms/tok`) by **`2.92×`** and already surpassing the Milestone 5 INT8 target (`≤ 20 ms/tok`).
+  - **4096-Token 24-Layer Tri-Hybrid Prefill (`64 × T=64` chunks)**: **NPU execution across all 64 chunks took `20.02 s` (`4.89 ms/tok`, streaming `187.5 GB` at `9.37 GB/s` effective DMA bandwidth — beating the `≤ 30.0 s` NPU weight-streaming gate by 33%)**. Total wall-clock including scalar CPU $O(N^2)$ 6-layer Global Attention (`412.4 GFLOPs` / `206.2B` FMAs over $4096 \times 4096$ on non-RVV SiFive P550 cores) is `108.39 s` (`26.46 ms/tok` = `37.8 tok/s`).
+  - **Immediate Post-Prefill `T=1` Decode (Zero Model Swap)**: **`82.03 ms/tok` (`12.19 tok/s`)** across all 24 layers `[PASS]`, with `dmesg` completely clean.
+
+
 
