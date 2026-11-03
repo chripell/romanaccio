@@ -319,9 +319,9 @@ as "low judgement". Assign by what can go wrong silently:
 | Milestone | Tier | Why |
 | :--- | :--- | :--- |
 | 1 — download, inspect, golden oracle | **flash** | **COMPLETED (2026-11-03)**: cos 0.999999 vs ORT, 175 arrays in `golden_ref.npz` |
-| 2 — static 4D ONNX export + sidecar weights | **flash**, max for review | **COMPLETED (2026-11-03)**: all 74 ONNX subgraphs + CPU sidecars exported, cos 1.00000000 across all gates |
-| 3 — `EsAAC` batch compile + verify | **flash** | Follows `batch_compile_all_layers.py`; must grep logs for `has no graph` and count outputs (§35.6) |
-| 3 (fused-conv experiment) | **max** | Unexplored: no depthwise `Conv` has ever been compiled on this project, and the state buffer has to be Class B because `EsAAC` SIGSEGVs on a second dynamic input |
+| 2 — static 4D ONNX export + sidecar weights | **flash**, max for review | **COMPLETED (2026-11-03)**: all 80 ONNX subgraphs (72 layer + 8×16K LM head) + CPU sidecars exported, cos 1.00000000 across all gates |
+| 3 — `EsAAC` batch compile + verify | **flash** | **COMPLETED (2026-11-03)**: all 80 `.model` files compiled & byte-size audited (40/die < 62); verified in `eswin-sim` (cos ≥ 0.9999994), `EsSimulator` & on `roma` silicon |
+| 3 (fused-conv experiment) | **max** | **COMPLETED (2026-11-03)**: verdict = REJECTED by `EsAAC` (`SdpEmitter.cpp:243` `Check failed: i_precision <= PRECISION_FP16`, exit 134); isolated depthwise `k=7` compiles in 70.4 ms; keep split `conv_in` + `conv_out` + CPU 7-tap ring |
 | **3.5 — batched T-wide prefill** | **max** | The residency arithmetic sits one model below a kernel-Oops ceiling, chunked CPU state updates must stay sequential, and numerics must match the T=1 path. Highest-consequence milestone in the plan |
 | 4 — C++ tri-hybrid engine | **max** | Four new primitives, two KV cache disciplines, partial RoPE with a split-half pairing rule, and a CPU-attention kernel whose cost has never been measured here |
 | 4 (attention microbenchmark) | **flash** | A timed loop; the *interpretation* belongs to whoever owns Milestone 4 |
@@ -426,8 +426,31 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
-### Milestone 3: AOT Compilation (`EsAAC`) & Simulator / Single-Block Silicon Verification
+### Milestone 3: AOT Compilation (`EsAAC`) & Simulator / Single-Block Silicon Verification [COMPLETED 2026-11-03]
 
+- **Implementation & Verification Status** (2026-11-03, full write-up in `FINDINGS.md` §36):
+  - **Batch Compiler & Manifest Tool**: `src/LFM3/batch_compile_lfm3.py` created and executed using the zero-copy `/run/host-wayland/simulator-ipc/lfm3_work` ↔ `/ipc/lfm3_work` RAM mount (`> 5 GB/s`). Also fixed the `ssh simulator` upload bottleneck (`0.56 MB/s` → `140.22 MB/s`, `250×`) by passing `-W 1048576` to `dropbear` and `-b 65536` + `nodelay` to `socat` in `deep/pdoman/esaac_essimulator/run-simulator.sh`.
+  - **2 MiB `/dmabuf:npu` KMD Command-Stream Limit Discovered & Resolved**:
+    - Compiling a half-vocab LM head (`2048 → 64,000`) as a single `.model` (`255.74 MiB`, `250` M-splits, `502` relocations) produced `3.73 MiB` of KMD command streams (`1.56 MiB` `dep_graph` + `1.42 MiB` `op_list` + `0.75 MiB` `surf_list`), overflowing the driver's fixed **2 MiB `/dmabuf:npu` buffer** (`FINDINGS.md` §34.2) and hanging both `EsSimulator` and `roma`.
+    - Splitting the LM head into **8 slices of `16,000` channels** (`4` slices on Die 0: `lfm3_lm_head_d0_s{0..3}.model`, `4` slices on Die 1: `lfm3_lm_head_d1_s{0..3}.model`, `64.89 MiB` each) keeps each slice at `125` M-splits (`252 <= 256` relocations) and **`1.86 MiB < 2.00 MiB`** of KMD streams.
+  - **Exact Byte-Size Audit of All 80 Compiled `.model` Loadables** in `/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/models/` (`3.41 GiB` total, `40` models/die `< 62` ceiling):
+    - `13 × conv_in` (`2048 → 6144`): `25,763,520 B` (`24.57 MiB` each, 100% uniform)
+    - `13 × conv_out` (`2048 → 2048`): `8,602,312 B` (`8.20 MiB` each, 100% uniform)
+    - `11 × attn_qkv` (`2048 → 3072`): `12,892,608 B` (`12.30 MiB` each, 100% uniform)
+    - `11 × attn_out` (`2048 → 2048`): `8,602,312 B` (`8.20 MiB` each, 100% uniform)
+    - `24 × mlp` (`2048 → 7680 → 2048`): `96,346,744 B` (`91.88 MiB` each, 100% uniform)
+    - `8 × lm_head` (`2048 → 16000`): `68,045,904 B` (`64.89 MiB` each, 100% uniform)
+    - Dual-die manifest generated at `/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/manifest.json` (`40` models on Die 0, `40` models on Die 1).
+  - **Simulator (`eswin-sim` & Vendor `EsSimulator`) + Physical Silicon (`roma` `/dev/npu0`) Verification**:
+    - Patched `src/eswin_simulator/eswin_simulator/cli.py` to support `w1splitM_`/`w3splitM_`/`w2splitM_` SwiGLU naming and 8-channel-aligned `c_out_split` (`88/88` pytest passing).
+    - `lfm3_l00_conv_in.model`: `eswin-sim` cos = **`0.99999997`**, `EsSimulator` = **PASS**, `roma` `/dev/npu0` = **`avg 0.7710 ms`** (`min 0.726 ms`, `1,297.0 FPS`).
+    - `lfm3_l02_attn_qkv.model`: `eswin-sim` cos = **`0.99999996`**, `EsSimulator` = **PASS**, `roma` `/dev/npu0` = **`avg 0.4701 ms`** (`min 0.426 ms`, `2,127.2 FPS`).
+    - `lfm3_l00_mlp.model`: `eswin-sim` cos = **`0.99999941`**, `EsSimulator` = **PASS**, `roma` `/dev/npu0` = **`avg 2.5382 ms`** (`min 2.485 ms`, `394.0 FPS`).
+    - `lfm3_lm_head_d0_s0.model`: `eswin-sim` cos = **`0.99999996`**, `EsSimulator` = **PASS**, `roma` `/dev/npu0` = **`avg 1.9056 ms`** (`min 1.849 ms`, `524.8 FPS`).
+  - **Fused-Conv Gate Verdict (§3.1)**:
+    - Isolated depthwise `Conv` (`[1, 2048, 7, 1] → [1, 2048, 1, 1]`, `groups=2048`) compiles in **70.4 ms**.
+    - Fused `in_proj → Concat(conv_state, x_tilde) → depthwise Conv → out_proj` (both with `Slice` and with 3 separate $2048\to 2048$ Convs) is **REJECTED by `EsAAC`** with `F20261103 SdpEmitter.cpp:243] Check failed: i_precision <= PRECISION_FP16` in `eaac::SdpEmitter::setPostDRPConfig()` (`SIGABRT`, exit 134).
+    - **Decision**: Keep the split `conv_in` + `conv_out` NPU loadables (`40` models/die total) and execute the 7-tap depthwise convolution + gating on the host CPU. In Milestone 3.5, this selects **Route B** (parallel per-turn prefill/decode loadable swap) or **Route C** (co-resident 12 `T=64` MLPs/die = `40 + 12 = 52/die < 62`).
 - **Goal**: Compile all 74 ONNX subgraphs to `.model` loadables using `EsAAC --gen-fp16-model=yes` inside the `simulator` container, verify numerical accuracy in `EsSimulator` / `eswin-sim`, and benchmark representative blocks on `roma`.
 - **Files to Create**:
   - `src/LFM3/batch_compile_lfm3.py`

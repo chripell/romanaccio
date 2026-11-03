@@ -233,24 +233,21 @@ def main():
                 f"SwiGLU MLP (2048 -> 7680 -> 2048)"
             )
 
-        # LM Head Slices (Die 0 & Die 1)
-        print("--- Dual-Die LM Head ---")
+        # LM Head Slices (8 slices: 4 on Die 0, 4 on Die 1, 16,000 channels each so KMD stream <= 1.86 MiB < 2.00 MiB /dmabuf:npu limit)
+        print("--- Dual-Die LM Head (8 x 16,000-channel slices) ---")
         embed_tokens_w = st.get_tensor("model.embed_tokens.weight")
-        head0_w = embed_tokens_w[0:64000]
-        head1_w = embed_tokens_w[64000:128000]
-
-        export_subgraph(
-            PointwiseConvBlock(head0_w),
-            dummy_x,
-            ONNX_OUT_DIR / "lfm3_lm_head_d0.onnx",
-            "LM Head Die 0 (2048 -> 64000)"
-        )
-        export_subgraph(
-            PointwiseConvBlock(head1_w),
-            dummy_x,
-            ONNX_OUT_DIR / "lfm3_lm_head_d1.onnx",
-            "LM Head Die 1 (2048 -> 64000)"
-        )
+        for die_id in (0, 1):
+            for s_idx in range(4):
+                global_slice = die_id * 4 + s_idx
+                start_ch = global_slice * 16000
+                end_ch = start_ch + 16000
+                head_slice_w = embed_tokens_w[start_ch:end_ch]
+                export_subgraph(
+                    PointwiseConvBlock(head_slice_w),
+                    dummy_x,
+                    ONNX_OUT_DIR / f"lfm3_lm_head_d{die_id}_s{s_idx}.onnx",
+                    f"LM Head Die {die_id} Slice {s_idx} [{start_ch}..{end_ch-1}] (2048 -> 16000)"
+                )
 
     print("\n[3/3] Validating Exported Subgraphs Against Golden Reference Oracle...")
     if not GOLDEN_PATH.exists():
@@ -313,22 +310,24 @@ def main():
     print(f"  Layer 4 MLP:     cos={cos_mlp4:.8f}, max_diff={diff_mlp4:.8f}")
     assert cos_mlp4 >= 0.99999, f"Layer 4 MLP cosine similarity {cos_mlp4} failed!"
 
-    # Acceptance Gate 4: Tied LM Head Slices
-    print("\n--- Gate Test: Dual-Die LM Head Slices ---")
-    h0_sess = ort.InferenceSession(str(ONNX_OUT_DIR / "lfm3_lm_head_d0.onnx"), providers=["CPUExecutionProvider"])
-    h1_sess = ort.InferenceSession(str(ONNX_OUT_DIR / "lfm3_lm_head_d1.onnx"), providers=["CPUExecutionProvider"])
+    # Acceptance Gate 4: Tied LM Head Slices (8 x 16,000 channels)
+    print("\n--- Gate Test: Dual-Die LM Head Slices (8 x 16,000) ---")
     head_in = golden["embedding_norm"][:, 0:1, :].transpose(0, 2, 1)[:, :, :, np.newaxis]
-    h0_out = h0_sess.run(None, {"input": head_in})[0].squeeze(-1).transpose(0, 2, 1) # [1, 1, 64000]
-    h1_out = h1_sess.run(None, {"input": head_in})[0].squeeze(-1).transpose(0, 2, 1) # [1, 1, 64000]
-    merged_logits = np.concatenate([h0_out, h1_out], axis=-1) # [1, 1, 128000]
+    slice_outs = []
+    for die_id in (0, 1):
+        for s_idx in range(4):
+            hs = ort.InferenceSession(str(ONNX_OUT_DIR / f"lfm3_lm_head_d{die_id}_s{s_idx}.onnx"), providers=["CPUExecutionProvider"])
+            s_out = hs.run(None, {"input": head_in})[0].squeeze(-1).transpose(0, 2, 1) # [1, 1, 16000]
+            slice_outs.append(s_out)
+    merged_logits = np.concatenate(slice_outs, axis=-1) # [1, 1, 128000]
     golden_logits0 = golden["pt_logits"][:, 0:1, :]
     cos_head = cosine_similarity(merged_logits, golden_logits0)
     diff_head = float(np.max(np.abs(merged_logits - golden_logits0)))
-    print(f"  Dual-Die Head:   cos={cos_head:.8f}, max_diff={diff_head:.8f}")
+    print(f"  Dual-Die Head (8 slices): cos={cos_head:.8f}, max_diff={diff_head:.8f}")
     assert cos_head >= 0.99999, f"Dual-Die LM Head cosine similarity {cos_head} failed!"
 
     print("\n=================================================================")
-    print(" ALL 74 ONNX SUBGRAPHS EXPORTED & GATES VERIFIED BIT-EXACT (cos >= 0.99999)")
+    print(" ALL 80 ONNX SUBGRAPHS EXPORTED & GATES VERIFIED BIT-EXACT (cos >= 0.99999)")
     print(" MILESTONE 2 COMPLETE.")
     print("=================================================================\n")
 

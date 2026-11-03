@@ -1647,3 +1647,46 @@ ssh roma "cd /tmp/cls && sudo ./probe_two_experts --static0 L1E0_npu_b1.model \
     --classb1s L26E0_npu_b1_classb.model --blob blob_L1E0_L26E0.bin --same-class"
 ```
 
+---
+
+## 36. LFM3-1.7B Milestone 3: Zero-Copy `/ipc`, 140 MB/s `socat`/`dropbear` Fix, Fused-Conv Verdict & The 2 MiB `/dmabuf:npu` KMD Command-Stream Limit
+
+**On `simulator` + `roma`, 2026-11-03.** While compiling and verifying all subgraphs of `LiquidAI/LFM3-1.7B` (24 layers: 13 gated short conv, 5 sliding-window attention, 6 global attention, $D = 2048$, $D_{\text{ffn}} = 7680$, $V = 128,000$), four empirical discoveries were made and verified on silicon:
+
+### 36.1 Root Cause of the 0.56 MB/s `ssh simulator` Bottleneck (§35.6) — and Two Fixes (250× & Zero-Copy)
+
+1. **Why Host → Container `ssh simulator` Was Stuck at 0.56 MB/s While Container → Host Ran at 72–134 MB/s**:
+   - Inside `simulator` (`deep/pdoman/esaac_essimulator/run-simulator.sh`), `dropbear` (`v2019.78`) defaults its SSH channel receive window (`DEFAULT_RECV_WINDOW`) to **24,576 bytes (24 KB)**, whereas host OpenSSH advertises a 2 MB receive window.
+   - `socat` bridged `UNIX-LISTEN:/ipc/dropbear.sock` to `TCP:127.0.0.1:2222` without `TCP_NODELAY` (`nodelay`) and with an 8 KB block size. Every 24 KB of host-to-container upload had to pause for Dropbear's 9-byte `SSH_MSG_CHANNEL_WINDOW_ADJUST` reply, which got held back by Nagle's algorithm + the Linux loopback **40 ms TCP delayed-ACK timer** (`24,576 B / 42 ms = 585 KB/s ≈ 0.56 MB/s`).
+   - Passing `-W 1048576` (1 MB window) to `dropbear` and `-b 65536` + `nodelay` to `socat` increased single-stream host-to-container upload throughput from **0.56 MB/s to 140.22 MB/s (250× speedup)**.
+2. **Zero-Copy Shared RAM Mount (`/run/host-wayland/simulator-ipc` ↔ `/ipc`, `> 5 GB/s`)**:
+   - `/run/host-wayland/simulator-ipc` on the host is bind-mounted directly as `/ipc` (`6.3 GiB` tmpfs) inside the container, but mode `0770 chri:chri` caused `eswin` (`uid=1000`) inside the container to get `Permission denied`. Setting `chmod o+rx /run/host-wayland/simulator-ipc` and staging jobs in `/run/host-wayland/simulator-ipc/lfm3_work` (`0777`) eliminates SSH/SCP file transfers completely.
+3. **Parallel `EsAAC` Collision Caveat on Multi-Slice Models**:
+   - When multiple `EsAAC` processes compile large multi-slice models concurrently (`mlp` with 92 blobs or `lm_head` with 125+ blobs), they can collide in `/tmp/build/build_npu_b1/` inside the container and emit a truncated `.model` file missing several weight-split blobs (`91.5 MB` vs `96.3 MB`) while still returning exit code `0`. Always assert exact byte-size uniformity across layers for each subgraph archetype (`Counter(p.stat().st_size)`) and compile large multi-slice subgraphs sequentially (`--workers=1`).
+
+### 36.2 Fused ShortConv Gate Verdict: Rejected by `EsAAC` (`SdpEmitter.cpp:243`)
+
+Testing whether LFM3's `Lfm3ShortConv` (`in_proj 2048→6144` → `B*x` → `Concat(conv_state[2048,6], x_tilde)` → `depthwise Conv k=(7,1) groups=2048` → `C*dw` → `out_proj 2048→2048`) can compile as a single fused NPU loadable:
+- An isolated depthwise `Conv` (`[1, 2048, 7, 1] → [1, 2048, 1, 1]`, `groups=2048`) compiles cleanly in **70.4 ms**.
+- However, fusing `in_proj → Concat(conv_state, x_tilde) → depthwise Conv → out_proj` (both with `Slice` and with 3 separate $2048\to 2048$ Convs) triggers a fatal assertion crash in `EsAAC`:
+  ```text
+  F20261103 07:29:55.413725 55 SdpEmitter.cpp:243] Check failed: i_precision <= PRECISION_FP16
+  in eaac::SdpEmitter::setPostDRPConfig() <- eaac::SdpEmitter::emitCvtN2EOp() (SIGABRT, exit 134)
+  ```
+- **Decision**: Keep the split `conv_in` + `conv_out` NPU loadables and run the 7-tap depthwise convolution and gating on the host CPU.
+
+### 36.3 The 2 MiB `/dmabuf:npu` KMD Command-Stream Limit (Why `2048 → 64,000` Hung `roma`, and Why `16,000`-Channel Slices Run in 1.90 ms)
+
+In §34.2, `/proc/self/maps` showed that `libedla_runtime.so` / `eic7700_npu.ko` allocates a fixed **2 MiB `/dmabuf:npu` mapping** per loaded model to hold its relocated KMD command streams (`kmd-task-dep_graph` + `kmd-task-op_list` + `kmd-task-surf_list`), and KMD operation dependency records use 8-bit (`256`-entry) indices:
+- Compiling a half-vocabulary LM head (`2048 → 64,000`) as a single `.model` file (`255.74 MiB`) produced **250 M-splits** (`502` relocations) with `dep_graph = 1.56 MiB`, `op_list = 1.42 MiB`, `surf_list = 0.75 MiB` (**`3.73 MiB > 2.00 MiB`**). Submitting it hung both `EsSimulator` and `roma`'s NPU.
+- Splitting the LM head into **8 slices of `16,000` channels** (4 slices on Die 0: `lfm3_lm_head_d0_s{0..3}.model`, 4 slices on Die 1: `lfm3_lm_head_d1_s{0..3}.model`, `64.89 MiB` each) reduces each loadable to **125 M-splits** (`252 <= 256` relocations) and **`1.86 MiB < 2.00 MiB`** of KMD command streams (`799 KiB + 728.5 KiB + 376 KiB`).
+- **Verified on `EsSimulator`, `eswin-sim`, and `roma` silicon (`/dev/npu0`)**:
+
+| Subgraph (`FP16`) | Shape (`In → Out`) | `.model` Size | `eswin-sim` Cosine | Vendor `EsSimulator` | `roma` Silicon Latency (`/dev/npu0`, 10 runs) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`lfm3_l00_conv_in.model`** | `2048 → 6144` | `24.57 MiB` (`25,763,520 B`) | `0.99999997` | `comparison successful` | **`avg = 0.7710 ms`** (`min = 0.726 ms`, `1,297.0 FPS`) |
+| **`lfm3_l02_attn_qkv.model`** | `2048 → 3072` | `12.30 MiB` (`12,892,608 B`) | `0.99999996` | `comparison successful` | **`avg = 0.4701 ms`** (`min = 0.426 ms`, `2,127.2 FPS`) |
+| **`lfm3_l00_mlp.model`** | `2048 → 7680 → 2048` | `91.88 MiB` (`96,346,744 B`) | `0.99999941` | `comparison successful` | **`avg = 2.5382 ms`** (`min = 2.485 ms`, `394.0 FPS`) |
+| **`lfm3_lm_head_d0_s0.model`** | `2048 → 16000` | `64.89 MiB` (`68,045,904 B`) | `0.99999996` | `comparison successful` | **`avg = 1.9056 ms`** (`min = 1.849 ms`, `524.8 FPS`) |
+
+

@@ -253,7 +253,7 @@ def execute_simulation(
             while f"{prefix}{split_idx}_{split_idx}" in model.blobs:
                 bname = f"{prefix}{split_idx}_{split_idx}"
                 raw = model.blobs[bname].data
-                c_out_split = len(raw) // (c_in * 2)
+                c_out_split = ((len(raw) // (c_in * 2)) // 8) * 8
                 w_s = unpack_nvdla_weights_1x1(raw, c_out=c_out_split, c_in=c_in, dtype=in_t.dtype)
                 w_splits.append(w_s)
                 split_idx += 1
@@ -264,7 +264,7 @@ def execute_simulation(
             )
             for bname in matching_blobs:
                 raw = model.blobs[bname].data
-                c_out_split = len(raw) // (c_in * 2)
+                c_out_split = ((len(raw) // (c_in * 2)) // 8) * 8
                 w_s = unpack_nvdla_weights_1x1(raw, c_out=c_out_split, c_in=c_in, dtype=in_t.dtype)
                 w_splits.append(w_s)
 
@@ -280,48 +280,57 @@ def execute_simulation(
             print(f"  • GEMM Execution: {cmac.total_macs:,} MACs, output shape {y.shape} [OK]")
             computed = True
 
-    # Scenario C: SwiGLU MLP Block (arbitrary hidden dimension and arbitrary M-splits)
-    elif any(b.startswith("w_gatesplitM_") for b in model.blobs):
+    # Scenario C: SwiGLU MLP Block (arbitrary hidden dimension and arbitrary M-splits; supports both w_gate/w_up/w_down and w1/w3/w2)
+    elif any(b.startswith(("w_gatesplitM_", "w1splitM_")) for b in model.blobs):
         in_t = model.input_tensors[0]
         out_t = model.output_tensors[0]
         c_in = in_t.c
         c_out = out_t.c
 
+        gate_prefix = "w_gatesplitM_" if any(b.startswith("w_gatesplitM_") for b in model.blobs) else "w1splitM_"
+        up_prefix   = "w_upsplitM_"   if any(b.startswith("w_upsplitM_")   for b in model.blobs) else "w3splitM_"
+        down_prefix = "w_downsplitM_" if any(b.startswith("w_downsplitM_") for b in model.blobs) else "w2splitM_"
+
+        def _split_sort_key(bname: str, pfx: str) -> int:
+            rem = bname[len(pfx):]
+            return int(rem.split("_")[0])
+
         # Unpack w_gate splits
         gate_blobs = sorted(
-            [b for b in model.blobs if b.startswith("w_gatesplitM_")],
-            key=lambda x: int(x.split("_")[2])
+            [b for b in model.blobs if b.startswith(gate_prefix)],
+            key=lambda x: _split_sort_key(x, gate_prefix)
         )
         gate_splits = []
         for b in gate_blobs:
             raw = model.blobs[b].data
-            c_out_s = len(raw) // (c_in * 2)
+            c_out_s = ((len(raw) // (c_in * 2)) // 8) * 8
             gate_splits.append(unpack_nvdla_weights_1x1(raw, c_out_s, c_in, dtype=in_t.dtype))
         w_gate = np.vstack(gate_splits)
         hidden_dim = w_gate.shape[0]
 
         # Unpack w_up splits
         up_blobs = sorted(
-            [b for b in model.blobs if b.startswith("w_upsplitM_")],
-            key=lambda x: int(x.split("_")[2])
+            [b for b in model.blobs if b.startswith(up_prefix)],
+            key=lambda x: _split_sort_key(x, up_prefix)
         )
         up_splits = []
         for b in up_blobs:
             raw = model.blobs[b].data
-            c_out_s = len(raw) // (c_in * 2)
+            c_out_s = ((len(raw) // (c_in * 2)) // 8) * 8
             up_splits.append(unpack_nvdla_weights_1x1(raw, c_out_s, c_in, dtype=in_t.dtype))
         w_up = np.vstack(up_splits)
 
         # Unpack w_down splits
         down_blobs = sorted(
-            [b for b in model.blobs if b.startswith("w_downsplitM_")],
-            key=lambda x: int(x.split("_")[2])
+            [b for b in model.blobs if b.startswith(down_prefix)],
+            key=lambda x: _split_sort_key(x, down_prefix)
         )
         total_down_bytes = sum(len(model.blobs[b].data) for b in down_blobs)
         down_splits = []
         for b in down_blobs:
             raw = model.blobs[b].data
             c_out_s = int(round(c_out * (len(raw) / total_down_bytes))) if total_down_bytes > 0 else (c_out // len(down_blobs))
+            c_out_s = ((c_out_s + 7) // 8) * 8
             down_splits.append(unpack_nvdla_weights_1x1(raw, c_out_s, hidden_dim, dtype=in_t.dtype))
         w_down = np.vstack(down_splits)[:c_out, :]
 
