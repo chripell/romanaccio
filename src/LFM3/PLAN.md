@@ -318,7 +318,7 @@ as "low judgement". Assign by what can go wrong silently:
 
 | Milestone | Tier | Why |
 | :--- | :--- | :--- |
-| 1 — download, inspect, golden oracle | **flash** | Mechanical; the gate is a cosine check against ORT |
+| 1 — download, inspect, golden oracle | **flash** | **COMPLETED (2026-11-03)**: cos 0.999999 vs ORT, 175 arrays in `golden_ref.npz` |
 | 2 — static 4D ONNX export + sidecar weights | **flash**, max for review | Repetitive, but a wrong weight slice or a transposed `w2` produces a loadable that *runs* and outputs plausible nonsense. Diff a few tensors against the checkpoint by hand |
 | 3 — `EsAAC` batch compile + verify | **flash** | Follows `batch_compile_all_layers.py`; must grep logs for `has no graph` and count outputs (§35.6) |
 | 3 (fused-conv experiment) | **max** | Unexplored: no depthwise `Conv` has ever been compiled on this project, and the state buffer has to be Class B because `EsAAC` SIGSEGVs on a second dynamic input |
@@ -330,8 +330,19 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
-### Milestone 1: Checkpoint Acquisition, Architecture Inspector & Golden Reference Oracle
+### Milestone 1: Checkpoint Acquisition, Architecture Inspector & Golden Reference Oracle [COMPLETED 2026-11-03]
 
+- **Implementation & Verification Status** (2026-11-03):
+  - **Artifacts Acquired**:
+    - `LiquidAI/LFM3-1.7B` in `deep/models/LFM3-1.7B/`: `model.safetensors` (3,457,635,448 B, 1,728,801,536 parameters bit-exact), `config.json`, `configuration_lfm3.py`, `modeling_lfm3.py`, `lfm3_conv.py`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `generation_config.json`, `chat_template.jinja`.
+    - `LiquidAI/LFM3-1.7B-ONNX` in `deep/models/LFM3-1.7B-ONNX/`: `onnx/model_fp16.onnx` (270,733 B), `onnx/model_fp16.onnx_data` (2,131,447,808 B), `onnx/model_fp16.onnx_data_1` (1,460,367,360 B) — all 39 dynamic inputs (4 sequence controls, 13 `past_conv.N` states, 22 `past_key_values.N` states) verified.
+  - **Inspector & Oracle Tool**: `src/LFM3/inspect_and_golden.py` committed (`49107af`).
+  - **Configuration Assertions**: Validated `config.json` against §2.1 (hidden 2048, intermediate 7680, 24 layers, 13 conv, 5 sliding_attention, 6 full_attention, 16 Q heads, 4 KV heads, vocab 128000, conv_L_cache 7, sliding_window 256, sandwich norm enabled) — all assertions PASSED.
+  - **Differential Parity Gate**: Prompt `"Hello, world! Today is"` (token IDs `[35808, 20, 1530, 9, 10767, 355]`, `seq_len = 6`) executed on PyTorch (FP32) vs. ONNX Runtime (FP16):
+    - **Cosine Similarity: 0.999999** (acceptance gate $\ge 0.9995$ PASSED).
+    - **Max Absolute Difference: 0.022583**.
+  - **Greedy Continuation**: 4 autoregressive steps generated: `[17479, 20, 309, 358]` (`" Monday"`, `","`, `" and"`, `" I"`).
+  - **Oracle Archive**: Saved to `/home/chri/aixigua/deep/artifacts/lfm3_golden/golden_ref.npz` (175 arrays: `input_ids`, `prompt_text`, `pt_logits`, `ort_logits`, `generated_token_ids`, `embed_tokens`, `embedding_norm`, plus per-layer `op_norm`, `conv_out`/`attn_out`, `post_op_norm`, `ffn_norm`, `mlp_out`, `post_ffn_norm`, `block_out`).
 - **Goal**: Download `LiquidAI/LFM3-1.7B` (SafeTensors) and `LiquidAI/LFM3-1.7B-ONNX` (`fp16` variant), verify all tensor shapes against §2, and generate deterministic golden reference tensors for 1-token prefill and 4-step autoregressive decode.
 - **Files to Create**:
   - `src/LFM3/inspect_and_golden.py`
