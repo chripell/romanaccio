@@ -319,7 +319,7 @@ as "low judgement". Assign by what can go wrong silently:
 | Milestone | Tier | Why |
 | :--- | :--- | :--- |
 | 1 — download, inspect, golden oracle | **flash** | **COMPLETED (2026-11-03)**: cos 0.999999 vs ORT, 175 arrays in `golden_ref.npz` |
-| 2 — static 4D ONNX export + sidecar weights | **flash**, max for review | Repetitive, but a wrong weight slice or a transposed `w2` produces a loadable that *runs* and outputs plausible nonsense. Diff a few tensors against the checkpoint by hand |
+| 2 — static 4D ONNX export + sidecar weights | **flash**, max for review | **COMPLETED (2026-11-03)**: all 74 ONNX subgraphs + CPU sidecars exported, cos 1.00000000 across all gates |
 | 3 — `EsAAC` batch compile + verify | **flash** | Follows `batch_compile_all_layers.py`; must grep logs for `has no graph` and count outputs (§35.6) |
 | 3 (fused-conv experiment) | **max** | Unexplored: no depthwise `Conv` has ever been compiled on this project, and the state buffer has to be Class B because `EsAAC` SIGSEGVs on a second dynamic input |
 | **3.5 — batched T-wide prefill** | **max** | The residency arithmetic sits one model below a kernel-Oops ceiling, chunked CPU state updates must stay sequential, and numerics must match the T=1 path. Highest-consequence milestone in the plan |
@@ -361,8 +361,41 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
-### Milestone 2: Static 4D Opset-13 ONNX Subgraph Exporter & Sidecar Weight Extractor
+### Milestone 2: Static 4D Opset-13 ONNX Subgraph Exporter & Sidecar Weight Extractor [COMPLETED 2026-11-03]
 
+- **Implementation & Verification Status** (2026-11-03):
+  - **Script**: `src/LFM3/export_lfm3.py` created and verified.
+  - **Artifact Locations & Structure (Reference for Milestones 3, 3.5 & 4)**:
+    1. **CPU Sidecar Files** (`/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/`):
+       - `embedding.bin`: Raw FP16 row-major table (`[128000, 2048]`, exactly `524,288,000` bytes = `500.0 MB`) for zero-copy CPU mmap via `EmbeddingTable` (Milestone 4).
+       - `cpu_weights.bin`: Dense binary of all 143 CPU weight tensors (`2,993,152` bytes ≈ `2,923.0 KB`).
+       - `cpu_weights.json`: JSON index mapping tensor name to `{offset, length, shape, dtype}` inside `cpu_weights.bin`. Contains:
+         - 24 layers of `operator_norm`, `post_operator_norm`, `ffn_norm`, `post_ffn_norm` (all `[2048]` FP32).
+         - 1 final `model.embedding_norm.weight` (`[2048]` FP32).
+         - 13 depthwise Conv1D kernels `layer_{L}.conv.conv.weight` (`[2048, 7]` FP32).
+         - 11 attention head QK norms `layer_{L}.self_attn.q_norm.weight` (`[128]` FP32), `k_norm.weight` (`[128]` FP32).
+         - 11 attention head gates `layer_{L}.self_attn.gate_proj.weight` (`[16, 2048]` FP32).
+       - `cpu_weights.npz`: Compressed NumPy archive of all 143 tensors for testing.
+    2. **74 Static 4D Opset-13 NPU ONNX Subgraphs** (`/home/chri/aixigua/deep/artifacts/lfm3_onnx/`):
+       - **26 ShortConv subgraphs** (13 layers: 0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23):
+         - `lfm3_l{00..23}_conv_in.onnx` (`48.0 MB` each, `1x1 Conv2D [1, 2048, 1, 1] -> [1, 6144, 1, 1]`).
+         - `lfm3_l{00..23}_conv_out.onnx` (`16.0 MB` each, `1x1 Conv2D [1, 2048, 1, 1] -> [1, 2048, 1, 1]`).
+       - **22 GQA Attention subgraphs** (11 layers: 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22):
+         - `lfm3_l{02..22}_attn_qkv.onnx` (`24.0 MB` each, `1x1 Conv2D [1, 2048, 1, 1] -> [1, 3072, 1, 1]`).
+         - `lfm3_l{02..22}_attn_out.onnx` (`16.0 MB` each, `1x1 Conv2D [1, 2048, 1, 1] -> [1, 2048, 1, 1]`).
+       - **24 SwiGLU MLP subgraphs** (all layers 0..23):
+         - `lfm3_l{00..23}_mlp.onnx` (`180.0 MB` each, full SwiGLU: `w1(2048->7680)` + `Sigmoid` + `Mul` + `w3(2048->7680)` + `Mul` + `w2(7680->2048)`).
+       - **2 Dual-Die Tied LM Head slices**:
+         - `lfm3_lm_head_d0.onnx` (`500.0 MB`, `1x1 Conv2D [1, 2048, 1, 1] -> [1, 64000, 1, 1]`, Die 0).
+         - `lfm3_lm_head_d1.onnx` (`500.0 MB`, `1x1 Conv2D [1, 2048, 1, 1] -> [1, 64000, 1, 1]`, Die 1).
+  - **Differential Parity Gate Results in ONNX Runtime** (evaluated against `golden_ref.npz`):
+    - Gate 1 (Layer 0 Conv In/Out & MLP): MLP `cos = 1.00000000`, `max_diff = 4.2e-7` (PASSED).
+    - Gate 2 (Layer 2 Global Attn QKV & MLP): MLP `cos = 1.00000000`, `max_diff = 4.2e-7` (PASSED).
+    - Gate 3 (Layer 4 SWA MLP): MLP `cos = 1.00000000`, `max_diff = 1.37e-6` (PASSED).
+    - Gate 4 (Dual-Die LM Head merged logits): `cos = 1.00000000`, `max_diff = 3.81e-6` (PASSED).
+  - **Downstream Coupling**:
+    - Milestone 3 (`batch_compile_lfm3.py`) compiles the 74 `.onnx` files from `/home/chri/aixigua/deep/artifacts/lfm3_onnx/` into `.model` loadables in `/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/models/`.
+    - Milestone 4 (`lfm3_v2.cpp`) reads `embedding.bin` and `cpu_weights.bin` (indexed by `cpu_weights.json`) directly from `/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/`.
 - **Goal**: Export all NPU-targeted linear/MLP subgraphs as static 4D `[1, C, 1, 1]` Opset-13 ONNX files (compatible with `EsAAC`), and package all CPU-side weights (embeddings, RMSNorms, depthwise conv kernels, attention gates) into fast binary files.
 - **Files to Create**:
   - `src/LFM3/export_lfm3.py`
