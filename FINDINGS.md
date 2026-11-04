@@ -2179,3 +2179,41 @@ the flag only edited the echoed label). The result -- FP16 weights read under IN
 scaling -- is min-layer **-0.06023356** and logits **-0.17375845**, i.e. worse than chance. That
 is the signature of a boundary-representation mismatch, and it is the shape of the failure §43.2
 suspects is hiding inside the 0.729.
+
+
+---
+
+## 44. Ranged Cache Maintenance Does Not Exist; Buffer Sizing Is the Lever
+
+**On the host and `roma`, 2026-11-04.**
+
+`nm -D` over `rootfs-roma/lib/libes_memory.so` lists the whole cache-maintenance surface:
+`ES_SYS_MemFlushCache`, `ES_SYS_MemFlushCacheAll`, `ES_SYS_MemFlushCacheAllByNid`,
+`ES_VB_PoolFlushCache` (plus the `SYS_*`/`VB_*` aliases). **Every one is fd- or scope-keyed --
+there is no address+length form**, and the wrapper's `fn_ES_SYS_MemFlushCache` is
+`int (*)(uint64_t memFd)`, matching. So "flush only the bytes the graph wrote" is not available
+through the vendor library, and `DmaBuffer::flush_cache()` will keep maintaining whole allocations.
+
+The lever is therefore allocation size, and re-running the A/B *after* the §42.5 race fix
+separates the two effects that §40.2 had conflated:
+
+| package | buffers | deterministic | decode |
+|---|---|---|---|
+| INT8 | entry-sized (2 MiB) | yes (0.72907964 / 0.88736760) | 5.5 tok/s |
+| INT8 | fixed 32 KiB | **no** -- run 1 gives 0.73032038 / 0.88325379, run 2 gives 0.72907964 / 0.88736760 | -- |
+| FP16 | fixed 32 KiB | yes | **6.61 tok/s** |
+| FP16 | entry-sized (2 MiB) | yes | 5.03 tok/s |
+
+- §40.2's conclusion **stands on its own**: INT8 is genuinely nondeterministic with 32 KiB output
+  buffers even with the race gone, so something really does write past them and entry-sized
+  allocation is required for INT8.
+- The cost is real and measured: small buffers are **~32% faster for FP16** (6.61 vs 5.03), which
+  is whole-allocation cache maintenance on 2 MiB x 72 submits/token.
+- So the remaining win is to size each buffer to what its graph actually writes rather than to the
+  driver's 2 MiB bucket (a reporting artifact, §41.1) or to a fixed constant. That needs a
+  measured write-extent per archetype -- e.g. a canary region after each buffer, corrupt
+  deliberately, and see what gets clobbered -- not a smaller guess.
+
+Also added `src/LFM3/README.md`: which package to run (FP16 is the only one that passes its gate),
+exact commands, the `--model-dir`/cwd trap with the checksum lines that catch it, the
+gate-integrity checks, the package-rebuild order, and the EsAAC container traps.
