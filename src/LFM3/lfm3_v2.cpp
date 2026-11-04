@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <fstream>
 #include <iomanip>
@@ -292,16 +293,23 @@ static constexpr Lfm3LayerType kLayerSchedule[24] = {
  * reads or writes and the result still looks plausible. That is a hard error, not a clamp.
  */
 static size_t surface_descriptor(const DmaBuffer *buf, size_t reported, size_t raw,
-                                 const char *what, bool &failed) {
+                                 const char *what, bool &failed, size_t cap = SIZE_MAX) {
     if (!buf) return raw;
-    if (raw > buf->size()) {
+    // The write-extent probe over-allocates buffers to carry a guard region. Without this cap
+    // the guard would silently widen every descriptor and change the thing being measured.
+    const size_t usable = std::min(buf->size(), cap);
+    // Compare against `usable`, not `buf->size()`: under the extent probe the allocation carries a
+    // guard region, and testing against it would let a tensor larger than the production buffer
+    // pass the check and then be silently truncated by the min() below -- the exact bug this
+    // function exists to prevent.
+    if (raw > usable) {
         std::printf("FAIL: %s tensor needs %zu bytes but its DMA buffer holds only %zu "
                     "(reported entry %zu) -- refusing to truncate the surface\n",
                     what, raw, buf->size(), reported);
         failed = true;
         return raw;
     }
-    return std::max(raw, std::min(reported, buf->size()));
+    return std::max(raw, std::min(reported, usable));
 }
 
 struct StageTimers {
@@ -1113,12 +1121,16 @@ public:
                     s_lmout = std::max(s_lmout, a->out_surface_bytes);
             }
 
+            const size_t g = m_guard_bytes;
             m_act_t1[d]  = std::make_unique<DmaBuffer>(s_act1,  CacheMode::Cached, zone);
-            m_out_t1[d]  = std::make_unique<DmaBuffer>(s_out1,  CacheMode::Cached, zone);
+            m_out_t1[d]  = std::make_unique<DmaBuffer>(s_out1 + g,  CacheMode::Cached, zone);
             m_act_t64[d] = std::make_unique<DmaBuffer>(s_act64, CacheMode::Cached, zone);
-            m_out_t64[d] = std::make_unique<DmaBuffer>(s_out64, CacheMode::Cached, zone);
+            m_out_t64[d] = std::make_unique<DmaBuffer>(s_out64 + g, CacheMode::Cached, zone);
             for (int s = 0; s < 4; ++s)
-                m_lm_out[d][s] = std::make_unique<DmaBuffer>(s_lmout, CacheMode::Cached, zone);
+                m_lm_out[d][s] = std::make_unique<DmaBuffer>(s_lmout + g, CacheMode::Cached, zone);
+            note_prod_cap(m_out_t1[d].get(), s_out1);
+            note_prod_cap(m_out_t64[d].get(), s_out64);
+            for (int s = 0; s < 4; ++s) note_prod_cap(m_lm_out[d][s].get(), s_lmout);
             for (const DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
                                        m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
                                        m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
@@ -1246,7 +1258,8 @@ public:
             auto surf_or = [&](const DmaBuffer *buf, size_t reported, int T_cur, int C_cur,
                                BoundaryDtype dt, const char *what) -> size_t {
                 const size_t raw = static_cast<size_t>(T_cur) * C_cur * dtype_elem_size(dt);
-                return surface_descriptor(buf, reported, raw, what, surface_overflow);
+                return surface_descriptor(buf, reported, raw, what, surface_overflow,
+                                          prod_cap(buf));
             };
             if (surface_overflow) return false;
 
@@ -1265,10 +1278,12 @@ public:
                                    const std::vector<DmaBufferSlice> &outs,
                                    DmaBuffer *flush_after, double weight_bytes,
                                    double &stage_ms) -> bool {
+                prime_guard(flush_after);
                 const auto s0 = std::chrono::steady_clock::now();
                 uint64_t driver_ns = 0;
                 const bool ok = m_pool.submit_task(phys_die, model_id, ins, outs, &driver_ns);
                 if (ok && flush_after) flush_after->flush_cache();
+                if (ok) measure_guard(arch_idx, flush_after);
                 const auto s1 = std::chrono::steady_clock::now();
                 const double master_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
                 stage_ms += master_ms;
@@ -1580,19 +1595,23 @@ public:
                 size_t out_raw  = static_cast<size_t>(16000)   * dtype_elem_size(lm_sc.out_dtype);
                 bool lm_fit = false;
                 const size_t in_surf  = surface_descriptor(in_b,  lm_arch.in_surface_bytes,
-                                                           in_raw,  "lm_head act",  lm_fit);
+                                                           in_raw,  "lm_head act",  lm_fit,
+                                                           prod_cap(in_b));
                 const size_t out_surf = surface_descriptor(out_b, lm_arch.out_surface_bytes,
-                                                           out_raw, "lm_head logits", lm_fit);
+                                                           out_raw, "lm_head logits", lm_fit,
+                                                           prod_cap(out_b));
                 if (lm_fit) {
                     ok_flag = false;
                     return;
                 }
+                prime_guard(out_b);
                 const auto s0 = std::chrono::steady_clock::now();
                 uint64_t driver_ns = 0;
                 const bool ok = m_pool.submit_task(phys_die, lm_arch.id,
                         {DmaBufferSlice{in_b, 0, in_surf}},
                         {DmaBufferSlice{out_b, 0, out_surf}}, &driver_ns);
                 if (ok) out_b->flush_cache();
+                if (ok) measure_guard(StageTimers::ARCH_LM_HEAD, out_b);
                 const auto s1 = std::chrono::steady_clock::now();
                 lm_master[logical_die] += std::chrono::duration<double, std::milli>(s1 - s0).count();
                 lm_driver[logical_die] += static_cast<double>(driver_ns) / 1e6;
@@ -1682,6 +1701,69 @@ public:
         for (size_t i = 0; i < len; ++i) p[i] ^= xor_mask;
         m_w_blob[die]->flush_cache();
         return true;
+    }
+
+    /**
+     * @brief Write-extent probe (LFM3_MEASURE_EXTENT=1): what does each graph actually write?
+     *
+     * Buffers are sized today either to a fixed constant (32 KiB) or to the driver's reported
+     * memory entry (2 MiB) -- neither is a measurement. The 2 MiB figure is known to be a
+     * reporting bucket, not a tensor (FINDINGS 41.1), and whole-allocation cache maintenance
+     * costs ~32% of decode (44), so the right size is whatever the NPU actually touches.
+     *
+     * Each output buffer gets a guard region appended, refilled with a known byte before every
+     * submit and scanned after it. The first overwritten offset is that archetype's write extent.
+     */
+    void set_extent_probe(bool on, size_t guard) { m_extent_probe = on; m_guard_bytes = on ? guard : 0; }
+    void note_prod_cap(const DmaBuffer *b, size_t prod) { if (m_extent_probe) m_prod_cap[b] = prod; }
+    size_t prod_cap(const DmaBuffer *b) const {
+        auto it = m_prod_cap.find(b);
+        return it == m_prod_cap.end() ? SIZE_MAX : it->second;
+    }
+    void prime_guard(DmaBuffer *b) {
+        if (!m_extent_probe || !b) return;
+        // Fill the WHOLE buffer, not just the guard. The question worth answering is how far into
+        // the production region the graph actually writes -- that is what allows a buffer to be
+        // shrunk -- and a guard-only fill can only ever report overruns, never a high-water mark.
+        uint8_t *g = static_cast<uint8_t *>(b->data());
+        std::fill(g, g + b->size(), GUARD_BYTE);
+        // Flush AFTER priming and BEFORE submitting. The fill leaves megabytes of dirty CPU cache
+        // lines over the region the NPU is about to write; the post-submit flush then pushes them
+        // back over the NPU's output and the run silently degrades to garbage. Production never
+        // dirties an output buffer before a submit, so this ordering bug only exists here.
+        // (Direct evidence for the unresolved flush-direction question, audit 1.1: a flush on an
+        // fd whose cache lines are dirty does write them back, and it is not merely an invalidate.)
+        b->flush_cache();
+    }
+    void measure_guard(int arch, DmaBuffer *b) {
+        if (!m_extent_probe || !b) return;
+        const uint8_t *g = static_cast<const uint8_t *>(b->data());
+        ++m_extent_samples[arch];
+        for (size_t i = b->size(); i-- > 0; ) {
+            if (g[i] != GUARD_BYTE) {
+                if (i + 1 > m_extent_max[arch]) m_extent_max[arch] = i + 1;
+                if (i + 1 > prod_cap(b)) m_extent_overrun[arch] = true;
+                break;
+            }
+        }
+    }
+    void print_extent_report() const {
+        if (!m_extent_probe) return;
+        std::printf("\n--- measured write extent per archetype (guard %zu KiB, byte 0x%02x) ---\n",
+                    m_guard_bytes >> 10, GUARD_BYTE);
+        static const char *nm[StageTimers::ARCH_COUNT] = {
+            "conv_in", "proj2048", "attn_qkv", "mlp", "lm_head"};
+        for (int i = 0; i < StageTimers::ARCH_COUNT; ++i) {
+            if (!m_extent_samples[i]) { std::printf("  %-9s NOT ARMED (0 submits sampled)\n", nm[i]); continue; }
+            if (!m_extent_max[i]) { std::printf("  %-9s %llu submits, no bytes written\n", nm[i],
+                                                (unsigned long long)m_extent_samples[i]); continue; }
+            const size_t pages = (m_extent_max[i] + 4095) & ~static_cast<size_t>(4095);
+            std::printf("  %-9s %4llu submits, write high-water %8zu B -> size %8zu B (%.3f MiB)%s\n",
+                        nm[i], (unsigned long long)m_extent_samples[i], m_extent_max[i], pages,
+                        pages / 1048576.0, m_extent_overrun[i] ? "  <-- OVERRUNS its region!" : "");
+        }
+        std::printf("  Anything at the 2 MiB bucket is the driver's reporting artifact (41.1),\n"
+                    "  not a measured write; size to what is above and flush cost follows it.\n");
     }
 
     size_t weight_blob_bytes(int die) const {
@@ -2510,6 +2592,13 @@ private:
     bool m_force_int8 = false;
     bool m_use_shared_archetype_scales = true;
     bool m_ab_shared_weights = false;   // --weights-layer0: timing experiment, numerics invalid
+    bool m_extent_probe = false;
+    size_t m_guard_bytes = 0;
+    static constexpr uint8_t GUARD_BYTE = 0xA5;
+    uint64_t m_extent_max[StageTimers::ARCH_COUNT] = {0, 0, 0, 0, 0};
+    uint64_t m_extent_samples[StageTimers::ARCH_COUNT] = {0, 0, 0, 0, 0};
+    bool m_extent_overrun[StageTimers::ARCH_COUNT] = {false, false, false, false, false};
+    std::map<const DmaBuffer *, size_t> m_prod_cap;
 
     WorkerPool m_pool;
     EmbeddingTable m_embedding;
@@ -2654,6 +2743,7 @@ int main(int argc, char **argv) {
     Lfm3Engine engine;
     engine.set_quant_options(force_int8, use_shared_archetype_scales);
     engine.set_ab_shared_weights(ab_shared_weights);
+    engine.set_extent_probe(std::getenv("LFM3_MEASURE_EXTENT") != nullptr, 2u << 20);
     if (bench_attn && verify_golden_path.empty() && prompt.empty()) {
         engine.benchmark_global_attention_kernel();
         return 0;
@@ -2856,6 +2946,7 @@ int main(int argc, char **argv) {
         prefill_timers.print_report("Prefill (6 tokens, T=1 path)");
         decode_timers.print_report("Autoregressive Decode (16 tokens)");
         decode_timers.print_arch_report();
+        engine.print_extent_report();
 
         double decode_tok_s = 1000.0 * decode_timers.tokens_run / decode_timers.total_ms();
         bool speed_pass = (decode_tok_s >= 1.80);

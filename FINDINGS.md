@@ -2234,3 +2234,41 @@ Linear's output is not shape-transparent there. No conclusion about weights vs a
 be drawn from this script until that is fixed; the engine-side evidence (FP16 correct, INT8 0.729,
 `proj2048` non-monotonic) stands as far as it goes, which is: the fault is in the quantization
 path, not the model code, but which half is still open.
+
+
+---
+
+## 45. Measured Write Extents: Output Buffers Are 16-500x Larger Than Anything Writes
+
+**On `roma`, 2026-11-04.** `LFM3_MEASURE_EXTENT=1` fills each output buffer with a sentinel and
+flushes it **before** the submit, then scans for the high-water mark after. Production behaviour is
+unchanged with the probe off (FP16 re-verified: min-layer 0.99998623, logits 0.99999267,
+determinism and restore identical).
+
+| archetype | FP16 high-water | INT8 high-water | current allocation |
+|---|---|---|---|
+| conv_in | 12,288 B | 6,144 B | 2 MiB |
+| proj2048 | 4,096 B | 2,048 B | 2 MiB |
+| attn_qkv | 6,144 B | 3,072 B | 2 MiB |
+| mlp | 4,096 B | 4,096 B | 2 MiB |
+| lm_head | 32,000 B | 16,000 B | 2 MiB |
+
+Sampled over 520/960/440/960/160 submits respectively. **No archetype overran its region.** The
+2 MiB allocations from §40.2 are therefore 16-500x larger than anything the graphs touch, and since
+`ES_SYS_MemFlushCache` is whole-allocation and fd-keyed (§44), that surplus is exactly the ~46-86
+ms/token of cache maintenance costing the measured ~32% of decode. Sizing to the extents above
+(+ page rounding, + margin) is the win; the earlier small-buffer run already reached 6.61 tok/s.
+
+### 45.1 Two things this does NOT yet license
+
+- **Do not shrink production buffers on this evidence alone.** §44 observed INT8 was still
+  nondeterministic with 32 KiB output buffers, and these extents cannot explain that -- all are
+  <= 32,000 B. So the overrun, if any, is on a buffer the probe does not watch: the **input** side
+  (`act_t1` at 4 KiB) is the obvious candidate, since a graph may read beyond its input tensor.
+  Probe the activation buffers the same way before changing allocation.
+- **The priming incident is itself a finding.** Filling an output buffer and *not* flushing before
+  the submit dropped FP16 min-layer from 0.99998623 to -0.0266 -- the post-submit flush wrote the
+  dirty sentinel lines back over the NPU's output. Production never dirties an output buffer before
+  a submit, so only the probe could hit it. Evidence for audit item 1.1: the flush is not
+  invalidate-only, it writes back dirty lines. Any future `Cached`-mode optimization must respect
+  that ordering.
