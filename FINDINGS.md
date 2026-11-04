@@ -2075,3 +2075,42 @@ claimed end-to-end win: final logits get worse and greedy still fails. Both pack
 the `>= 0.9990` gate, so the dominant error is elsewhere. The next step is a per-archetype
 ablation (revert one archetype at a time to FP16 and watch min-layer *and* logits) rather than
 another single-variable guess, and it must be done with the run-2 numbers, not run-1.
+
+### 42.5 RESOLVED: the cause was a data race on the pack/unpack staging buffers
+
+Neither suspect named in §42.3 was the cause. `unpack_npu_output()` takes `dyntok_ratios` as
+`const float *`, so the `lm_tok_ratio[1]` array shared by the two die threads is read-only and
+cannot race; and the un-cleared global KV in `reset_state()` is unreachable at 6 tokens
+(`n_valid = pos + 1`). The real defect:
+
+```cpp
+alignas(64) static uint16_t g_stage_fp16[64 * 6144];   // file scope
+alignas(64) static int8_t   g_stage_int8[64 * 6144];
+alignas(64) static int16_t  g_stage_int16[64 * 6144];
+```
+
+Every `pack_npu_input` / `unpack_npu_output` call stages through those globals. The dual-die LM
+head runs `run_die_lm_head` on **two `std::thread`s**, each unpacking 4 x 16,000 logits through
+the *same* buffer -- so die 1 could overwrite the stage between die 0's `memcpy` and its read.
+That is why only the logits varied while the 24-layer residual stream (single-threaded) stayed
+bit-stable, and why the damage was worst on the first invocation.
+
+They cannot be made `thread_local`: the T=64 unpack path reads the stage from inside an OpenMP
+region, whose workers would each see their own zero-filled copy. So the fix serializes at the two
+dispatchers (`static std::mutex g_stage_mutex`), which costs one uncontended lock per call in the
+single-threaded layer loop. `reset_state()` was also completed (global KV, INT8 side-cars,
+logits) as hygiene -- a second conversation in one process would otherwise inherit the first.
+
+Verified on `roma`, two packages x two separate processes, three prefills each:
+
+| package | run 1 | run 2 | run 3 (restored) | run 1 in a second process |
+|---|---|---|---|---|
+| all-INT8 | 0.88736760 | 0.88736760 | 0.88736760 | **0.88736760** |
+| mixed | 0.81591145 | 0.81591145 | 0.81591145 | **0.81591145** |
+
+`min-layer` likewise stable (0.72907964 / 0.85739772), sensitivity still passes, and the `[1/3]`
+figure now equals the stable value instead of the anomalous first-call one. Decode is 5.1-5.6
+tok/s (the 2 MiB surface flushes of §40.2), greedy still FAIL and logits still far below the
+0.9990 gate -- but those numbers are now reproducible, so the remaining accuracy problem is
+measurable rather than noise. Every accuracy figure recorded before this fix, in §38.1 and §39.3
+included, was measured through the race.

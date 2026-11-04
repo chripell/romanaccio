@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -498,6 +499,22 @@ alignas(64) static uint16_t g_stage_fp16[64 * 6144];
 alignas(64) static int8_t   g_stage_int8[64 * 6144];
 alignas(64) static int16_t  g_stage_int16[64 * 6144];
 
+/**
+ * @brief Serializes every use of the g_stage_* buffers above.
+ *
+ * The dual-die LM head calls unpack_npu_output() from two std::threads, and both staged through
+ * the same global buffer -- which is why the first prefill's logits differed from every later one
+ * and varied between processes while the 24-layer residual stream stayed bit-stable
+ * (FINDINGS 42.3). These buffers cannot be made thread_local: the T=64 unpack path reads them
+ * from inside an OpenMP region, whose workers would each see their own zero-filled copy. So the
+ * lock goes at the two dispatchers instead. The layer loop is single-threaded, so this is one
+ * uncontended lock per call; the head's two threads are the only contenders.
+ *
+ * The typed pack and unpack leaves are NOT thread-safe; reach them only through
+ * pack_npu_input() and unpack_npu_output(), which hold this lock.
+ */
+static std::mutex g_stage_mutex;
+
 static void pack_npu_input_fp16(const float *src_tc, uint16_t *dst_npu, int T, int C) {
     if (T == 1) {
         for (int c = 0; c < C; ++c) {
@@ -810,6 +827,7 @@ static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc,
 // Unified NPU Input Packer: routes FP32 [T, C] -> FP16, INT8 (static or dyntok), or INT16 DmaBuffer
 static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C,
                            const SubgraphScaleInfo &sc, float *dyntok_ratios = nullptr) {
+    std::lock_guard<std::mutex> stage_lk(g_stage_mutex);
     switch (sc.in_dtype) {
         case BoundaryDtype::Int8:
             if (dyntok_ratios) {
@@ -831,6 +849,7 @@ static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C
 // Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T, C_out]
 static void unpack_npu_output(const DmaBuffer *src_buf, float *dst_tc, int T, int C_out,
                               const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr) {
+    std::lock_guard<std::mutex> stage_lk(g_stage_mutex);
     switch (sc.out_dtype) {
         case BoundaryDtype::Int8:
             if (dyntok_ratios) {
@@ -1133,10 +1152,27 @@ public:
         return true;
     }
 
+    /**
+     * @brief Returns every piece of per-conversation state to its post-init value.
+     *
+     * This used to clear only the conv rings, the SWA caches and m_pos, leaving the global KV,
+     * its INT8 side-cars and the logits buffer holding the previous conversation. A 6-token
+     * prefill cannot expose that (n_valid = pos+1 never reaches the stale slots), but a second
+     * conversation in one process -- or any test that reuses the engine -- reads it. "Reset"
+     * should mean reset, even where today's callers happen not to notice.
+     */
     void reset_state() {
         std::fill(m_conv_state.begin(), m_conv_state.end(), 0.0f);
         std::fill(m_swa_k.begin(), m_swa_k.end(), 0.0f);
         std::fill(m_swa_v.begin(), m_swa_v.end(), 0.0f);
+        std::fill(m_glob_k.begin(), m_glob_k.end(), 0.0f);
+        std::fill(m_glob_v.begin(), m_glob_v.end(), 0.0f);
+        std::fill(m_glob_k_u8.begin(), m_glob_k_u8.end(), 0);
+        std::fill(m_glob_v_u8.begin(), m_glob_v_u8.end(), 0);
+        std::fill(m_glob_k_sc.begin(), m_glob_k_sc.end(), 0.0f);
+        std::fill(m_glob_v_sc.begin(), m_glob_v_sc.end(), 0.0f);
+        std::fill(m_glob_k_sum.begin(), m_glob_k_sum.end(), 0);
+        std::fill(m_logits.begin(), m_logits.end(), 0.0f);
         m_pos = 0;
     }
 
