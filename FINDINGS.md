@@ -2217,3 +2217,20 @@ separates the two effects that §40.2 had conflated:
 Also added `src/LFM3/README.md`: which package to run (FP16 is the only one that passes its gate),
 exact commands, the `--model-dir`/cwd trap with the checksum lines that catch it, the
 gate-integrity checks, the package-rebuild order, and the EsAAC container traps.
+
+
+### 44.5 Attribution tool written, not yet run
+
+To settle whether the INT8 gap is weight precision or boundary handling without waiting on an
+external pre-quantized checkpoint (which would answer only the weights half),
+`src/LFM3/attribute_int8_error.py` runs four configurations against the same fp32 reference --
+baseline, per-channel INT8 weights only, engine boundary quantization only, and both -- reporting
+min-layer, first-layer-below-0.99, and logits cosine for each.
+
+Status, stated plainly: **it does not run yet.** With hooks installed the reference
+`modeling_lfm3.py` fails in `Lfm3DecoderLayer._conv` with `Expected 2D or 3D input to conv1d,
+but got [1, 1, 2048, 6]` -- `Lfm3ShortConv` transposes around its projections, so replacing a
+Linear's output is not shape-transparent there. No conclusion about weights vs activations should
+be drawn from this script until that is fixed; the engine-side evidence (FP16 correct, INT8 0.729,
+`proj2048` non-monotonic) stands as far as it goes, which is: the fault is in the quantization
+path, not the model code, but which half is still open.

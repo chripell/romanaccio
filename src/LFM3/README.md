@@ -115,6 +115,12 @@ but scale ~8x in parallel; pulls run at ~134 MB/s.
 - **Long context.** The global-attention KV lives on the host; measured cost crosses the NPU's
   weight-stream cost somewhere between 32K and 128K tokens (§1.1 item 3). Nothing above ~4K is
   validated.
+- **Attribution experiment not yet run to completion.** `attribute_int8_error.py` measures the
+  fp32 baseline, weights-only INT8, activations-only, and both, to say whether the INT8 gap is
+  weight precision or boundary handling. It currently dies inside `modeling_lfm3.py`'s conv path
+  (`Expected 2D or 3D input to conv1d, but got [1, 1, 2048, 6]`) once the boundary hooks are
+  installed, because `Lfm3ShortConv` transposes around its projections -- wrapping the Linears is
+  not shape-transparent there. Fixing that is the next step before drawing any conclusion from it.
 - **Nothing exercises the >256-token paths end to end yet**: the INT8 SWAR attention kernel, the
   sliding-window ring wrap and flash-decoding splits all engage past position 256, and the golden
   test is 6 tokens. Each is unit-benchmarked; none is integration-tested.
