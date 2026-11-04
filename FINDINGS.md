@@ -2303,3 +2303,32 @@ Consequences, recorded as decisions not aspirations:
 - **The activation-tail probe is implemented but has not been run yet**, so the input side remains
   unmeasured. Next measurement is that, plus re-running 45's scan against *tensor* boundaries
   rather than descriptor boundaries, which is what would actually reveal writes in between.
+
+
+### 45.3 Cause isolated: stale bytes INSIDE the buffer, not an out-of-bounds write
+
+Same small-buffer configuration that diverged, with `LFM3_MEASURE_EXTENT=1` also set -- the probe
+sentinel-fills every output buffer and flushes **before** each submit:
+
+| config | INT8 run1 vs run2 | FP16 run1 vs run2 |
+|---|---|---|
+| small buffers, no prime (45.2) | diverge: 0.73503351/0.84836137 then 0.72907964/0.88736760 | diverge: 0.99996877 then 0.99999267 |
+| small buffers + per-submit prime & flush | **identical 0.72907964 / 0.88736760** | **identical 0.99998623 / 0.99999267** |
+| entry-sized buffers, no prime (default) | identical, same values | identical, same values |
+
+Making the buffer's contents deterministic per submit removes the divergence **and reproduces the
+entry-sized numbers exactly**. So the graph is reading bytes between the end of its tensor and the
+end of the descriptor -- inside the allocation -- whose values vary between runs. Nothing is
+overrunning anything: measured write high-water marks in the small configuration are exactly the
+tensor byte counts (FP16 conv_in 12,288 B, lm_head 32,000 B; INT8 6,144 B and 16,000 B), and no
+input-buffer tail was ever clobbered (zero `INPUT buffer tail` reports across 2,040 submits).
+
+That also refines 45.2's conclusion: entry-sized buffers work not because the NPU writes 2 MiB,
+but because the descriptor there equals the declared surface, so the stale region the graph reads
+happens to be one it also writes.
+
+**Untested candidate fix, and the reason 32% may still be recoverable:** the descriptor is
+currently `max(raw_tensor, min(reported, buffer))`, which in the small configuration hands the
+graph a 32,768-byte surface for a 12,288-byte tensor. Set the descriptor to the **tensor** size
+instead and the graph has no stale region in range to read, which should make tensor-sized
+buffers deterministic without any per-submit priming. Not run yet; do not quote it as a result.
