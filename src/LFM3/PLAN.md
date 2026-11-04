@@ -505,7 +505,17 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
-### Milestone 4: Native C++17 Tri-Hybrid Inference Engine (`lfm3_v2`)
+### Milestone 4: Native C++17 Tri-Hybrid Inference Engine (`lfm3_v2`) — **COMPLETE (2026-11-04)**
+
+- **Status**: **COMPLETE & VERIFIED ON SILICON (`roma`, `/dev/npu0` Die 0 + Die 1)**.
+  - **Deliverables Created**: `src/LFM3/lfm3_v2.cpp`, `src/LFM3/Makefile`, `src/LFM3/CMakeLists.txt`, and binary golden oracle `/home/chri/aixigua/deep/artifacts/lfm3_golden/golden_ref.bin`.
+  - **Dual-Die Residency**: `12 / 55` resident loadables per die (`4 × T=1` Class B + `4 × T=64` Class B + `4 × 16K` LM head slices), `50` models below the 62-model kernel Oops ceiling, with `weights_die0.bin` (`1.379 GiB` on `mmz_nid_0_part_0`) and `weights_die1.bin` (`1.367 GiB` on `mmz_nid_1_part_0`) prepared once at startup.
+  - **Golden Reference Verification (`--verify-golden golden_ref.bin` on `roma`)**:
+    - **24-Layer Hidden State Parity**: `Min Layer Cosine = 0.99998623`, `Final embedding_norm Cosine = 0.99998761`.
+    - **128,000-Token Logits Cosine**: **`0.99999267`** vs. PyTorch FP32 and **`0.99999225`** vs. ONNX Runtime FP16 (`>= 0.9990` gate `[PASS]`).
+    - **4-Step Greedy Decode (`"Hello, world! Today is"`)**: Predicted **`[17479, 20, 309, 358]`** (`" Monday, and I"`), matching `golden_ref.npz` **4/4 exact** (`[PASS]`).
+  - **Sustained FP16 Decode Speed & Per-Stage Breakdown (`16` tokens on `roma`)**: **`5.86 tokens/sec` (`170.61 ms/tok`)** — beating the `>= 1.80 tok/s` gate by **`3.26×`** (`NPU Layer Projections = 145.85 ms/tok [85.5%]`, `NPU Dual-Die LM Head = 13.69 ms/tok [8.0%]`, `CPU SandwichNorm+Gates = 6.85 ms/tok [4.0%]`, `CPU ShortConv = 2.21 ms/tok [1.3%]`, `CPU Global Attn = 1.22 ms/tok [0.7%]`, `CPU SWA Attn = 0.80 ms/tok [0.5%]`, `D2D Transfer = 0.00 ms/tok`), with `dmesg` 100% clean.
+  - **Global GQA CPU Microbenchmark (`--bench-attn` on `roma`)**: Using NUMA-pinned (`sched_setaffinity`) Head-Major INT8 KV cache + 64-bit 2-lane SWAR (`run_gqa_attention_int8_swar`, `Cosine = 0.99999210` vs. FP32 at `4096` ctx) achieved **`1.11 ms/tok` at `512` context** (budget `~1.0 ms`, `2×` gate `<= 2.0 ms` `[PASS]`), **`6.07 ms/tok` at `4096` context** (budget `~8.0 ms`, `2×` gate `<= 16.0 ms` `[PASS]`), and **`60.57 ms/tok` at `32768` context** (budget `~65.0 ms`, `2×` gate `<= 130.0 ms` `[PASS]`).
 
 - **Goal**: Build a standalone C++17 dual-die inference executable (`src/LFM3/lfm3_v2.cpp`) on top of `libes_runtime.so` (modeled directly on `src/qwen2_v2/qwen2_v2.cpp`) that executes the full 24-layer LFM3 tri-hybrid pipeline across Die 0 and Die 1.
 - **Files to Create**:

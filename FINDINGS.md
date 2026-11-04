@@ -1741,5 +1741,59 @@ Running the full 24-layer tri-hybrid prefill and decode suite (`src/LFM3/bench_p
   - **4096-Token 24-Layer Tri-Hybrid Prefill (`64 × T=64` chunks)**: **NPU execution across all 64 chunks took `20.02 s` (`4.89 ms/tok`, streaming `187.5 GB` at `9.37 GB/s` effective DMA bandwidth — beating the `≤ 30.0 s` NPU weight-streaming gate by 33%)**. Total wall-clock including scalar CPU $O(N^2)$ 6-layer Global Attention (`412.4 GFLOPs` / `206.2B` FMAs over $4096 \times 4096$ on non-RVV SiFive P550 cores) is `108.39 s` (`26.46 ms/tok` = `37.8 tok/s`).
   - **Immediate Post-Prefill `T=1` Decode (Zero Model Swap)**: **`82.03 ms/tok` (`12.19 tok/s`)** across all 24 layers `[PASS]`, with `dmesg` completely clean.
 
+---
+
+## 38. LFM3-1.7B Milestone 4: Native C++17 Dual-Die Inference Engine (`lfm3_v2`), 64-Bit SWAR INT8 Global GQA & Silicon Verification
+
+**On `roma` (`/dev/npu0` Die 0 + Die 1), 2026-11-04.** We implemented and verified the standalone C++17 dual-die inference engine (`src/LFM3/lfm3_v2.cpp`, `src/LFM3/Makefile`, `src/LFM3/CMakeLists.txt`) built on `libes_runtime.so` (`WorkerPool`, `DmaBufferSlice`, `EmbeddingTable`, `Tokenizer`, `Sampler`).
+
+### 38.1 Dual-Die Route D Residency & Golden Oracle Parity (`--verify-golden`)
+
+- **12 Resident Models per Die (Zero Model Swapping)**:
+  - **Die 0 (`mmz_nid_0_part_0`, Layers `0..11`)** and **Die 1 (`mmz_nid_1_part_0`, Layers `12..23`)** each load `4` shared `T=1` Class B layer archetypes (`conv_in`, `proj2048`, `attn_qkv`, `mlp`), `4` shared `T=64` Class B layer archetypes, and `4` `16,000`-channel LM head slices (`lfm3_lm_head_d{0,1}_s{0..3}.model`) = **`12 / 55` resident models per die** (`50` below the 62-model kernel Oops ceiling).
+  - Both `T=1` and `T=64` Class B archetypes bind to the same 4K-aligned per-die MMZ weight blob (`weights_die0.bin = 1.379 GiB`, `weights_die1.bin = 1.367 GiB`), prepared once in the SMMU at startup.
+- **24-Layer & 128K-Logit Numerical Parity vs. PyTorch FP32 & ONNX Runtime FP16**:
+  - Across the 6-token teacher-forced prefill (`"Hello, world! Today is"`) + 4-token greedy decode (`--verify-golden golden_ref.bin`):
+    - **Layer 00 `block_out` Cosine vs. PyTorch FP32**: **`0.99999987`**
+    - **Layer 11 `block_out` (Die 0 out) Cosine vs. PyTorch FP32**: **`0.99999800`**
+    - **Layer 23 `block_out` (Die 1 out) Cosine vs. PyTorch FP32**: **`0.99998714`** (`Min Layer Cosine = 0.99998623` across all 24 layers)
+    - **Final `embedding_norm` Cosine vs. PyTorch FP32**: **`0.99998761`**
+    - **128,000-Token Logits Cosine**: **`0.99999267`** vs. PyTorch FP32 (`>= 0.9990` gate `[PASS]`) and **`0.99999225`** vs. ONNX Runtime FP16.
+    - **4-Step Greedy Autoregressive Token IDs**: Predicted **`[17479, 20, 309, 358]`** (`" Monday, and I"`), matching `golden_ref.npz` **4/4 exact** (`[PASS]`).
+
+### 38.2 Sustained FP16 Decode Speed & Per-Stage Timing Breakdown on `roma`
+
+| Decode Stage (24 Layers + 128K Dual-Die LM Head, `16` Tokens) | Total (`16` tok) | Per-Token (`ms/tok`) | Share (`%`) |
+| :--- | :--- | :--- | :--- |
+| **NPU Layer Projections** (`60` submits: `26` Conv, `22` Attn, `24` MLP) | `2,333.61 ms` | **`145.85 ms/tok`** | `85.5%` |
+| **NPU Dual-Die Parallel LM Head** (`4 × 16K` Die 0 $\parallel$ `4 × 16K` Die 1) | `218.96 ms` | **`13.69 ms/tok`** | `8.0%` |
+| **CPU Sandwich RMSNorm + Sigmoid Gates** (`97` norms + `11` gates) | `109.57 ms` | **`6.85 ms/tok`** | `4.0%` |
+| **CPU ShortConv State Engine** (`13` layers, 7-tap depthwise ring) | `35.29 ms` | **`2.21 ms/tok`** | `1.3%` |
+| **CPU Global Attention** (`6` layers, Zero-Tail Partial RoPE) | `19.55 ms` | **`1.22 ms/tok`** | `0.7%` |
+| **CPU SWA Attention** (`5` layers, `W=256` ring) | `12.81 ms` | **`0.80 ms/tok`** | `0.5%` |
+| **D2D Cross-Die Transfer** (Layer 11 $\to$ Layer 12 handoff) | `0.01 ms` | **`0.00 ms/tok`** | `0.0%` |
+| **TOTAL (`5.86 tokens/sec` sustained FP16, gate `>= 1.80 tok/s`)** | **`2,729.80 ms`** | **`170.61 ms/tok`** | **`100.0%`** |
+
+### 38.3 Fixing the Long-Context CPU Attention Bottleneck: NUMA First-Touch + 64-Bit 2-Lane SWAR (`--bench-attn`)
+
+- **Four Bottlenecks Identified via Disassembly on `roma` (`rv64imafdch_zba_zbb`, 8 SiFive P550 Cores @ `1.80 GHz`)**:
+  1. **Un-register-blocked `P * V` loop**: Outer loop over `s` with inner loop over `d = 0..127` across 4 heads (`512` floats > `32` FP registers) caused GCC to emit `5` `flw` loads and `4` `fsw` stores per `4` `fmadd.s` instructions.
+  2. **L1D/L2 Cache Set Aliasing on `32,768`-Float Score Stride**: Spacing `sc0..sc3` by `128 KiB` mapped all 4 query heads in a KV group to the identical set in the 32 KiB 4-way L1D (`8 KiB`/way) and 256 KiB 8-way L2 (`32 KiB`/way).
+  3. **Cross-Die Chiplink Traffic from Single-Thread First-Touch**: Allocating the KV cache on Thread 0 placed all physical pages on Die 0's DDR5 controller (`NUMA node 0`), forcing Cores `4..7` on Die 1 (`NUMA node 1`) to fetch KV lines across Chiplink.
+  4. **FP32 KV Cache Bandwidth Ceiling (`805 MB/tok` at `32K` across 6 layers)** and scalar FPU 4-cycle latency on non-RVV P550 cores.
+- **Three-Part Hardware Fix (`run_gqa_attention_int8_swar`)**:
+  1. **Head-Major Layout + Single-OpenMP-Region Online Softmax (FlashDecoding)**: Eliminates the global score buffer (`m_scores_ws`), keeping `o_loc[4][128]` (`2 KiB`) and `sc_tile[32][4]` (`512 B`) 100% L1D-resident with only **1 OpenMP barrier per layer**.
+  2. **`sched_setaffinity` + Parallel NUMA First-Touch**: Pins OpenMP threads `0..3` to Die 0 (`CPU 0..3`) and threads `4..7` to Die 1 (`CPU 4..7`) so `kv_h = 0, 1` reside in Die 0 DDR5 and `kv_h = 2, 3` reside in Die 1 DDR5, doubling CPU memory bandwidth.
+  3. **Per-Token Symmetric INT8 KV Cache + 64-Bit 2-Lane SWAR (`uint64_t`)**: Biases quantized 8-bit `Q`, `K`, `V` to unsigned `uint8_t` ($u = q + 128 \in [1, 255]$) and packs two query heads (`qu0 | (uint64_t(qu1) << 32)`) into a single 64-bit integer register. Because $128 \times 255 \times 255 = 8.32 \times 10^6 \ll 2^{32}$, the low and high 32-bit lanes never overflow into each other across a 128-dim dot product or 32-token tile, computing **2 query heads per scalar 64-bit `mul`+`add`** while cutting KV DRAM traffic by **`4×`**.
+- **Measured `--bench-attn` Results on `roma` (6 Global Attention Layers / Token)**:
+
+| Context Length (6 Global Layers / Token) | Token-Major FP32 (`v1`) | Head-Major FP32 (`v2`) | **NUMA-Pinned INT8 64-Bit SWAR (`v3`)** | Speedup (`v1` $\to$ `v3`) | `PLAN.md` §1.1 Target (`2×` Gate) | Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`512` tokens** | `18.87 ms/tok` | `2.78 ms/tok` | **`1.11 ms/tok`** (`0.19 ms/layer`) | **`17.00×`** | `~1.0 ms` (`<= 2.0 ms`) | **PASS** |
+| **`4,096` tokens** | `65.00 ms/tok` | `21.04 ms/tok` | **`6.07 ms/tok`** (`1.01 ms/layer`) | **`10.71×`** | `~8.0 ms` (`<= 16.0 ms`) | **PASS** |
+| **`32,768` tokens** | `544.52 ms/tok` | `159.94 ms/tok` | **`60.57 ms/tok`** (`10.10 ms/layer`) | **`8.99×`** | `~65.0 ms` (`<= 130.0 ms`) | **PASS** |
+| **Numerical Parity vs. FP32 (`4096` ctx)** | `1.00000000` | `1.00000000` | **`Cosine = 0.99999210`** | — | `>= 0.9995` | **PASS** |
+
+
 
 

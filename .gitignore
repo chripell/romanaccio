@@ -23,6 +23,7 @@ bin/
 /src/smollm_v2/smollm_v2
 /src/qwen2_fix/es_qwen2
 /src/qwen2_v2/qwen2_v2
+/src/LFM3/lfm3_v2
 
 # Python artifacts and caches
 __pycache__/
