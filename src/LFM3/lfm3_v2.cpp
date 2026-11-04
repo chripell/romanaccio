@@ -276,6 +276,32 @@ static constexpr Lfm3LayerType kLayerSchedule[24] = {
     Lfm3LayerType::Conv              // L23 (Die 1)
 };
 
+/**
+ * @brief Byte count to hand the driver for one tensor surface.
+ *
+ * The descriptor describes the DMA buffer that was allocated, not the loadable's memory entry:
+ * `ModelInfo` reports an entry size far larger than the tensor (the INT8 `conv_in` output entry
+ * is 2 MiB for a 6 KiB tensor), and submitting that full 2 MiB wedges the die worker. Passing a
+ * descriptor *larger* than the tensor is proven harmless (FINDINGS §33.1, measured on the
+ * over-sized activation buffer), so the value is the larger of the tensor bytes and the reported
+ * entry, capped to the allocation.
+ *
+ * The reverse case is not harmless: a descriptor smaller than the tensor truncates what the NPU
+ * reads or writes and the result still looks plausible. That is a hard error, not a clamp.
+ */
+static size_t surface_descriptor(const DmaBuffer *buf, size_t reported, size_t raw,
+                                 const char *what, bool &failed) {
+    if (!buf) return raw;
+    if (raw > buf->size()) {
+        std::printf("FAIL: %s tensor needs %zu bytes but its DMA buffer holds only %zu "
+                    "(reported entry %zu) -- refusing to truncate the surface\n",
+                    what, raw, buf->size(), reported);
+        failed = true;
+        return raw;
+    }
+    return std::max(raw, std::min(reported, buf->size()));
+}
+
 struct StageTimers {
     double npu_layer_ms  = 0.0;
     double npu_lmhead_ms = 0.0;
@@ -286,10 +312,70 @@ struct StageTimers {
     double d2d_xfer_ms   = 0.0;
     int    tokens_run    = 0;
 
+    /**
+     * @brief Per-archetype submit accounting, to separate NPU streaming speed from our overhead.
+     *
+     * master_ms brackets WorkerPool::submit_task plus the post-submit cache flush, exactly as
+     * npu_layer_ms does, so the two stay comparable. driver_ms is the elapsed_ns the worker
+     * measured around the driver call itself. The difference is IPC + queue + cache maintenance --
+     * the only way to tell "the engine wastes time per submit" from "the NPU streams distinct
+     * weights slower than it streams one reused region".
+     */
+    struct ArchStat {
+        const char *name = "";
+        long   submits      = 0;
+        double master_ms    = 0.0;
+        double driver_ms    = 0.0;
+        double weight_bytes = 0.0;
+    };
+    enum ArchIdx { ARCH_CONV_IN = 0, ARCH_PROJ2048, ARCH_ATTN_QKV, ARCH_MLP, ARCH_LM_HEAD,
+                   ARCH_COUNT };
+    ArchStat arch[ARCH_COUNT] = {
+        {"conv_in  2048->6144"}, {"proj2048 2048->2048"}, {"attn_qkv 2048->3072"},
+        {"mlp  SwiGLU 7680"},     {"lm_head  2048->16K"},
+    };
+
+    void add_arch(int idx, double master_ms, double driver_ms, double weight_bytes) {
+        ArchStat &a = arch[idx];
+        ++a.submits;
+        a.master_ms += master_ms;
+        a.driver_ms += driver_ms;
+        a.weight_bytes += weight_bytes;
+    }
+
     void reset() { *this = StageTimers{}; }
 
     double total_ms() const {
         return npu_layer_ms + npu_lmhead_ms + cpu_conv_ms + cpu_swa_ms + cpu_glob_ms + cpu_norm_ms + d2d_xfer_ms;
+    }
+
+    void print_arch_report() const {
+        const int n = std::max(tokens_run, 1);
+        std::printf("  +--------------------------------------------------------------------------------------------+\n");
+        std::printf("  | Per-submit NPU streaming (master = submit+flush as measured above; driver = worker-side)    |\n");
+        std::printf("  +------------------------+-------+-----------+-----------+----------+-----------+-----------+\n");
+        std::printf("  | Archetype              | Submits| master ms | driver ms | our ms   | GB/s drv  | GB/s mst  |\n");
+        std::printf("  +------------------------+-------+-----------+-----------+----------+-----------+-----------+\n");
+        double w_tot = 0.0, m_tot = 0.0, d_tot = 0.0;
+        long subs = 0;
+        for (const ArchStat &a : arch) {
+            if (!a.submits) continue;
+            const double gb = a.weight_bytes / 1e9;              // total for the whole run
+            const double per_tok_m = a.master_ms / n, per_tok_d = a.driver_ms / n;
+            // Bytes and seconds must cover the same span: rate = total bytes / total seconds.
+            std::printf("  | %-22s | %5ld | %9.2f | %9.2f | %8.2f | %9.2f | %9.2f |\n",
+                        a.name, a.submits, per_tok_m, per_tok_d, per_tok_m - per_tok_d,
+                        a.driver_ms > 0 ? gb * 1000.0 / a.driver_ms : 0.0,
+                        a.master_ms > 0 ? gb * 1000.0 / a.master_ms : 0.0);
+            w_tot += gb; m_tot += a.master_ms; d_tot += a.driver_ms; subs += a.submits;
+        }
+        std::printf("  +------------------------+-------+-----------+-----------+----------+-----------+-----------+\n");
+        std::printf("  | TOTAL %4d tokens         | %5ld | %9.2f | %9.2f | %8.2f | %9.2f | %9.2f |\n",
+                    n, subs, m_tot / n, d_tot / n, (m_tot - d_tot) / n,
+                    d_tot > 0 ? w_tot * 1000.0 / d_tot : 0.0,
+                    m_tot > 0 ? w_tot * 1000.0 / m_tot : 0.0);
+        std::printf("  | GB/s uses this run's weight bytes/token; with --weights-layer0 they are re-read, not distinct |\n");
+        std::printf("  +--------------------------------------------------------------------------------------------+\n");
     }
 
     void print_report(const char *phase_label) const {
@@ -373,6 +459,7 @@ struct LoadedArchetype {
     uint32_t id = 0;
     size_t   in_surface_bytes  = 0;
     size_t   out_surface_bytes = 0;
+    size_t   weight_bytes      = 0;   // loadable file size; the streamed bytes for a static head
 };
 
 struct DieModels {
@@ -881,25 +968,10 @@ public:
             }
             m_w_blob[d]->flush_cache();
 
-            // Allocate T=1, T=64, and LM head activation/output DMA buffers
-            m_act_t1[d]  = std::make_unique<DmaBuffer>(4096,   CacheMode::Cached, zone);
-            m_out_t1[d]  = std::make_unique<DmaBuffer>(32768,  CacheMode::Cached, zone);
-            m_act_t64[d] = std::make_unique<DmaBuffer>(262144, CacheMode::Cached, zone);
-            m_out_t64[d] = std::make_unique<DmaBuffer>(786432, CacheMode::Cached, zone);
-            for (int s = 0; s < 4; ++s) {
-                m_lm_out[d][s] = std::make_unique<DmaBuffer>(32768, CacheMode::Cached, zone);
-            }
-
-            // Prepare all buffers ONCE in the worker's SMMU
-            for (DmaBuffer *b : {m_w_blob[d].get(), m_act_t1[d].get(), m_out_t1[d].get(),
-                                 m_act_t64[d].get(), m_out_t64[d].get(),
-                                 m_lm_out[d][0].get(), m_lm_out[d][1].get(),
-                                 m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
-                if (!m_pool.prepare_buffer(phys_die, *b)) {
-                    std::printf("FAIL: prepare_buffer on Die %u\n", phys_die);
-                    return false;
-                }
-            }
+            // Buffers are allocated *after* the archetypes are loaded (see below), because their
+            // size has to cover the largest surface the driver reports for those loadables.
+            // Preparing them before that would force a descriptor to be clamped to an allocation
+            // that may be smaller than the tensor surface -- see surf_or() in forward_chunk().
 
             // Load the 8 shared Class B archetypes + 4 LM Head 16K slices = 12 models/die
             auto load_m = [&](const std::string &rel, LoadedArchetype &out_arch) -> bool {
@@ -912,6 +984,11 @@ public:
                 out_arch.id = info.model_id;
                 out_arch.in_surface_bytes  = info.input_sizes[0];
                 out_arch.out_surface_bytes = info.output_sizes[0];
+                // For a static loadable (the LM head slices) the weights stream from the driver's
+                // own copy, so the file size is the right byte count; a Class B archetype reports
+                // the bound region size instead, which the submit sites already know.
+                std::ifstream szf(full, std::ios::ate | std::ios::binary);
+                if (szf) out_arch.weight_bytes = static_cast<size_t>(szf.tellg());
                 m_die_models[d].resident_count++;
                 return true;
             };
@@ -933,11 +1010,87 @@ public:
                 if (!load_m(buf, m_die_models[d].lm_head[s])) return false;
             }
 
-            std::printf("[+] Die %u Resident Model Count: %d / 55 gate (50 below 62 kernel Oops ceiling) [PASS]\n",
-                        d, m_die_models[d].resident_count);
             if (m_die_models[d].resident_count >= 55) {
-                std::printf("FAIL: resident model count %d >= 55 ceiling!\n", m_die_models[d].resident_count);
+                std::printf("FAIL: Die %u resident model count %d >= 55 (ceiling 62 Oopses the "
+                            "kernel, FINDINGS 33.4)\n", d, m_die_models[d].resident_count);
                 return false;
+            }
+            std::printf("[+] Die %u Resident Model Count: %d (gate < 55; kernel Oops ceiling 62) [PASS]\n",
+                        d, m_die_models[d].resident_count);
+
+            // Fixed surface buffers, deliberately below the memory-entry sizes the driver reports
+            // (2 MiB for the INT8 conv_in output): surface_descriptor() caps the descriptor at the
+            // allocation, and submitting the full reported entry wedges the die worker. The
+            // invariant that matters is the other direction -- a buffer smaller than a tensor's own
+            // byte count is now a hard error instead of a silent truncation.
+            DieModels &dm = m_die_models[d];
+            size_t max_entry = 0;
+            for (const LoadedArchetype *a : {&dm.conv_in_t1, &dm.proj2048_t1, &dm.attn_qkv_t1,
+                                             &dm.mlp_t1, &dm.conv_in_t64, &dm.proj2048_t64,
+                                             &dm.attn_qkv_t64, &dm.mlp_t64, &dm.lm_head[0],
+                                             &dm.lm_head[1], &dm.lm_head[2], &dm.lm_head[3]})
+                max_entry = std::max({max_entry, a->in_surface_bytes, a->out_surface_bytes});
+
+            size_t s_act1 = 4096, s_out1 = 32768, s_act64 = 262144, s_out64 = 786432;
+            size_t s_lmout = 32768;
+            // Buffers must be at least as large as the memory entry the loadable declares, or the
+            // NPU writes past the allocation and corrupts neighbouring MMZ. Measured on roma: with
+            // the old fixed 32 KiB buffers the same binary and prompt produced logits cosine
+            // 0.7934 then 0.8678 (and min-layer 0.7462 / 0.7258) -- nondeterminism no
+            // deterministic feed-forward network can produce. With entry-sized buffers two runs
+            // returned 0.88736760 and 0.72907964 bit-identically.
+            const bool clamped_ab = std::getenv("LFM3_CLAMPED_SURFACES") != nullptr;
+            const bool m_wide_surfaces = !clamped_ab;
+            if (m_wide_surfaces) {
+                // Size every buffer to the largest entry its role reports rather than clamping
+                // the descriptor down to a convenient constant.
+                for (const LoadedArchetype *a : {&dm.conv_in_t1, &dm.proj2048_t1, &dm.attn_qkv_t1,
+                                                 &dm.mlp_t1, &dm.lm_head[0], &dm.lm_head[1],
+                                                 &dm.lm_head[2], &dm.lm_head[3]})
+                    s_act1 = std::max(s_act1, a->in_surface_bytes);
+                for (const LoadedArchetype *a : {&dm.conv_in_t1, &dm.proj2048_t1, &dm.attn_qkv_t1,
+                                                 &dm.mlp_t1})
+                    s_out1 = std::max(s_out1, a->out_surface_bytes);
+                for (const LoadedArchetype *a : {&dm.conv_in_t64, &dm.proj2048_t64,
+                                                 &dm.attn_qkv_t64, &dm.mlp_t64}) {
+                    s_act64 = std::max(s_act64, a->in_surface_bytes);
+                    s_out64 = std::max(s_out64, a->out_surface_bytes);
+                }
+                for (const LoadedArchetype *a : {&dm.lm_head[0], &dm.lm_head[1], &dm.lm_head[2],
+                                                 &dm.lm_head[3]})
+                    s_lmout = std::max(s_lmout, a->out_surface_bytes);
+            }
+
+            m_act_t1[d]  = std::make_unique<DmaBuffer>(s_act1,  CacheMode::Cached, zone);
+            m_out_t1[d]  = std::make_unique<DmaBuffer>(s_out1,  CacheMode::Cached, zone);
+            m_act_t64[d] = std::make_unique<DmaBuffer>(s_act64, CacheMode::Cached, zone);
+            m_out_t64[d] = std::make_unique<DmaBuffer>(s_out64, CacheMode::Cached, zone);
+            for (int s = 0; s < 4; ++s)
+                m_lm_out[d][s] = std::make_unique<DmaBuffer>(s_lmout, CacheMode::Cached, zone);
+            for (const DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+                                       m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
+                                       m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
+                if (!b->is_valid()) {
+                    std::printf("FAIL: DmaBuffer alloc on Die %u (%zu B)\n", d, b->size());
+                    return false;
+                }
+            }
+            std::printf("[+] Die %u surface buffers: act_t1=%zu out_t1=%zu act_t64=%zu "
+                        "out_t64=%zu lm_out=%zu B (largest entry %.2f MiB, surfaces %s)\n",
+                        d, s_act1, s_out1, s_act64, s_out64, s_lmout, max_entry / 1048576.0,
+                        m_wide_surfaces ? "FROM ENTRY (wide)" : "FIXED (clamp)");
+
+            // Prepare all buffers ONCE in the worker's SMMU. The weight blob must be in this list:
+            // submitting against an unprepared weight fd wedges the die worker (FINDINGS 33.4 /
+            // 34.3), which is what happens if it is prepared separately and this list is edited.
+            for (DmaBuffer *b : {m_w_blob[d].get(),
+                                 m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+                                 m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
+                                 m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
+                if (!m_pool.prepare_buffer(phys_die, *b)) {
+                    std::printf("FAIL: prepare_buffer on Die %u\n", phys_die);
+                    return false;
+                }
             }
         }
 
@@ -981,6 +1134,7 @@ public:
         timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
         int conv_idx = 0, swa_idx = 0, glob_idx = 0;
+        bool surface_overflow = false;
 
         for (int l = 0; l < kNumLayers; ++l) {
             uint16_t logical_die = (l < 12) ? 0 : 1;
@@ -992,6 +1146,26 @@ public:
             DmaBuffer *out_buf = (T == 1) ? m_out_t1[logical_die].get() : m_out_t64[logical_die].get();
             DmaBuffer *w_buf   = m_w_blob[logical_die].get();
 
+            // First region per archetype on this die, for --weights-layer0.
+            struct AbRegion { size_t off = 0, sz = 0; };
+            AbRegion ab[4] = {};
+            if (m_ab_shared_weights) {
+                for (int j = (logical_die == 0) ? 0 : 12; j < (logical_die == 0 ? 12 : 24); ++j) {
+                    const LayerNpuOffsets &o = m_layer_npu[j];
+                    const bool is_conv = (kLayerSchedule[j] == Lfm3LayerType::Conv);
+                    if (!ab[0].sz && is_conv && o.op_in_size) ab[0] = {o.op_in_offset, o.op_in_size};
+                    if (!ab[1].sz && o.op_out_size)          ab[1] = {o.op_out_offset, o.op_out_size};
+                    if (!ab[2].sz && !is_conv && o.op_in_size) ab[2] = {o.op_in_offset, o.op_in_size};
+                    if (!ab[3].sz && o.mlp_size)             ab[3] = {o.mlp_offset, o.mlp_size};
+                }
+            }
+            const double weight_gb_total =
+                (double)(ab[0].sz + ab[1].sz + ab[2].sz + ab[3].sz);
+            if (m_ab_shared_weights && l == 0)
+                std::printf("[+] --weights-layer0 ACTIVE: every layer reuses one region per "
+                            "archetype (%.3f GB distinct weights/die instead of the full blob)\n",
+                            weight_gb_total / 1e9);
+
             // Record cross-die handoff at Layer 12 boundary
             if (l == 12) {
                 auto td0 = std::chrono::steady_clock::now();
@@ -1000,10 +1174,38 @@ public:
                 timers.d2d_xfer_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
             }
 
-            auto surf_or = [](const DmaBuffer *buf, size_t reported, int T_cur, int C_cur, BoundaryDtype dt) -> size_t {
-                size_t raw  = static_cast<size_t>(T_cur) * C_cur * dtype_elem_size(dt);
-                size_t want = (reported >= raw) ? reported : raw;
-                return (buf && want > buf->size()) ? buf->size() : want;
+            auto surf_or = [&](const DmaBuffer *buf, size_t reported, int T_cur, int C_cur,
+                               BoundaryDtype dt, const char *what) -> size_t {
+                const size_t raw = static_cast<size_t>(T_cur) * C_cur * dtype_elem_size(dt);
+                return surface_descriptor(buf, reported, raw, what, surface_overflow);
+            };
+            if (surface_overflow) return false;
+
+            // Bytes of the weight region to bind: with --weights-layer0 every layer of a die
+            // reuses that die's first region per archetype, so the streamed working set collapses
+            // from ~1.4 GiB to ~141 MB while bytes-per-submit stay identical. A/B against a normal
+            // run separates weight locality (SMMU/TLB and DRAM pages across a 1.4 GiB blob) from
+            // per-submit engine overhead. Numerically meaningless by design -- timing only.
+            auto wsel = [&](int slot, size_t off, size_t sz) -> std::pair<size_t, size_t> {
+                if (!m_ab_shared_weights || ab[slot].sz == 0) return {off, sz};
+                return {ab[slot].off, ab[slot].sz};
+            };
+
+            auto submit_arch = [&](int arch_idx, uint32_t model_id,
+                                   const std::vector<DmaBufferSlice> &ins,
+                                   const std::vector<DmaBufferSlice> &outs,
+                                   DmaBuffer *flush_after, double weight_bytes,
+                                   double &stage_ms) -> bool {
+                const auto s0 = std::chrono::steady_clock::now();
+                uint64_t driver_ns = 0;
+                const bool ok = m_pool.submit_task(phys_die, model_id, ins, outs, &driver_ns);
+                if (ok && flush_after) flush_after->flush_cache();
+                const auto s1 = std::chrono::steady_clock::now();
+                const double master_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
+                stage_ms += master_ms;
+                timers.add_arch(arch_idx, master_ms, static_cast<double>(driver_ns) / 1e6,
+                                weight_bytes);
+                return ok;
             };
             float op_in_ratios[64], op_out_ratios[64];
 
@@ -1019,20 +1221,20 @@ public:
                 // --- Primitive 2: Gated ShortConv Layer ---
                 const LoadedArchetype &m_in  = (T == 1) ? dm.conv_in_t1  : dm.conv_in_t64;
                 const LoadedArchetype &m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
-                size_t in_bytes  = surf_or(act_buf, m_in.in_surface_bytes,   T, 2048, no.op_in_scale.in_dtype);
-                size_t mid_bytes = surf_or(out_buf, m_in.out_surface_bytes,  T, 6144, no.op_in_scale.out_dtype);
-                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype);
-                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype);
+                size_t in_bytes  = surf_or(act_buf, m_in.in_surface_bytes,   T, 2048, no.op_in_scale.in_dtype,  "conv_in act");
+                size_t mid_bytes = surf_or(out_buf, m_in.out_surface_bytes,  T, 6144, no.op_in_scale.out_dtype, "conv_in mid");
+                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype,  "conv_out act");
+                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype, "conv_out out");
+                if (surface_overflow) return false;
 
-                auto tnpu0 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_in.id,
-                        {DmaBufferSlice{act_buf, 0, in_bytes}, DmaBufferSlice{w_buf, no.op_in_offset, no.op_in_size}},
-                        {DmaBufferSlice{out_buf, 0, mid_bytes}})) {
+                const auto conv_in_w = wsel(0, no.op_in_offset, no.op_in_size);
+                if (!submit_arch(StageTimers::ARCH_CONV_IN, m_in.id,
+                        {DmaBufferSlice{act_buf, 0, in_bytes},
+                         DmaBufferSlice{w_buf, conv_in_w.first, conv_in_w.second}},
+                        {DmaBufferSlice{out_buf, 0, mid_bytes}}, out_buf,
+                        static_cast<double>(conv_in_w.second), timers.npu_layer_ms)) {
                     return false;
                 }
-                out_buf->flush_cache();
-                auto tnpu1 = std::chrono::steady_clock::now();
-                timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tnpu1 - tnpu0).count();
 
                 // CPU 7-tap depthwise ShortConv state update
                 auto tconv0 = std::chrono::steady_clock::now();
@@ -1063,15 +1265,14 @@ public:
                 auto tconv1 = std::chrono::steady_clock::now();
                 timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tconv1 - tconv0).count();
 
-                auto tnpu2 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_out.id,
-                        {DmaBufferSlice{act_buf, 0, oin_bytes}, DmaBufferSlice{w_buf, no.op_out_offset, no.op_out_size}},
-                        {DmaBufferSlice{out_buf, 0, out_bytes}})) {
+                const auto proj_w = wsel(1, no.op_out_offset, no.op_out_size);
+                if (!submit_arch(StageTimers::ARCH_PROJ2048, m_out.id,
+                        {DmaBufferSlice{act_buf, 0, oin_bytes},
+                         DmaBufferSlice{w_buf, proj_w.first, proj_w.second}},
+                        {DmaBufferSlice{out_buf, 0, out_bytes}}, out_buf,
+                        static_cast<double>(proj_w.second), timers.npu_layer_ms)) {
                     return false;
                 }
-                out_buf->flush_cache();
-                auto tnpu3 = std::chrono::steady_clock::now();
-                timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tnpu3 - tnpu2).count();
 
                 auto tn2 = std::chrono::steady_clock::now();
                 unpack_npu_output(out_buf, op_out.data(), T, kHidden, no.op_out_scale, op_out_ratios);
@@ -1083,20 +1284,20 @@ public:
                 bool is_swa = (kLayerSchedule[l] == Lfm3LayerType::SlidingAttention);
                 const LoadedArchetype &m_qkv = (T == 1) ? dm.attn_qkv_t1 : dm.attn_qkv_t64;
                 const LoadedArchetype &m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
-                size_t in_bytes  = surf_or(act_buf, m_qkv.in_surface_bytes,  T, 2048, no.op_in_scale.in_dtype);
-                size_t qkv_bytes = surf_or(out_buf, m_qkv.out_surface_bytes, T, 3072, no.op_in_scale.out_dtype);
-                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype);
-                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype);
+                size_t in_bytes  = surf_or(act_buf, m_qkv.in_surface_bytes,  T, 2048, no.op_in_scale.in_dtype,  "attn_qkv act");
+                size_t qkv_bytes = surf_or(out_buf, m_qkv.out_surface_bytes, T, 3072, no.op_in_scale.out_dtype, "attn_qkv out");
+                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype,  "attn_out act");
+                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype, "attn_out out");
+                if (surface_overflow) return false;
 
-                auto tnpu0 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_qkv.id,
-                        {DmaBufferSlice{act_buf, 0, in_bytes}, DmaBufferSlice{w_buf, no.op_in_offset, no.op_in_size}},
-                        {DmaBufferSlice{out_buf, 0, qkv_bytes}})) {
+                const auto qkv_w = wsel(2, no.op_in_offset, no.op_in_size);
+                if (!submit_arch(StageTimers::ARCH_ATTN_QKV, m_qkv.id,
+                        {DmaBufferSlice{act_buf, 0, in_bytes},
+                         DmaBufferSlice{w_buf, qkv_w.first, qkv_w.second}},
+                        {DmaBufferSlice{out_buf, 0, qkv_bytes}}, out_buf,
+                        static_cast<double>(qkv_w.second), timers.npu_layer_ms)) {
                     return false;
                 }
-                out_buf->flush_cache();
-                auto tnpu1 = std::chrono::steady_clock::now();
-                timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tnpu1 - tnpu0).count();
 
                 // Compute 16-head sigmoid gate g_h = sigmoid(W_gate * u_t)
                 auto tg0 = std::chrono::steady_clock::now();
@@ -1211,15 +1412,14 @@ public:
                 if (is_swa) timers.cpu_swa_ms += attn_dt;
                 else        timers.cpu_glob_ms += attn_dt;
 
-                auto tnpu2 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_out.id,
-                        {DmaBufferSlice{act_buf, 0, oin_bytes}, DmaBufferSlice{w_buf, no.op_out_offset, no.op_out_size}},
-                        {DmaBufferSlice{out_buf, 0, out_bytes}})) {
+                const auto proj_w = wsel(1, no.op_out_offset, no.op_out_size);
+                if (!submit_arch(StageTimers::ARCH_PROJ2048, m_out.id,
+                        {DmaBufferSlice{act_buf, 0, oin_bytes},
+                         DmaBufferSlice{w_buf, proj_w.first, proj_w.second}},
+                        {DmaBufferSlice{out_buf, 0, out_bytes}}, out_buf,
+                        static_cast<double>(proj_w.second), timers.npu_layer_ms)) {
                     return false;
                 }
-                out_buf->flush_cache();
-                auto tnpu3 = std::chrono::steady_clock::now();
-                timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tnpu3 - tnpu2).count();
 
                 auto tattn2 = std::chrono::steady_clock::now();
                 unpack_npu_output(out_buf, op_out.data(), T, kHidden, no.op_out_scale, op_out_ratios);
@@ -1240,17 +1440,17 @@ public:
 
             // 3. SwiGLU MLP on NPU
             const LoadedArchetype &m_mlp = (T == 1) ? dm.mlp_t1 : dm.mlp_t64;
-            size_t mlp_in_bytes  = surf_or(act_buf, m_mlp.in_surface_bytes,  T, 2048, no.mlp_scale.in_dtype);
-            size_t mlp_out_bytes = surf_or(out_buf, m_mlp.out_surface_bytes, T, 2048, no.mlp_scale.out_dtype);
-            auto tmlp0 = std::chrono::steady_clock::now();
-            if (!m_pool.submit_task(phys_die, m_mlp.id,
-                    {DmaBufferSlice{act_buf, 0, mlp_in_bytes}, DmaBufferSlice{w_buf, no.mlp_offset, no.mlp_size}},
-                    {DmaBufferSlice{out_buf, 0, mlp_out_bytes}})) {
+            size_t mlp_in_bytes  = surf_or(act_buf, m_mlp.in_surface_bytes,  T, 2048, no.mlp_scale.in_dtype,  "mlp act");
+            size_t mlp_out_bytes = surf_or(out_buf, m_mlp.out_surface_bytes, T, 2048, no.mlp_scale.out_dtype, "mlp out");
+            if (surface_overflow) return false;
+            const auto mlp_w = wsel(3, no.mlp_offset, no.mlp_size);
+            if (!submit_arch(StageTimers::ARCH_MLP, m_mlp.id,
+                    {DmaBufferSlice{act_buf, 0, mlp_in_bytes},
+                     DmaBufferSlice{w_buf, mlp_w.first, mlp_w.second}},
+                    {DmaBufferSlice{out_buf, 0, mlp_out_bytes}}, out_buf,
+                    static_cast<double>(mlp_w.second), timers.npu_layer_ms)) {
                 return false;
             }
-            out_buf->flush_cache();
-            auto tmlp1 = std::chrono::steady_clock::now();
-            timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tmlp1 - tmlp0).count();
 
             // 4. Sandwich post_ffn_norm + Residual
             auto tn6 = std::chrono::steady_clock::now();
@@ -1295,6 +1495,10 @@ public:
         // Primitive 4: Concurrent Dual-Die LM Head Execution (4 x 16K slices on Die 0 || 4 x 16K slices on Die 1)
         auto tlm0 = std::chrono::steady_clock::now();
         bool ok_d0 = true, ok_d1 = true;
+        // The two die threads must not touch `timers` concurrently; accumulate per die and merge.
+        double lm_master[2] = {0.0, 0.0}, lm_driver[2] = {0.0, 0.0};
+        double lm_bytes[2]  = {0.0, 0.0};
+        long   lm_submits[2] = {0, 0};
 
         auto run_die_lm_head = [&](uint16_t logical_die, bool &ok_flag) {
             uint16_t phys_die = (logical_die < m_num_dies) ? logical_die : 0;
@@ -1305,15 +1509,30 @@ public:
                 DmaBuffer *out_b = m_lm_out[logical_die][s].get();
                 size_t in_raw   = static_cast<size_t>(kHidden) * dtype_elem_size(lm_sc.in_dtype);
                 size_t out_raw  = static_cast<size_t>(16000)   * dtype_elem_size(lm_sc.out_dtype);
-                size_t in_surf  = std::min(in_b->size(),  std::max(lm_arch.in_surface_bytes,  in_raw));
-                size_t out_surf = std::min(out_b->size(), std::max(lm_arch.out_surface_bytes, out_raw));
-                if (!m_pool.submit_task(phys_die, lm_arch.id,
-                        {DmaBufferSlice{in_b, 0, in_surf}},
-                        {DmaBufferSlice{out_b, 0, out_surf}})) {
+                bool lm_fit = false;
+                const size_t in_surf  = surface_descriptor(in_b,  lm_arch.in_surface_bytes,
+                                                           in_raw,  "lm_head act",  lm_fit);
+                const size_t out_surf = surface_descriptor(out_b, lm_arch.out_surface_bytes,
+                                                           out_raw, "lm_head logits", lm_fit);
+                if (lm_fit) {
                     ok_flag = false;
                     return;
                 }
-                out_b->flush_cache();
+                const auto s0 = std::chrono::steady_clock::now();
+                uint64_t driver_ns = 0;
+                const bool ok = m_pool.submit_task(phys_die, lm_arch.id,
+                        {DmaBufferSlice{in_b, 0, in_surf}},
+                        {DmaBufferSlice{out_b, 0, out_surf}}, &driver_ns);
+                if (ok) out_b->flush_cache();
+                const auto s1 = std::chrono::steady_clock::now();
+                lm_master[logical_die] += std::chrono::duration<double, std::milli>(s1 - s0).count();
+                lm_driver[logical_die] += static_cast<double>(driver_ns) / 1e6;
+                lm_bytes[logical_die]  += static_cast<double>(lm_arch.weight_bytes);
+                ++lm_submits[logical_die];
+                if (!ok) {
+                    ok_flag = false;
+                    return;
+                }
                 float *dst_fp32 = m_logits.data() + (static_cast<size_t>(logical_die) * 64000 + s * 16000);
                 unpack_npu_output(out_b, dst_fp32, 1, 16000, lm_sc, lm_tok_ratio);
             }
@@ -1330,6 +1549,9 @@ public:
         }
         auto tlm1 = std::chrono::steady_clock::now();
         timers.npu_lmhead_ms += std::chrono::duration<double, std::milli>(tlm1 - tlm0).count();
+        for (int d = 0; d < 2; ++d)
+            if (lm_submits[d])
+                timers.add_arch(StageTimers::ARCH_LM_HEAD, lm_master[d], lm_driver[d], lm_bytes[d]);
 
         return ok_d0 && ok_d1;
     }
@@ -1365,6 +1587,10 @@ public:
         m_force_int8 = force_int8;
         m_use_shared_archetype_scales = use_shared_archetype_scales;
     }
+
+    /// Binds every layer of a die to one weight region per archetype. Timing experiment only:
+    /// the numbers it prints are for bandwidth attribution, and its generated text is garbage.
+    void set_ab_shared_weights(bool on) { m_ab_shared_weights = on; }
 
     const std::vector<float>& logits() const { return m_logits; }
     float* logits_mut() { return m_logits.data(); }
@@ -2187,6 +2413,7 @@ private:
     uint16_t m_num_dies = 1;
     bool m_force_int8 = false;
     bool m_use_shared_archetype_scales = true;
+    bool m_ab_shared_weights = false;   // --weights-layer0: timing experiment, numerics invalid
 
     WorkerPool m_pool;
     EmbeddingTable m_embedding;
@@ -2277,6 +2504,7 @@ int main(int argc, char **argv) {
     bool bench_attn = false;
     bool force_int8 = false;
     bool use_shared_archetype_scales = true;
+    bool ab_shared_weights = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -2300,9 +2528,13 @@ int main(int argc, char **argv) {
         else if (a == "--bench-attn") bench_attn = true;
         else if (a == "--int8") force_int8 = true;
         else if (a == "--per-subgraph-scales") use_shared_archetype_scales = false;
+        else if (a == "--weights-layer0") ab_shared_weights = true;
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--int8] [--per-subgraph-scales] [--prompt TEXT] [--max-tokens N]\n"
+                        "          [--int8] [--per-subgraph-scales] [--weights-layer0] [--prompt TEXT] [--max-tokens N]\n"
+                        "  --weights-layer0  Timing experiment: bind every layer of a die to one\n"
+                        "                    weight region per archetype to separate NPU streaming\n"
+                        "                    speed from per-submit overhead. Generated text is garbage.\n"
                         "          [--temp F] [--top-k K] [--no-think]\n",
                         argv[0]);
             return 0;
@@ -2311,6 +2543,7 @@ int main(int argc, char **argv) {
 
     Lfm3Engine engine;
     engine.set_quant_options(force_int8, use_shared_archetype_scales);
+    engine.set_ab_shared_weights(ab_shared_weights);
     if (bench_attn && verify_golden_path.empty() && prompt.empty()) {
         engine.benchmark_global_attention_kernel();
         return 0;
@@ -2416,6 +2649,7 @@ int main(int argc, char **argv) {
         std::printf("\n[3/3] Per-Stage Timing Breakdown & Throughput Gate Verification:\n");
         prefill_timers.print_report("Prefill (6 tokens, T=1 path)");
         decode_timers.print_report("Autoregressive Decode (16 tokens)");
+        decode_timers.print_arch_report();
 
         double decode_tok_s = 1000.0 * decode_timers.tokens_run / decode_timers.total_ms();
         bool speed_pass = (decode_tok_s >= 1.80);

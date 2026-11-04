@@ -1739,7 +1739,13 @@ Running the full 24-layer tri-hybrid prefill and decode suite (`src/LFM3/bench_p
   - **512-Token Teacher-Forced Differential Parity (`T=64` vs `512 × T=1` on Silicon)**: **`Cosine = 1.00000000`**, **`Max Abs Diff = 0.00000000`**, **`Final Conv State Max Diff = 0.00000000`** `[PASS]`.
   - **512-Token 24-Layer Tri-Hybrid Prefill (`8 × T=64` chunks)**: **`6,143.24 ms` total (`12.00 ms/tok` = `83.3 prompt tokens/sec`, `NPU = 2,522.81 ms` [`4.93 ms/tok`], `CPU = 3,617.20 ms` [`7.06 ms/tok`])** — beating the Milestone 3.5 FP16 gate (`≤ 35 ms/tok`) by **`2.92×`** and already surpassing the Milestone 5 INT8 target (`≤ 20 ms/tok`).
   - **4096-Token 24-Layer Tri-Hybrid Prefill (`64 × T=64` chunks)**: **NPU execution across all 64 chunks took `20.02 s` (`4.89 ms/tok`, streaming `187.5 GB` at `9.37 GB/s` effective DMA bandwidth — beating the `≤ 30.0 s` NPU weight-streaming gate by 33%)**. Total wall-clock including scalar CPU $O(N^2)$ 6-layer Global Attention (`412.4 GFLOPs` / `206.2B` FMAs over $4096 \times 4096$ on non-RVV SiFive P550 cores) is `108.39 s` (`26.46 ms/tok` = `37.8 tok/s`).
-  - **Immediate Post-Prefill `T=1` Decode (Zero Model Swap)**: **`82.03 ms/tok` (`12.19 tok/s`)** across all 24 layers `[PASS]`, with `dmesg` completely clean.
+  - **Immediate Post-Prefill `T=1` Decode (Zero Model Swap)**: **`82.03 ms/tok` (`12.19 tok/s`)** across all 24 layers.
+    **CORRECTED (2026-11-04, §40): this is not a decode speed and was never a gate.** That loop binds
+    layer 0's weight region to all 24 layers (four fixed offsets), so it measures submit
+    throughput on a 141 MB reused working set. Its `82 ms` equals the engine's *driver-side* time
+    (`80.6 ms/tok`, §40.1); the wall-clock decode for the same INT8 model is `121 ms/tok` (§39.3).
+    `bench_prefill_t64.cpp` now labels it as a submit microbenchmark, runs 16 steps, and gates on
+    ms/submit instead of printing an unconditional `[PASS]`.
 
 ---
 
@@ -1765,7 +1771,7 @@ Running the full 24-layer tri-hybrid prefill and decode suite (`src/LFM3/bench_p
 
 | Decode Stage (24 Layers + 128K Dual-Die LM Head, `16` Tokens) | Total (`16` tok) | Per-Token (`ms/tok`) | Share (`%`) |
 | :--- | :--- | :--- | :--- |
-| **NPU Layer Projections** (`60` submits: `26` Conv, `22` Attn, `24` MLP) | `2,333.61 ms` | **`145.85 ms/tok`** | `85.5%` |
+| **NPU Layer Projections** (`72` submits/token: `13x2` conv + `11x2` attn + `24` MLP. §38.2's original "60" mis-summed its own breakdown.) | `2,333.61 ms` | **`145.85 ms/tok`** | `85.5%` |
 | **NPU Dual-Die Parallel LM Head** (`4 × 16K` Die 0 $\parallel$ `4 × 16K` Die 1) | `218.96 ms` | **`13.69 ms/tok`** | `8.0%` |
 | **CPU Sandwich RMSNorm + Sigmoid Gates** (`97` norms + `11` gates) | `109.57 ms` | **`6.85 ms/tok`** | `4.0%` |
 | **CPU ShortConv State Engine** (`13` layers, 7-tap depthwise ring) | `35.29 ms` | **`2.21 ms/tok`** | `1.3%` |
@@ -1847,3 +1853,71 @@ Deploying the synthesized INT8 package (`weights_die0.bin = 0.878 GiB`, `weights
   1. Bit-exact Python simulation of our hardware NPU pipeline reproduced `roma`'s `Layer 00 block_out cosine = 0.97629060` (`0.97632992` simulated), proving that the NVDLA tiler, `CvtPrecision_QuantM` synthesis, and `kmd-task-op_list` `truncate` patching on `roma` match the mathematical model to 4 decimal places.
   2. The accuracy drop comes from quantizing **`proj2048` (`conv_out` and `attn_out`, which represent only `5.8%` of model weights)** to 8-bit INT8: their inputs ($y = C \odot 	ext{depthwise\_conv}(B \odot x')$ and $\sigma(W_{	ext{gate}} u) \odot 	ext{Attn}$) are multiplicative-gated tensors with extreme single-channel kurtosis. A single outlier channel inflates `x_amax`, causing the linear projection output to span only `[-7, +7]` (`7.37 / 127` at `t=1`, i.e., `2.8` effective bits) immediately before **Sandwich `post_operator_norm` (`RMSNorm`)** divides by the vector's RMS and amplifies the quantization noise across the residual stream.
   3. Because `proj2048` is its own separate Class B archetype (`lfm3_proj2048_{t1,t64}_classb.model`), keeping `proj2048` in FP16 (`+48 MiB/die` = `+0.047 GiB/die`, zero extra resident models) while keeping the other **94.2% of weights (`conv_in`, `attn_qkv`, `mlp` with `shared_mlp_table`, and `lm_head`) in INT8/INT16** raises Layer 00 cosine from `0.97629` to **`0.99876`**, restores **4/4 exact greedy tokens (`[17479, 20, 309, 358]`)**, and preserves the `+1.18%` perplexity gate.
+
+
+---
+
+## 40. LFM3 Review Follow-ups: MMZ Surface Overflow, the Decode-Number Contradiction, and Where Per-Submit Time Actually Goes
+
+**On `roma`, 2026-11-04**, while reviewing Milestones 1-5. Three results, one of them a live bug.
+
+### 40.1 The §37.3 vs §38.2 contradiction resolved: `~0.4 ms` of per-submit overhead, and it is ours
+
+`lfm3_v2` was instrumented to record, for every submit, both the master-side wall time
+(`WorkerPool::submit_task` + post-submit cache flush) and the driver-side `elapsed_ns` the worker
+measures around the driver call. INT8, 16-token decode:
+
+| arch | submits | master ms/tok | driver ms/tok | ours ms/tok | GB/s (driver) |
+|---|---|---|---|---|---|
+| conv_in | 208 | 12.54 | 8.58 | 3.96 | 19.7 |
+| proj2048 | 384 | 22.35 | 11.17 | **11.18** | 9.3 |
+| attn_qkv | 176 | 9.04 | 5.18 | 3.86 | 13.8 |
+| mlp | 384 | 53.17 | 45.62 | 7.55 | 33.6 |
+| lm_head | 32 | 13.23 | 10.00 | 3.23 | 27.9 |
+| **total** | 1184 | **110.33** | **80.56** | **29.77** | 26.8 |
+
+- The engine's **driver-side 80.6 ms/token matches `bench_prefill_t64`'s 82 ms** almost exactly. So
+  the two numbers never disagreed: the bench measured driver time and called it decode.
+- **`27 GB/s` per die, not 14.** The `14.0 GB/s` figure in §24 is a CPU-side read measurement, not
+  the NPU's ceiling. Do not use it to project decode throughput: at 27 GB/s the FP16 3.46 GB/token
+  floors at 128 ms, not 247 ms.
+- **`29.77 ms/token` (27% of decode) is our own overhead** -- IPC, worker marshalling and cache
+  maintenance, roughly `0.41 ms` per submit, and *fixed* rather than proportional to the work:
+  `proj2048` spends half its measured time in it. Removing it is worth ~1.35x on decode.
+
+### 40.2 A real bug: descriptor clamping let the NPU write past its DMA buffer
+
+`lfm3_v2` sized activation/output buffers with fixed constants (32 KiB) while
+`surface_descriptor`-equivalent logic clamped the descriptor to `min(reported_entry, buffer_size)`.
+`ModelInfo` reports a **2 MiB** memory entry for the INT8 `conv_in` output -- a 6 KiB tensor -- so
+every such submit declared 32 KiB against a loadable that writes its declared entry.
+
+Replacing the clamp with a hard failure and sizing buffers to the reported entry, same binary,
+same prompt, two runs each:
+
+| buffers | run 1 logits cosine | run 2 logits cosine | deterministic |
+|---|---|---|---|
+| fixed 32 KiB (old) | 0.7934 | 0.8678 | **no** (min-layer 0.7462 vs 0.7258) |
+| entry-sized (fixed) | 0.88736760 | 0.88736760 | **yes** (min-layer 0.72907964 both) |
+
+A deterministic feed-forward network cannot produce two answers; the variance was the NPU
+overwriting neighbouring MMZ. `LFM3_CLAMPED_SURFACES=1` reproduces the old behaviour for the A/B.
+
+**Cost of correctness:** `DmaBuffer::flush_cache()` takes only an fd, so it flushes the whole
+allocation. Entry-sized buffers raised our per-submit overhead from 29.8 to ~76 ms/token
+(total master 162-172 ms/tok). Next step is a ranged flush, or discovering why `output_sizes[0]`
+reports an entry far larger than the tensor -- if a later index holds the real surface, the 2 MiB
+allocation is over-defensive and the flush cost is avoidable.
+
+**Methodology lesson for every future probe here:** run the same input twice before believing any
+accuracy number. Two of the three headline claims checked this session did not survive it.
+
+### 40.3 Milestone 5 is not reproducible from the deployed package
+
+`sudo ./lfm3_v2 --int8 --per-subgraph-scales --verify-golden golden_ref.bin` on
+`roma:/home/chri/models/LFM3-1.7B_ENNP` gives logits cosine **0.887** against a `>= 0.9990` gate
+and **fails** 4/4 greedy match -- with the unmodified pre-review binary too, so it is not a review
+artifact. §39.3 reports `Layer 00 = 0.99876` and `4/4 exact` for the same command. Either the
+deployed package predates the proj2048-in-FP16 fix, or that fix lives in a flag/package
+combination the repo does not record. Until the passing configuration is captured in
+`manifest.json` and re-measured, treat Milestone 5 as **not accepted**.

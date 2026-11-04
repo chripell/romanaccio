@@ -320,8 +320,16 @@ int main(int argc, char **argv) {
             std::printf("  [+] Loaded lfm3_lm_head_d0_s0.model          -> model_id=%u\n", lm_head_id);
         }
     }
-    std::printf("  [+] Active resident models on Die 0: %d (with 4 LM head slices: 12 / 55 gate, 50 below 62 Oops limit) [PASS]\n\n",
-                resident_models);
+    // Real check on the count this process actually holds, not a restatement of the engine's
+    // budget. The engine loads 12/die; the ceiling that Oopses the kernel is 62 (FINDINGS 33.4).
+    const bool residency_ok = resident_models > 0 && resident_models <= 55;
+    std::printf("  [+] Resident models loaded on Die 0 by this process: %d "
+                "[gate 1..55: %s] (engine loads 12/die; kernel Oops ceiling is 62)\n\n",
+                resident_models, residency_ok ? "PASS" : "FAIL");
+    if (!residency_ok) {
+        std::printf("FAIL: unexpected resident model count %d\n", resident_models);
+        return 1;
+    }
 
     // Allocate shared weight DMA blob holding all 4 archetype weight sets + a second MLP weight set at offset
     // Layout in weight_blob:
@@ -751,25 +759,43 @@ int main(int argc, char **argv) {
         return std::chrono::duration<double, std::milli>(t_end - t_start).count();
     };
 
+    bool g_gates_ok = true;   // every gate below must record into this; the exit code depends on it
+
     std::memcpy(u_chunk.data(), prompt_h.data(), kChunk * kHidden * sizeof(float));
     double npu_512 = 0.0, cpu_512 = 0.0;
     double ms_512 = run_24layer_prefill(512, &npu_512, &cpu_512);
     double ms_per_tok_512 = ms_512 / 512.0;
+    const bool gate_512 = ms_per_tok_512 <= 35.0;
     std::printf("  • 512-Token Prompt (8 x T=64 chunks, 24 layers):   %.2f ms total (NPU=%.2f ms, CPU=%.2f ms) -> %.2f ms/tok (%.1f tok/s) [gate <= 35 ms/tok: %s]\n",
-                ms_512, npu_512, cpu_512, ms_per_tok_512, 1000.0 / ms_per_tok_512, (ms_per_tok_512 <= 35.0) ? "PASS" : "FAIL");
+                ms_512, npu_512, cpu_512, ms_per_tok_512, 1000.0 / ms_per_tok_512, gate_512 ? "PASS" : "FAIL");
+    g_gates_ok &= gate_512;
 
     double npu_4096 = 0.0, cpu_4096 = 0.0;
     double ms_4096 = run_24layer_prefill(4096, &npu_4096, &cpu_4096);
     double s_4096 = ms_4096 / 1000.0;
     double ms_per_tok_4096 = ms_4096 / 4096.0;
+    const bool gate_4096 = s_4096 <= 30.0;
     std::printf("  • 4096-Token Prompt (64 x T=64 chunks, 24 layers): %.2f s total (NPU=%.2f s, CPU=%.2f s)  -> %.2f ms/tok (%.1f tok/s) [gate <= 30.0 s: %s]\n\n",
-                s_4096, npu_4096 / 1000.0, cpu_4096 / 1000.0, ms_per_tok_4096, 1000.0 / ms_per_tok_4096, (s_4096 <= 30.0) ? "PASS" : "FAIL");
+                s_4096, npu_4096 / 1000.0, cpu_4096 / 1000.0, ms_per_tok_4096, 1000.0 / ms_per_tok_4096, gate_4096 ? "PASS" : "FAIL");
+    g_gates_ok &= gate_4096;
 
     // -------------------------------------------------------------------------
-    // Gate 4: Immediate T=1 Autoregressive Decode After 4096-Token Prefill
+    // Gate 4: per-submit throughput microbenchmark.
+    //
+    // This is NOT a decode benchmark and its output must never be quoted as one. Every layer
+    // binds layer 0's weight region (`kOffConvIn`/`kOffProj2k`/`kOffAttnQkv`/`kOffMlp` are fixed
+    // constants), so the streamed working set is ~141 MB reused 24 times rather than the model's
+    // ~2.95 GB of distinct weights. Bytes-per-submit are identical, so it measures how fast the
+    // NPU and driver accept submits; it says nothing about DRAM/SMMU behaviour on a real pass, and
+    // the generated activations are numerically meaningless by construction.
+    //
+    // The engine-side equivalent of this measurement is `lfm3_v2 --weights-layer0`, which runs the
+    // same reused-working-set condition through the real WorkerPool path and therefore *is*
+    // comparable to a normal engine run. Use that for bandwidth attribution.
     // -------------------------------------------------------------------------
-    std::printf("[4/4] Immediate T=1 Autoregressive Decode After 4096-Token Prefill (Zero Model Swap!)...\n");
-    const int kDecodeSteps = 4;
+    std::printf("[4/4] Per-submit throughput microbenchmark (layer-0 weights reused across all "
+                "24 layers -- NOT a decode benchmark)\n");
+    const int kDecodeSteps = 16;          // enough to average out scheduler noise
     auto t_dec0 = std::chrono::steady_clock::now();
     for (int step = 0; step < kDecodeSteps; ++step) {
         for (int l = 0; l < 24; ++l) {
@@ -786,8 +812,19 @@ int main(int argc, char **argv) {
     }
     auto t_dec1 = std::chrono::steady_clock::now();
     double ms_dec_per_tok = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count() / kDecodeSteps;
-    std::printf("  • Post-Prefill T=1 Decode Latency (24 layers): %.2f ms/tok (%.2f tok/s) [PASS]\n\n",
-                ms_dec_per_tok, 1000.0 / ms_dec_per_tok);
+    // 72 submits/token (13 conv x2 + 11 attn x2 + 24 mlp). The gate is about submit acceptance
+    // rate, so it is stated per submit and checked against the measured T=1 per-archetype mean.
+    const double ms_per_submit = ms_dec_per_tok / 72.0;
+    const bool submit_pass = ms_per_submit <= 2.0;
+    std::printf("  • %.2f ms per 72-submit pass -> %.3f ms/submit  "
+                "[gate <= 2.0 ms/submit: %s]\n", ms_dec_per_tok, ms_per_submit,
+                submit_pass ? "PASS" : "FAIL");
+    std::printf("  • DO NOT read this as decode speed: it implies %.2f tok/s only because every\n"
+                "    layer re-reads the same 141 MB. The engine's real decode number is in\n"
+                "    FINDINGS 38.2/39.3; lfm3_v2 --weights-layer0 reproduces this condition\n"
+                "    through the production submit path.\n\n",
+                1000.0 / ms_dec_per_tok);
+    g_gates_ok &= submit_pass;
 
     if (have_lm_head) drv.unload_model(lm_head_id);
     for (auto &it : items) drv.unload_model(it.m->model_id);
@@ -799,7 +836,12 @@ int main(int argc, char **argv) {
     drv.shutdown();
 
     std::printf("=================================================================\n");
-    std::printf(" ALL MILESTONE 3.5 SILICON ACCEPTANCE GATES PASSED.\n");
+    if (g_gates_ok) {
+        std::printf(" ALL MILESTONE 3.5 SILICON ACCEPTANCE GATES PASSED.\n");
+        std::printf("=================================================================\n");
+        return 0;
+    }
+    std::printf(" ONE OR MORE GATES FAILED -- see the [gate ...: FAIL] lines above.\n");
     std::printf("=================================================================\n");
-    return 0;
+    return 1;
 }
