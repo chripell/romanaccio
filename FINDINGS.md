@@ -2272,3 +2272,34 @@ ms/token of cache maintenance costing the measured ~32% of decode. Sizing to the
   a submit, so only the probe could hit it. Evidence for audit item 1.1: the flush is not
   invalidate-only, it writes back dirty lines. Any future `Cached`-mode optimization must respect
   that ordering.
+
+
+### 45.2 Buffer size controls a first-run dependency -- the ~32% is NOT collectable yet
+
+Shrinking allocations to the measured extents was tried and **reverted**. Same binary, same
+packages, same prompt, three prefills each:
+
+| output buffers | FP16 run1 vs run2 logits | INT8 run1 vs run2 | run1 deterministic | FP16 decode |
+|---|---|---|---|---|
+| entry-sized, 2 MiB (default) | 0.99999267 = 0.99999267 | 0.72907964 / 0.88736760 both | **yes** | 5.00 tok/s |
+| geometry-derived (32 KiB etc.) | **0.99996877 != 0.99999267** | **0.73503351 / 0.84836137** vs 0.72907964 / 0.88736760 | no | ~6.61 tok/s |
+
+With small buffers, run 1 diverges from runs 2+ in **both** precisions -- including FP16, where the
+effect is tiny but real (logits only; min-layer stays identical) -- and runs 2 onward agree exactly
+with each other. That is the signature of a first pass reading bytes that later passes find already
+populated, not of accumulated floating-point drift, and it contradicts any claim that the extents
+in 45 are the whole story.
+
+Why the probe could not see it: 45 measured high-water marks against `prod_cap`, i.e. against the
+*descriptor* size (32 KiB), so writes anywhere between the tensor end and the descriptor end are
+invisible to it. The graphs may legitimately be writing the full descriptor region, and the first
+pass may be reading part of it. Either way 45's "no archetype overran its region" is narrower than
+it looked: it means "nothing wrote past the descriptor", not "nothing wrote past the tensor".
+
+Consequences, recorded as decisions not aspirations:
+- **Entry-sized allocation remains the default.** Correctness beats 32%, and the FP16 config that
+  people actually run passes every gate with it (gate PASS, determinism PASS, **greedy 4/4 exact**).
+- `LFM3_SMALL_SURFACES=1` preserves the experiment; the old `LFM3_CLAMPED_SURFACES` name is gone.
+- **The activation-tail probe is implemented but has not been run yet**, so the input side remains
+  unmeasured. Next measurement is that, plus re-running 45's scan against *tensor* boundaries
+  rather than descriptor boundaries, which is what would actually reveal writes in between.

@@ -53,7 +53,7 @@ Useful flags and environment variables:
 | `--weights-layer0` | timing experiment only: bind every layer to one weight region per archetype, to separate NPU streaming speed from per-submit overhead. **Generated text is garbage.** |
 | `LFM3_DUMP_SURFACES=1` | print what `ModelInfo` reports for every input/output slot at load time |
 | `LFM3_MEASURE_EXTENT=1` | write-extent probe: sentinel-fill each output buffer, submit, report the high-water mark per archetype (§45). Slow; diagnostic only |
-| `LFM3_CLAMPED_SURFACES=1` | use the old fixed 32 KiB output buffers instead of entry-sized ones |
+| `LFM3_SMALL_SURFACES=1` | geometry-sized output buffers (~32% faster) -- **not deterministic on run 1, do not ship** (§45.2) |
 
 ### Gate-integrity checks (built in, not optional)
 

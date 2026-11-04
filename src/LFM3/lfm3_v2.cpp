@@ -1099,8 +1099,15 @@ public:
             // 0.7934 then 0.8678 (and min-layer 0.7462 / 0.7258) -- nondeterminism no
             // deterministic feed-forward network can produce. With entry-sized buffers two runs
             // returned 0.88736760 and 0.72907964 bit-identically.
-            const bool clamped_ab = std::getenv("LFM3_CLAMPED_SURFACES") != nullptr;
-            const bool m_wide_surfaces = !clamped_ab;
+            // Entry-sized (2 MiB) buffers stay the DEFAULT, because they are the only
+            // configuration measured to be fully deterministic: with the smaller geometry-derived
+            // sizes, run 1 diverges from run 2+ in BOTH precisions (FP16 logits 0.99996877 vs
+            // 0.99999267; INT8 min-layer 0.73503351 vs 0.72907964, logits 0.84836137 vs
+            // 0.88736760), and runs 2 onward agree exactly. The ~32% of decode that smaller
+            // buffers buy is therefore not available until the first-run dependency is
+            // understood -- see 45.2. LFM3_SMALL_SURFACES=1 keeps the experiment reproducible.
+            const bool small_ab = std::getenv("LFM3_SMALL_SURFACES") != nullptr;
+            const bool m_wide_surfaces = !small_ab;
             if (m_wide_surfaces) {
                 // Size every buffer to the largest entry its role reports rather than clamping
                 // the descriptor down to a convenient constant.
@@ -1122,12 +1129,14 @@ public:
             }
 
             const size_t g = m_guard_bytes;
-            m_act_t1[d]  = std::make_unique<DmaBuffer>(s_act1,  CacheMode::Cached, zone);
+            m_act_t1[d]  = std::make_unique<DmaBuffer>(s_act1 + g,  CacheMode::Cached, zone);
             m_out_t1[d]  = std::make_unique<DmaBuffer>(s_out1 + g,  CacheMode::Cached, zone);
-            m_act_t64[d] = std::make_unique<DmaBuffer>(s_act64, CacheMode::Cached, zone);
+            m_act_t64[d] = std::make_unique<DmaBuffer>(s_act64 + g, CacheMode::Cached, zone);
             m_out_t64[d] = std::make_unique<DmaBuffer>(s_out64 + g, CacheMode::Cached, zone);
             for (int s = 0; s < 4; ++s)
                 m_lm_out[d][s] = std::make_unique<DmaBuffer>(s_lmout + g, CacheMode::Cached, zone);
+            note_prod_cap(m_act_t1[d].get(), s_act1);
+            note_prod_cap(m_act_t64[d].get(), s_act64);
             note_prod_cap(m_out_t1[d].get(), s_out1);
             note_prod_cap(m_out_t64[d].get(), s_out64);
             for (int s = 0; s < 4; ++s) note_prod_cap(m_lm_out[d][s].get(), s_lmout);
@@ -1279,11 +1288,13 @@ public:
                                    DmaBuffer *flush_after, double weight_bytes,
                                    double &stage_ms) -> bool {
                 prime_guard(flush_after);
+                if (!ins.empty()) prime_input_tail(ins[0].buffer, ins[0].size);
                 const auto s0 = std::chrono::steady_clock::now();
                 uint64_t driver_ns = 0;
                 const bool ok = m_pool.submit_task(phys_die, model_id, ins, outs, &driver_ns);
                 if (ok && flush_after) flush_after->flush_cache();
                 if (ok) measure_guard(arch_idx, flush_after);
+                if (ok && !ins.empty()) measure_input_tail(arch_idx, ins[0].buffer, ins[0].size);
                 const auto s1 = std::chrono::steady_clock::now();
                 const double master_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
                 stage_ms += master_ms;
@@ -1734,6 +1745,35 @@ public:
         // (Direct evidence for the unresolved flush-direction question, audit 1.1: a flush on an
         // fd whose cache lines are dirty does write them back, and it is not merely an invalidate.)
         b->flush_cache();
+    }
+    /**
+     * @brief Prime/scan the tail of an INPUT buffer.
+     *
+     * The measured output extents equal the tensor byte counts exactly, so no output buffer is
+     * oversized by anything we can see -- yet INT8 was still nondeterministic with small output
+     * buffers (44). The remaining place a hidden write could land is the tail of an activation
+     * buffer, which pack_npu_input leaves full of stale bytes and no probe has watched.
+     */
+    void prime_input_tail(const DmaBuffer *b, size_t nominal) {
+        if (!m_extent_probe || !b || nominal >= b->size()) return;
+        // DmaBufferSlice hands out const buffer pointers; the bytes themselves are mutable DMA
+        // memory, and priming a guard region is exactly what they are for.
+        uint8_t *g = static_cast<uint8_t *>(const_cast<void *>(b->data())) + nominal;
+        std::fill(g, g + (b->size() - nominal), GUARD_BYTE);
+        const_cast<DmaBuffer *>(b)->flush_cache();  // sentinel must reach DRAM pre-submit
+    }
+    void measure_input_tail(int arch, const DmaBuffer *b, size_t nominal) {
+        if (!m_extent_probe || !b || nominal >= b->size()) return;
+        const uint8_t *g = static_cast<const uint8_t *>(b->data());
+        for (size_t i = nominal; i < b->size(); ++i) {
+            if (g[i] != GUARD_BYTE) {
+                std::printf("  !! arch %d wrote %zu B into its INPUT buffer tail at %zu\n",
+                            arch, b->size() - i, i);
+                if (i + 1 > m_extent_max[arch]) m_extent_max[arch] = i + 1;
+                m_extent_overrun[arch] = true;
+                return;
+            }
+        }
     }
     void measure_guard(int arch, DmaBuffer *b) {
         if (!m_extent_probe || !b) return;
