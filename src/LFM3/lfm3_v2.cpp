@@ -45,6 +45,9 @@
 #include <omp.h>
 #include <sched.h>
 #include <sys/mman.h>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 #define COLOR_RESET   "\033[0m"
 #define COLOR_BOLD    "\033[1m"
@@ -123,7 +126,103 @@ static void pin_openmp_threads_numa() {
     }
 }
 
+static inline int32_t round_clamp_f32(float x_scaled, float limit) {
+    float c = std::min(std::max(x_scaled, -limit), limit);
+#if defined(__riscv) && defined(__riscv_flen)
+    int32_t q;
+    __asm__ volatile("fcvt.w.s %0, %1, rne" : "=r"(q) : "f"(c));
+    return q;
+#else
+    return static_cast<int32_t>(std::nearbyintf(c));
+#endif
+}
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+// Quantize 16 FP32 values -> 16 symmetric INT8 values in [-127, 127]
+static inline int8x16_t neon_scale_clamp_f32_to_s8x16(
+    const float *src, float32x4_t v_inv_step, int8x16_t v_min_s8) {
+    float32x4_t f0 = vmulq_f32(vld1q_f32(src +  0), v_inv_step);
+    float32x4_t f1 = vmulq_f32(vld1q_f32(src +  4), v_inv_step);
+    float32x4_t f2 = vmulq_f32(vld1q_f32(src +  8), v_inv_step);
+    float32x4_t f3 = vmulq_f32(vld1q_f32(src + 12), v_inv_step);
+
+    int32x4_t i0 = vcvtnq_s32_f32(f0);
+    int32x4_t i1 = vcvtnq_s32_f32(f1);
+    int32x4_t i2 = vcvtnq_s32_f32(f2);
+    int32x4_t i3 = vcvtnq_s32_f32(f3);
+
+    int16x8_t s16_lo = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+    int16x8_t s16_hi = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+    int8x16_t s8     = vcombine_s8(vqmovn_s16(s16_lo), vqmovn_s16(s16_hi));
+    return vmaxq_s8(s8, v_min_s8);
+}
+
+// Quantize 8 FP32 values -> 8 symmetric INT16 values in [-32767, 32767]
+static inline int16x8_t neon_scale_clamp_f32_to_s16x8(
+    const float *src, float32x4_t v_inv_step, int16x8_t v_min_s16) {
+    float32x4_t f0 = vmulq_f32(vld1q_f32(src + 0), v_inv_step);
+    float32x4_t f1 = vmulq_f32(vld1q_f32(src + 4), v_inv_step);
+
+    int32x4_t i0 = vcvtnq_s32_f32(f0);
+    int32x4_t i1 = vcvtnq_s32_f32(f1);
+
+    int16x8_t s16 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+    return vmaxq_s16(s16, v_min_s16);
+}
+
+// Dequantize 16 INT8 values -> 16 FP32 values
+static inline void neon_dequant_s8x16_to_f32(
+    int8x16_t v_s8, float32x4_t v_step, float *dst) {
+    int16x8_t s16_lo = vmovl_s8(vget_low_s8(v_s8));
+    int16x8_t s16_hi = vmovl_s8(vget_high_s8(v_s8));
+
+    float32x4_t f0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_lo))),  v_step);
+    float32x4_t f1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_lo))), v_step);
+    float32x4_t f2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_hi))),  v_step);
+    float32x4_t f3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_hi))), v_step);
+
+    vst1q_f32(dst +  0, f0);
+    vst1q_f32(dst +  4, f1);
+    vst1q_f32(dst +  8, f2);
+    vst1q_f32(dst + 12, f3);
+}
+
+// Dequantize 8 INT16 values -> 8 FP32 values
+static inline void neon_dequant_s16x8_to_f32(
+    int16x8_t v_s16, float32x4_t v_step, float *dst) {
+    float32x4_t f0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v_s16))),  v_step);
+    float32x4_t f1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(v_s16))), v_step);
+    vst1q_f32(dst + 0, f0);
+    vst1q_f32(dst + 4, f1);
+}
+#endif // __ARM_NEON
+
 static inline void quantize_kv_u8(const float *src, uint8_t *dst_u8, float &out_scale, uint16_t &out_sum) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    float32x4_t vmax0 = vdupq_n_f32(0.0f);
+    float32x4_t vmax1 = vdupq_n_f32(0.0f);
+    for (int d = 0; d < 128; d += 8) {
+        vmax0 = vmaxq_f32(vmax0, vabsq_f32(vld1q_f32(src + d + 0)));
+        vmax1 = vmaxq_f32(vmax1, vabsq_f32(vld1q_f32(src + d + 4)));
+    }
+    float amax = vmaxvq_f32(vmaxq_f32(vmax0, vmax1));
+    float sc   = (amax > 1e-12f) ? (amax / 127.0f) : 1.0f;
+    float inv  = (amax > 1e-12f) ? (127.0f / amax) : 0.0f;
+
+    float32x4_t v_inv    = vdupq_n_f32(inv);
+    int8x16_t   v_min_s8 = vdupq_n_s8(-127);
+    uint8x16_t  v_bias   = vdupq_n_u8(0x80);
+    uint16x8_t  v_sum16  = vdupq_n_u16(0);
+
+    for (int d = 0; d < 128; d += 16) {
+        int8x16_t  q_s8 = neon_scale_clamp_f32_to_s8x16(src + d, v_inv, v_min_s8);
+        uint8x16_t q_u8 = veorq_u8(vreinterpretq_u8_s8(q_s8), v_bias);
+        vst1q_u8(dst_u8 + d, q_u8);
+        v_sum16 = vpadalq_u8(v_sum16, q_u8);
+    }
+    out_scale = sc;
+    out_sum   = static_cast<uint16_t>(vaddlvq_u16(v_sum16));
+#else
     float amax = 0.0f;
     for (int d = 0; d < 128; ++d) {
         float a = std::fabs(src[d]);
@@ -133,15 +232,14 @@ static inline void quantize_kv_u8(const float *src, uint8_t *dst_u8, float &out_
     float inv = (amax > 1e-12f) ? (127.0f / amax) : 0.0f;
     uint32_t sum_u = 0;
     for (int d = 0; d < 128; ++d) {
-        int q = static_cast<int>(std::nearbyintf(src[d] * inv));
-        if (q < -127) q = -127;
-        if (q > 127)  q = 127;
+        int32_t q = round_clamp_f32(src[d] * inv, 127.0f);
         uint8_t u = static_cast<uint8_t>(q + 128);
         dst_u8[d] = u;
         sum_u += u;
     }
     out_scale = sc;
     out_sum = static_cast<uint16_t>(sum_u);
+#endif
 }
 
 // LFM3 24-layer schedule: 0 = conv (13), 1 = full_attention (6), 2 = sliding_attention (5)
@@ -232,6 +330,31 @@ struct LayerCpuWeights {
     const float *gate_proj = nullptr;     // [16, 2048]
 };
 
+enum class BoundaryDtype : uint8_t {
+    Fp16  = 0,
+    Int8  = 1,
+    Int16 = 2
+};
+
+struct SubgraphScaleInfo {
+    BoundaryDtype in_dtype  = BoundaryDtype::Fp16;
+    BoundaryDtype out_dtype = BoundaryDtype::Fp16;
+    float in_thresh  = 1.0f;
+    float in_step    = 1.0f / 127.0f;
+    float out_thresh = 1.0f;
+    float out_step   = 1.0f / 127.0f;
+};
+
+static inline BoundaryDtype parse_boundary_dtype(const std::string &s) {
+    if (s == "int8")  return BoundaryDtype::Int8;
+    if (s == "int16") return BoundaryDtype::Int16;
+    return BoundaryDtype::Fp16;
+}
+
+static inline size_t dtype_elem_size(BoundaryDtype dt) {
+    return (dt == BoundaryDtype::Int8) ? 1 : 2;
+}
+
 struct LayerNpuOffsets {
     uint16_t die_id = 0;
     size_t op_in_offset = 0;   // conv_in (25,362,432 B) or attn_qkv (12,681,216 B)
@@ -240,21 +363,32 @@ struct LayerNpuOffsets {
     size_t op_out_size   = 0;
     size_t mlp_offset    = 0;  // mlp (94,863,360 B)
     size_t mlp_size      = 0;
+
+    SubgraphScaleInfo op_in_scale{};
+    SubgraphScaleInfo op_out_scale{};
+    SubgraphScaleInfo mlp_scale{};
+};
+
+struct LoadedArchetype {
+    uint32_t id = 0;
+    size_t   in_surface_bytes  = 0;
+    size_t   out_surface_bytes = 0;
 };
 
 struct DieModels {
     // T=1 Class B archetypes
-    uint32_t conv_in_t1  = 0;
-    uint32_t proj2048_t1 = 0;
-    uint32_t attn_qkv_t1 = 0;
-    uint32_t mlp_t1      = 0;
+    LoadedArchetype conv_in_t1{};
+    LoadedArchetype proj2048_t1{};
+    LoadedArchetype attn_qkv_t1{};
+    LoadedArchetype mlp_t1{};
     // T=64 Class B archetypes
-    uint32_t conv_in_t64  = 0;
-    uint32_t proj2048_t64 = 0;
-    uint32_t attn_qkv_t64 = 0;
-    uint32_t mlp_t64      = 0;
+    LoadedArchetype conv_in_t64{};
+    LoadedArchetype proj2048_t64{};
+    LoadedArchetype attn_qkv_t64{};
+    LoadedArchetype mlp_t64{};
     // 4 x 16,000 LM head slices per die
-    uint32_t lm_head[4] = {0, 0, 0, 0};
+    LoadedArchetype   lm_head[4]{};
+    SubgraphScaleInfo lm_head_scale[4]{};
     int resident_count = 0;
 };
 
@@ -271,8 +405,10 @@ static void rms_norm_f32(const float *x, const float *w, float *out, int T, int 
     }
 }
 
-// Pack [T, C] FP32 into NPU FP16 input buffer (with L2 staging & FP16 round-trip in src_roundtrip if non-null)
-static uint16_t g_stage_fp16[64 * 6144];
+// Pack [T, C] FP32 into NPU FP16/INT8/INT16 input buffer (with L2 staging)
+alignas(64) static uint16_t g_stage_fp16[64 * 6144];
+alignas(64) static int8_t   g_stage_int8[64 * 6144];
+alignas(64) static int16_t  g_stage_int16[64 * 6144];
 
 static void pack_npu_input_fp16(const float *src_tc, uint16_t *dst_npu, int T, int C) {
     if (T == 1) {
@@ -319,6 +455,309 @@ static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int 
                 std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
             }
         }
+    }
+}
+
+// Pack [T, C] FP32 into NPU INT8 input buffer (in_step = threshold / 127.0f, clamped to [-127, 127])
+static void pack_npu_input_int8(const float *src_tc, int8_t *dst_npu, int T, int C, float in_step) {
+    const float inv_step = (in_step > 1e-12f) ? (1.0f / in_step) : 0.0f;
+    if (T == 1) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t v_inv    = vdupq_n_f32(inv_step);
+        int8x16_t   v_min_s8 = vdupq_n_s8(-127);
+        int c = 0;
+        for (; c + 15 < C; c += 16) {
+            vst1q_s8(g_stage_int8 + c, neon_scale_clamp_f32_to_s8x16(src_tc + c, v_inv, v_min_s8));
+        }
+        for (; c < C; ++c) {
+            g_stage_int8[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
+        }
+#else
+        for (int c = 0; c < C; ++c) {
+            g_stage_int8[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
+        }
+#endif
+        std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(C) * sizeof(int8_t));
+        return;
+    }
+
+    const int c_blocks = C / 16;
+    #pragma omp parallel for schedule(static)
+    for (int cb = 0; cb < c_blocks; ++cb) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t v_inv    = vdupq_n_f32(inv_step);
+        int8x16_t   v_min_s8 = vdupq_n_s8(-127);
+#endif
+        for (int t = 0; t < T; ++t) {
+            const float *s = src_tc + static_cast<size_t>(t) * C + cb * 16;
+            int8_t *d      = g_stage_int8 + (static_cast<size_t>(cb) * T + t) * 16;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            vst1q_s8(d, neon_scale_clamp_f32_to_s8x16(s, v_inv, v_min_s8));
+#else
+            for (int k = 0; k < 16; ++k) {
+                d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * inv_step, 127.0f));
+            }
+#endif
+        }
+    }
+    std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(T) * C * sizeof(int8_t));
+}
+
+// Pack [T, C] FP32 into NPU INT16 input buffer (in_step = threshold / 32767.0f, clamped to [-32767, 32767])
+static void pack_npu_input_int16(const float *src_tc, int16_t *dst_npu, int T, int C, float in_step) {
+    const float inv_step = (in_step > 1e-12f) ? (1.0f / in_step) : 0.0f;
+    if (T == 1) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t v_inv     = vdupq_n_f32(inv_step);
+        int16x8_t   v_min_s16 = vdupq_n_s16(-32767);
+        int c = 0;
+        for (; c + 15 < C; c += 16) {
+            vst1q_s16(g_stage_int16 + c + 0, neon_scale_clamp_f32_to_s16x8(src_tc + c + 0, v_inv, v_min_s16));
+            vst1q_s16(g_stage_int16 + c + 8, neon_scale_clamp_f32_to_s16x8(src_tc + c + 8, v_inv, v_min_s16));
+        }
+        for (; c < C; ++c) {
+            g_stage_int16[c] = static_cast<int16_t>(round_clamp_f32(src_tc[c] * inv_step, 32767.0f));
+        }
+#else
+        for (int c = 0; c < C; ++c) {
+            g_stage_int16[c] = static_cast<int16_t>(round_clamp_f32(src_tc[c] * inv_step, 32767.0f));
+        }
+#endif
+        std::memcpy(dst_npu, g_stage_int16, static_cast<size_t>(C) * sizeof(int16_t));
+        return;
+    }
+
+    const int c_blocks = C / 16;
+    #pragma omp parallel for schedule(static)
+    for (int cb = 0; cb < c_blocks; ++cb) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t v_inv     = vdupq_n_f32(inv_step);
+        int16x8_t   v_min_s16 = vdupq_n_s16(-32767);
+#endif
+        for (int t = 0; t < T; ++t) {
+            const float *s = src_tc + static_cast<size_t>(t) * C + cb * 16;
+            int16_t *d     = g_stage_int16 + (static_cast<size_t>(cb) * T + t) * 16;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            vst1q_s16(d + 0, neon_scale_clamp_f32_to_s16x8(s + 0, v_inv, v_min_s16));
+            vst1q_s16(d + 8, neon_scale_clamp_f32_to_s16x8(s + 8, v_inv, v_min_s16));
+#else
+            for (int k = 0; k < 16; ++k) {
+                d[k] = static_cast<int16_t>(round_clamp_f32(s[k] * inv_step, 32767.0f));
+            }
+#endif
+        }
+    }
+    std::memcpy(dst_npu, g_stage_int16, static_cast<size_t>(T) * C * sizeof(int16_t));
+}
+
+// Unpack NPU NCHW [1, C_out, T, 1] INT8 output into [T, C_out] FP32
+static void unpack_npu_output_int8(const int8_t *src_nchw, float *dst_tc, int T, int C_out, float out_step) {
+    std::memcpy(g_stage_int8, src_nchw, static_cast<size_t>(T) * C_out * sizeof(int8_t));
+    if (T == 1) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t v_step = vdupq_n_f32(out_step);
+        int c = 0;
+        for (; c + 15 < C_out; c += 16) {
+            neon_dequant_s8x16_to_f32(vld1q_s8(g_stage_int8 + c), v_step, dst_tc + c);
+        }
+        for (; c < C_out; ++c) {
+            dst_tc[c] = static_cast<float>(g_stage_int8[c]) * out_step;
+        }
+#else
+        for (int c = 0; c < C_out; ++c) {
+            dst_tc[c] = static_cast<float>(g_stage_int8[c]) * out_step;
+        }
+#endif
+        return;
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int t0 = 0; t0 < T; t0 += 16) {
+        for (int c0 = 0; c0 < C_out; c0 += 16) {
+            alignas(64) float tile[16][16];
+            for (int dc = 0; dc < 16; ++dc) {
+                const int8_t *s_row = g_stage_int8 + static_cast<size_t>(c0 + dc) * T + t0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                float row_f32[16];
+                neon_dequant_s8x16_to_f32(vld1q_s8(s_row), vdupq_n_f32(out_step), row_f32);
+                for (int dt = 0; dt < 16; ++dt) tile[dt][dc] = row_f32[dt];
+#else
+                for (int dt = 0; dt < 16; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * out_step;
+                }
+#endif
+            }
+            for (int dt = 0; dt < 16; ++dt) {
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+            }
+        }
+    }
+}
+
+// Unpack NPU NCHW [1, C_out, T, 1] INT16 output into [T, C_out] FP32
+static void unpack_npu_output_int16(const int16_t *src_nchw, float *dst_tc, int T, int C_out, float out_step) {
+    std::memcpy(g_stage_int16, src_nchw, static_cast<size_t>(T) * C_out * sizeof(int16_t));
+    if (T == 1) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t v_step = vdupq_n_f32(out_step);
+        int c = 0;
+        for (; c + 15 < C_out; c += 16) {
+            neon_dequant_s16x8_to_f32(vld1q_s16(g_stage_int16 + c + 0), v_step, dst_tc + c + 0);
+            neon_dequant_s16x8_to_f32(vld1q_s16(g_stage_int16 + c + 8), v_step, dst_tc + c + 8);
+        }
+        for (; c < C_out; ++c) {
+            dst_tc[c] = static_cast<float>(g_stage_int16[c]) * out_step;
+        }
+#else
+        for (int c = 0; c < C_out; ++c) {
+            dst_tc[c] = static_cast<float>(g_stage_int16[c]) * out_step;
+        }
+#endif
+        return;
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int t0 = 0; t0 < T; t0 += 16) {
+        for (int c0 = 0; c0 < C_out; c0 += 16) {
+            alignas(64) float tile[16][16];
+            for (int dc = 0; dc < 16; ++dc) {
+                const int16_t *s_row = g_stage_int16 + static_cast<size_t>(c0 + dc) * T + t0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                float row_f32[16];
+                float32x4_t v_step = vdupq_n_f32(out_step);
+                neon_dequant_s16x8_to_f32(vld1q_s16(s_row + 0), v_step, row_f32 + 0);
+                neon_dequant_s16x8_to_f32(vld1q_s16(s_row + 8), v_step, row_f32 + 8);
+                for (int dt = 0; dt < 16; ++dt) tile[dt][dc] = row_f32[dt];
+#else
+                for (int dt = 0; dt < 16; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * out_step;
+                }
+#endif
+            }
+            for (int dt = 0; dt < 16; ++dt) {
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+            }
+        }
+    }
+}
+
+// Dynamic per-token INT8 input packer for homogeneous 1x1 linear projections
+static void pack_npu_input_int8_dyntok(const float *src_tc, int8_t *dst_npu, int T, int C,
+                                       float in_thresh, float *scale_ratios) {
+    const float safe_thresh = std::max(in_thresh, 1e-8f);
+    if (T == 1) {
+        float amax = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            float a = std::fabs(src_tc[c]);
+            if (a > amax) amax = a;
+        }
+        amax = std::max(amax, 1e-8f);
+        scale_ratios[0] = amax / safe_thresh;
+        const float inv_step = 127.0f / amax;
+        for (int c = 0; c < C; ++c) {
+            g_stage_int8[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
+        }
+        std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(C) * sizeof(int8_t));
+        return;
+    }
+
+    float inv_step_tok[64];
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; ++t) {
+        const float *row = src_tc + static_cast<size_t>(t) * C;
+        float amax = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            float a = std::fabs(row[c]);
+            if (a > amax) amax = a;
+        }
+        amax = std::max(amax, 1e-8f);
+        scale_ratios[t] = amax / safe_thresh;
+        inv_step_tok[t] = 127.0f / amax;
+    }
+
+    const int c_blocks = C / 16;
+    #pragma omp parallel for schedule(static)
+    for (int cb = 0; cb < c_blocks; ++cb) {
+        for (int t = 0; t < T; ++t) {
+            const float inv = inv_step_tok[t];
+            const float *s  = src_tc + static_cast<size_t>(t) * C + cb * 16;
+            int8_t *d       = g_stage_int8 + (static_cast<size_t>(cb) * T + t) * 16;
+            for (int k = 0; k < 16; ++k) {
+                d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * inv, 127.0f));
+            }
+        }
+    }
+    std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(T) * C * sizeof(int8_t));
+}
+
+// Dynamic per-token INT8 output unpacker for homogeneous 1x1 linear projections
+static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc, int T, int C_out,
+                                          float out_step, const float *scale_ratios) {
+    std::memcpy(g_stage_int8, src_nchw, static_cast<size_t>(T) * C_out * sizeof(int8_t));
+    if (T == 1) {
+        const float step_tok = scale_ratios[0] * out_step;
+        for (int c = 0; c < C_out; ++c) {
+            dst_tc[c] = static_cast<float>(g_stage_int8[c]) * step_tok;
+        }
+        return;
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int t0 = 0; t0 < T; t0 += 16) {
+        for (int c0 = 0; c0 < C_out; c0 += 16) {
+            alignas(64) float tile[16][16];
+            for (int dc = 0; dc < 16; ++dc) {
+                const int8_t *s_row = g_stage_int8 + static_cast<size_t>(c0 + dc) * T + t0;
+                for (int dt = 0; dt < 16; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * (scale_ratios[t0 + dt] * out_step);
+                }
+            }
+            for (int dt = 0; dt < 16; ++dt) {
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+            }
+        }
+    }
+}
+
+// Unified NPU Input Packer: routes FP32 [T, C] -> FP16, INT8 (static or dyntok), or INT16 DmaBuffer
+static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C,
+                           const SubgraphScaleInfo &sc, float *dyntok_ratios = nullptr) {
+    switch (sc.in_dtype) {
+        case BoundaryDtype::Int8:
+            if (dyntok_ratios) {
+                pack_npu_input_int8_dyntok(src_tc, dst_buf->as<int8_t>(), T, C, sc.in_thresh, dyntok_ratios);
+            } else {
+                pack_npu_input_int8(src_tc, dst_buf->as<int8_t>(), T, C, sc.in_step);
+            }
+            break;
+        case BoundaryDtype::Int16:
+            pack_npu_input_int16(src_tc, dst_buf->as<int16_t>(), T, C, sc.in_step);
+            break;
+        case BoundaryDtype::Fp16:
+        default:
+            pack_npu_input_fp16(src_tc, dst_buf->as<uint16_t>(), T, C);
+            break;
+    }
+}
+
+// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T, C_out]
+static void unpack_npu_output(const DmaBuffer *src_buf, float *dst_tc, int T, int C_out,
+                              const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr) {
+    switch (sc.out_dtype) {
+        case BoundaryDtype::Int8:
+            if (dyntok_ratios) {
+                unpack_npu_output_int8_dyntok(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, dyntok_ratios);
+            } else {
+                unpack_npu_output_int8(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step);
+            }
+            break;
+        case BoundaryDtype::Int16:
+            unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step);
+            break;
+        case BoundaryDtype::Fp16:
+        default:
+            unpack_npu_output_fp16(src_buf->as<uint16_t>(), dst_tc, T, C_out);
+            break;
     }
 }
 
@@ -376,8 +815,9 @@ public:
             }
         }
 
-        // 4. Parse weights_map.json
+        // 4. Parse weights_map.json & optional quant_scales.json
         if (!load_weights_map()) return false;
+        if (!load_quant_scales()) return false;
 
         // 5. Precompute RoPE inverse frequency tables
         for (int i = 0; i < 64; ++i) {
@@ -462,12 +902,16 @@ public:
             }
 
             // Load the 8 shared Class B archetypes + 4 LM Head 16K slices = 12 models/die
-            auto load_m = [&](const std::string &rel, uint32_t &out_id) -> bool {
+            auto load_m = [&](const std::string &rel, LoadedArchetype &out_arch) -> bool {
                 std::string full = m_pkg_dir + "/" + rel;
-                if (!m_pool.load_model(phys_die, full, out_id)) {
+                ModelInfo info{};
+                if (!m_pool.load_model(phys_die, full, info)) {
                     std::printf("FAIL: load_model(%s) on Die %u\n", full.c_str(), phys_die);
                     return false;
                 }
+                out_arch.id = info.model_id;
+                out_arch.in_surface_bytes  = info.input_sizes[0];
+                out_arch.out_surface_bytes = info.output_sizes[0];
                 m_die_models[d].resident_count++;
                 return true;
             };
@@ -556,24 +1000,32 @@ public:
                 timers.d2d_xfer_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
             }
 
+            auto surf_or = [](const DmaBuffer *buf, size_t reported, int T_cur, int C_cur, BoundaryDtype dt) -> size_t {
+                size_t raw  = static_cast<size_t>(T_cur) * C_cur * dtype_elem_size(dt);
+                size_t want = (reported >= raw) ? reported : raw;
+                return (buf && want > buf->size()) ? buf->size() : want;
+            };
+            float op_in_ratios[64], op_out_ratios[64];
+
             // 1. Pre-operator Sandwich RMSNorm
             auto tn0 = std::chrono::steady_clock::now();
             rms_norm_f32(h.data(), cw.op_norm, u.data(), T, kHidden);
-            pack_npu_input_fp16(u.data(), act_buf->as<uint16_t>(), T, kHidden);
+            pack_npu_input(u.data(), act_buf, T, kHidden, no.op_in_scale, op_in_ratios);
             act_buf->flush_cache();
             auto tn1 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn1 - tn0).count();
 
             if (kLayerSchedule[l] == Lfm3LayerType::Conv) {
                 // --- Primitive 2: Gated ShortConv Layer ---
-                uint32_t m_in  = (T == 1) ? dm.conv_in_t1  : dm.conv_in_t64;
-                uint32_t m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
-                size_t in_bytes  = static_cast<size_t>(T) * 2048 * 2;
-                size_t mid_bytes = static_cast<size_t>(T) * 6144 * 2;
-                size_t out_bytes = static_cast<size_t>(T) * 2048 * 2;
+                const LoadedArchetype &m_in  = (T == 1) ? dm.conv_in_t1  : dm.conv_in_t64;
+                const LoadedArchetype &m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
+                size_t in_bytes  = surf_or(act_buf, m_in.in_surface_bytes,   T, 2048, no.op_in_scale.in_dtype);
+                size_t mid_bytes = surf_or(out_buf, m_in.out_surface_bytes,  T, 6144, no.op_in_scale.out_dtype);
+                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype);
+                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype);
 
                 auto tnpu0 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_in,
+                if (!m_pool.submit_task(phys_die, m_in.id,
                         {DmaBufferSlice{act_buf, 0, in_bytes}, DmaBufferSlice{w_buf, no.op_in_offset, no.op_in_size}},
                         {DmaBufferSlice{out_buf, 0, mid_bytes}})) {
                     return false;
@@ -584,7 +1036,7 @@ public:
 
                 // CPU 7-tap depthwise ShortConv state update
                 auto tconv0 = std::chrono::steady_clock::now();
-                unpack_npu_output_fp16(out_buf->as<uint16_t>(), bcx.data(), T, 6144);
+                unpack_npu_output(out_buf, bcx.data(), T, 6144, no.op_in_scale, op_in_ratios);
                 float *layer_st = m_conv_state.data() + static_cast<size_t>(conv_idx) * kHidden * 6;
                 const float *w_conv = cw.conv_weight;
 
@@ -606,14 +1058,14 @@ public:
                     }
                 }
                 conv_idx++;
-                pack_npu_input_fp16(y.data(), act_buf->as<uint16_t>(), T, kHidden);
+                pack_npu_input(y.data(), act_buf, T, kHidden, no.op_out_scale, op_out_ratios);
                 act_buf->flush_cache();
                 auto tconv1 = std::chrono::steady_clock::now();
                 timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tconv1 - tconv0).count();
 
                 auto tnpu2 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_out,
-                        {DmaBufferSlice{act_buf, 0, in_bytes}, DmaBufferSlice{w_buf, no.op_out_offset, no.op_out_size}},
+                if (!m_pool.submit_task(phys_die, m_out.id,
+                        {DmaBufferSlice{act_buf, 0, oin_bytes}, DmaBufferSlice{w_buf, no.op_out_offset, no.op_out_size}},
                         {DmaBufferSlice{out_buf, 0, out_bytes}})) {
                     return false;
                 }
@@ -622,21 +1074,22 @@ public:
                 timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tnpu3 - tnpu2).count();
 
                 auto tn2 = std::chrono::steady_clock::now();
-                unpack_npu_output_fp16(out_buf->as<uint16_t>(), op_out.data(), T, kHidden);
+                unpack_npu_output(out_buf, op_out.data(), T, kHidden, no.op_out_scale, op_out_ratios);
                 auto tn3 = std::chrono::steady_clock::now();
                 timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tn3 - tn2).count();
 
             } else {
                 // --- Primitive 3: SWA or Global GQA Attention Layer ---
                 bool is_swa = (kLayerSchedule[l] == Lfm3LayerType::SlidingAttention);
-                uint32_t m_qkv = (T == 1) ? dm.attn_qkv_t1 : dm.attn_qkv_t64;
-                uint32_t m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
-                size_t in_bytes  = static_cast<size_t>(T) * 2048 * 2;
-                size_t qkv_bytes = static_cast<size_t>(T) * 3072 * 2;
-                size_t out_bytes = static_cast<size_t>(T) * 2048 * 2;
+                const LoadedArchetype &m_qkv = (T == 1) ? dm.attn_qkv_t1 : dm.attn_qkv_t64;
+                const LoadedArchetype &m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
+                size_t in_bytes  = surf_or(act_buf, m_qkv.in_surface_bytes,  T, 2048, no.op_in_scale.in_dtype);
+                size_t qkv_bytes = surf_or(out_buf, m_qkv.out_surface_bytes, T, 3072, no.op_in_scale.out_dtype);
+                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype);
+                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype);
 
                 auto tnpu0 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_qkv,
+                if (!m_pool.submit_task(phys_die, m_qkv.id,
                         {DmaBufferSlice{act_buf, 0, in_bytes}, DmaBufferSlice{w_buf, no.op_in_offset, no.op_in_size}},
                         {DmaBufferSlice{out_buf, 0, qkv_bytes}})) {
                     return false;
@@ -665,7 +1118,7 @@ public:
 
                 // QK-Norm + RoPE + KV Cache Update + GQA Attention
                 auto tattn0 = std::chrono::steady_clock::now();
-                unpack_npu_output_fp16(out_buf->as<uint16_t>(), qkv.data(), T, 3072);
+                unpack_npu_output(out_buf, qkv.data(), T, 3072, no.op_in_scale, op_in_ratios);
 
                 float *k_cache = is_swa
                     ? (m_swa_k.data() + static_cast<size_t>(swa_idx) * kSwaWin * kKvHeads * kHeadDim)
@@ -751,7 +1204,7 @@ public:
                                       T, m_pos, is_swa, s_cap);
                 }
 
-                pack_npu_input_fp16(y.data(), act_buf->as<uint16_t>(), T, kHidden);
+                pack_npu_input(y.data(), act_buf, T, kHidden, no.op_out_scale, op_out_ratios);
                 act_buf->flush_cache();
                 auto tattn1 = std::chrono::steady_clock::now();
                 double attn_dt = std::chrono::duration<double, std::milli>(tattn1 - tattn0).count();
@@ -759,8 +1212,8 @@ public:
                 else        timers.cpu_glob_ms += attn_dt;
 
                 auto tnpu2 = std::chrono::steady_clock::now();
-                if (!m_pool.submit_task(phys_die, m_out,
-                        {DmaBufferSlice{act_buf, 0, in_bytes}, DmaBufferSlice{w_buf, no.op_out_offset, no.op_out_size}},
+                if (!m_pool.submit_task(phys_die, m_out.id,
+                        {DmaBufferSlice{act_buf, 0, oin_bytes}, DmaBufferSlice{w_buf, no.op_out_offset, no.op_out_size}},
                         {DmaBufferSlice{out_buf, 0, out_bytes}})) {
                     return false;
                 }
@@ -769,7 +1222,7 @@ public:
                 timers.npu_layer_ms += std::chrono::duration<double, std::milli>(tnpu3 - tnpu2).count();
 
                 auto tattn2 = std::chrono::steady_clock::now();
-                unpack_npu_output_fp16(out_buf->as<uint16_t>(), op_out.data(), T, kHidden);
+                unpack_npu_output(out_buf, op_out.data(), T, kHidden, no.op_out_scale, op_out_ratios);
                 auto tattn3 = std::chrono::steady_clock::now();
                 if (is_swa) timers.cpu_swa_ms += std::chrono::duration<double, std::milli>(tattn3 - tattn2).count();
                 else        timers.cpu_glob_ms += std::chrono::duration<double, std::milli>(tattn3 - tattn2).count();
@@ -780,18 +1233,19 @@ public:
             rms_norm_f32(op_out.data(), cw.post_op_norm, op_out.data(), T, kHidden);
             for (int i = 0; i < T * kHidden; ++i) h_mid[i] = h[i] + op_out[i];
             rms_norm_f32(h_mid.data(), cw.ffn_norm, v.data(), T, kHidden);
-            pack_npu_input_fp16(v.data(), act_buf->as<uint16_t>(), T, kHidden);
+            pack_npu_input(v.data(), act_buf, T, kHidden, no.mlp_scale);
             act_buf->flush_cache();
             auto tn5 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn5 - tn4).count();
 
             // 3. SwiGLU MLP on NPU
-            uint32_t m_mlp = (T == 1) ? dm.mlp_t1 : dm.mlp_t64;
-            size_t mlp_bytes = static_cast<size_t>(T) * 2048 * 2;
+            const LoadedArchetype &m_mlp = (T == 1) ? dm.mlp_t1 : dm.mlp_t64;
+            size_t mlp_in_bytes  = surf_or(act_buf, m_mlp.in_surface_bytes,  T, 2048, no.mlp_scale.in_dtype);
+            size_t mlp_out_bytes = surf_or(out_buf, m_mlp.out_surface_bytes, T, 2048, no.mlp_scale.out_dtype);
             auto tmlp0 = std::chrono::steady_clock::now();
-            if (!m_pool.submit_task(phys_die, m_mlp,
-                    {DmaBufferSlice{act_buf, 0, mlp_bytes}, DmaBufferSlice{w_buf, no.mlp_offset, no.mlp_size}},
-                    {DmaBufferSlice{out_buf, 0, mlp_bytes}})) {
+            if (!m_pool.submit_task(phys_die, m_mlp.id,
+                    {DmaBufferSlice{act_buf, 0, mlp_in_bytes}, DmaBufferSlice{w_buf, no.mlp_offset, no.mlp_size}},
+                    {DmaBufferSlice{out_buf, 0, mlp_out_bytes}})) {
                 return false;
             }
             out_buf->flush_cache();
@@ -800,7 +1254,7 @@ public:
 
             // 4. Sandwich post_ffn_norm + Residual
             auto tn6 = std::chrono::steady_clock::now();
-            unpack_npu_output_fp16(out_buf->as<uint16_t>(), mlp_out.data(), T, kHidden);
+            unpack_npu_output(out_buf, mlp_out.data(), T, kHidden, no.mlp_scale);
             rms_norm_f32(mlp_out.data(), cw.post_ffn_norm, mlp_out.data(), T, kHidden);
             for (int i = 0; i < T * kHidden; ++i) h[i] = h_mid[i] + mlp_out[i];
             auto tn7 = std::chrono::steady_clock::now();
@@ -827,9 +1281,12 @@ public:
             debug_emb_norm->assign(h_final, h_final + kHidden);
         }
 
-        // Broadcast normalized [1, 2048] FP16 vector to both Die 0 and Die 1 activation buffers
-        pack_npu_input_fp16(h_final, m_act_t1[0]->as<uint16_t>(), 1, kHidden);
-        std::memcpy(m_act_t1[1]->data(), m_act_t1[0]->data(), kHidden * sizeof(uint16_t));
+        // Broadcast normalized [1, 2048] vector (FP16 or INT8) to both Die 0 and Die 1 activation buffers
+        const SubgraphScaleInfo &lm_in_sc = m_die_models[0].lm_head_scale[0];
+        float lm_tok_ratio[1] = {1.0f};
+        pack_npu_input(h_final, m_act_t1[0].get(), 1, kHidden, lm_in_sc, lm_tok_ratio);
+        size_t lm_copy_bytes = static_cast<size_t>(kHidden) * dtype_elem_size(lm_in_sc.in_dtype);
+        std::memcpy(m_act_t1[1]->data(), m_act_t1[0]->data(), lm_copy_bytes);
         m_act_t1[0]->flush_cache();
         m_act_t1[1]->flush_cache();
         auto tfn1 = std::chrono::steady_clock::now();
@@ -843,19 +1300,22 @@ public:
             uint16_t phys_die = (logical_die < m_num_dies) ? logical_die : 0;
             DmaBuffer *in_b = m_act_t1[logical_die].get();
             for (int s = 0; s < 4; ++s) {
+                const LoadedArchetype   &lm_arch = m_die_models[logical_die].lm_head[s];
+                const SubgraphScaleInfo &lm_sc   = m_die_models[logical_die].lm_head_scale[s];
                 DmaBuffer *out_b = m_lm_out[logical_die][s].get();
-                if (!m_pool.submit_task(phys_die, m_die_models[logical_die].lm_head[s],
-                        {DmaBufferSlice{in_b, 0, 4096}},
-                        {DmaBufferSlice{out_b, 0, 32000}})) {
+                size_t in_raw   = static_cast<size_t>(kHidden) * dtype_elem_size(lm_sc.in_dtype);
+                size_t out_raw  = static_cast<size_t>(16000)   * dtype_elem_size(lm_sc.out_dtype);
+                size_t in_surf  = std::min(in_b->size(),  std::max(lm_arch.in_surface_bytes,  in_raw));
+                size_t out_surf = std::min(out_b->size(), std::max(lm_arch.out_surface_bytes, out_raw));
+                if (!m_pool.submit_task(phys_die, lm_arch.id,
+                        {DmaBufferSlice{in_b, 0, in_surf}},
+                        {DmaBufferSlice{out_b, 0, out_surf}})) {
                     ok_flag = false;
                     return;
                 }
                 out_b->flush_cache();
-                const uint16_t *src_fp16 = out_b->as<uint16_t>();
                 float *dst_fp32 = m_logits.data() + (static_cast<size_t>(logical_die) * 64000 + s * 16000);
-                for (int i = 0; i < 16000; ++i) {
-                    dst_fp32[i] = fp16_to_fp32(src_fp16[i]);
-                }
+                unpack_npu_output(out_b, dst_fp32, 1, 16000, lm_sc, lm_tok_ratio);
             }
         };
 
@@ -899,6 +1359,11 @@ public:
             idx++;
         }
         return true;
+    }
+
+    void set_quant_options(bool force_int8, bool use_shared_archetype_scales) {
+        m_force_int8 = force_int8;
+        m_use_shared_archetype_scales = use_shared_archetype_scales;
     }
 
     const std::vector<float>& logits() const { return m_logits; }
@@ -1622,10 +2087,106 @@ private:
         return true;
     }
 
+    bool load_quant_scales() {
+        std::string manifest_path = m_pkg_dir + "/manifest.json";
+        bool manifest_is_quant = m_force_int8;
+        if (file_exists(manifest_path)) {
+            std::ifstream mf(manifest_path);
+            std::stringstream mss;
+            mss << mf.rdbuf();
+            std::string merr;
+            JsonValue mroot = JsonValue::parse(mss.str(), merr);
+            if (merr.empty() && mroot.is_object() && mroot.has("precision")) {
+                std::string prec = mroot["precision"].as_string("fp16");
+                if (prec == "int8" || prec == "int16" || prec == "mixed") {
+                    manifest_is_quant = true;
+                }
+            }
+        }
+
+        std::string qs_path = m_pkg_dir + "/quant_scales.json";
+        if (!manifest_is_quant || !file_exists(qs_path)) {
+            std::printf("[+] Boundary precision: FP16 (manifest_is_quant=%d)\n",
+                        manifest_is_quant ? 1 : 0);
+            return true;
+        }
+
+        std::ifstream jf(qs_path);
+        if (!jf.is_open()) {
+            std::printf("FAIL: cannot open %s\n", qs_path.c_str());
+            return false;
+        }
+        std::stringstream ss;
+        ss << jf.rdbuf();
+        std::string err;
+        JsonValue root = JsonValue::parse(ss.str(), err);
+        if (!err.empty() || !root.is_object() || !root.has("subgraphs")) {
+            std::printf("FAIL: invalid quant_scales.json (%s): %s\n", qs_path.c_str(), err.c_str());
+            return false;
+        }
+
+        const JsonValue &subs  = root["subgraphs"];
+        const JsonValue &archs = root["archetype_shared"];
+        bool use_shared = m_use_shared_archetype_scales && archs.is_object();
+
+        auto parse_entry = [](const JsonValue &v, SubgraphScaleInfo &out) -> bool {
+            if (!v.is_object()) return false;
+            out.in_dtype   = parse_boundary_dtype(v["input_dtype"].as_string("fp16"));
+            out.out_dtype  = parse_boundary_dtype(v["output_dtype"].as_string("fp16"));
+            out.in_thresh  = static_cast<float>(v["input_threshold"].as_double(1.0));
+            out.in_step    = static_cast<float>(v["input_step"].as_double(1.0 / 127.0));
+            out.out_thresh = static_cast<float>(v["output_threshold"].as_double(1.0));
+            out.out_step   = static_cast<float>(v["output_step"].as_double(1.0 / 127.0));
+            return (std::fabs(out.in_thresh - 1.0f) > 1e-5f);
+        };
+
+        for (int l = 0; l < kNumLayers; ++l) {
+            char pfx[32];
+            std::snprintf(pfx, sizeof(pfx), "lfm3_l%02d_", l);
+            std::string s_pfx(pfx);
+            bool is_conv = (kLayerSchedule[l] == Lfm3LayerType::Conv);
+
+            std::string k_in  = s_pfx + (is_conv ? "conv_in"  : "attn_qkv");
+            std::string k_out = s_pfx + (is_conv ? "conv_out" : "attn_out");
+            std::string k_mlp = s_pfx + "mlp";
+
+            const JsonValue &v_in  = use_shared ? archs[is_conv ? "conv_in" : "attn_qkv"] : subs[k_in];
+            const JsonValue &v_out = use_shared ? archs["proj2048"]                       : subs[k_out];
+            const JsonValue &v_mlp = use_shared ? archs["mlp"]                            : subs[k_mlp];
+
+            if (!parse_entry(v_in,  m_layer_npu[l].op_in_scale) ||
+                !parse_entry(v_out, m_layer_npu[l].op_out_scale) ||
+                !parse_entry(v_mlp, m_layer_npu[l].mlp_scale)) {
+                std::printf("FAIL: invalid or 1.0-fallback scale entry at layer %d in %s\n",
+                            l, qs_path.c_str());
+                return false;
+            }
+        }
+
+        for (uint16_t d = 0; d < 2; ++d) {
+            for (int s = 0; s < 4; ++s) {
+                char key[64];
+                std::snprintf(key, sizeof(key), "lfm3_lm_head_d%u_s%d", d, s);
+                if (!parse_entry(subs[key], m_die_models[d].lm_head_scale[s])) {
+                    std::printf("FAIL: missing/invalid scale for %s in %s\n", key, qs_path.c_str());
+                    return false;
+                }
+            }
+        }
+
+        std::printf("[+] Loaded quant_scales.json (%s scales, MLP out=%s, LMHead=%s)\n",
+                    use_shared ? "archetype_shared" : "per-subgraph",
+                    (m_layer_npu[0].mlp_scale.out_dtype == BoundaryDtype::Int16) ? "int16" : "int8",
+                    (m_die_models[0].lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? "int8" : "fp16");
+        return true;
+    }
+
     std::string m_pkg_dir;
     int m_max_ctx = 4096;
     int m_pos = 0;
     uint16_t m_num_dies = 1;
+    bool m_force_int8 = false;
+    bool m_use_shared_archetype_scales = true;
 
     WorkerPool m_pool;
     EmbeddingTable m_embedding;
@@ -1714,6 +2275,8 @@ int main(int argc, char **argv) {
     float repeat_penalty = 1.1f;
     bool enable_thinking = true;
     bool bench_attn = false;
+    bool force_int8 = false;
+    bool use_shared_archetype_scales = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1735,15 +2298,19 @@ int main(int argc, char **argv) {
         else if (a == "--repeat-penalty") repeat_penalty = std::stof(next_arg());
         else if (a == "--no-think") enable_thinking = false;
         else if (a == "--bench-attn") bench_attn = true;
+        else if (a == "--int8") force_int8 = true;
+        else if (a == "--per-subgraph-scales") use_shared_archetype_scales = false;
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--prompt TEXT] [--max-tokens N] [--temp F] [--top-k K] [--no-think]\n",
+                        "          [--int8] [--per-subgraph-scales] [--prompt TEXT] [--max-tokens N]\n"
+                        "          [--temp F] [--top-k K] [--no-think]\n",
                         argv[0]);
             return 0;
         }
     }
 
     Lfm3Engine engine;
+    engine.set_quant_options(force_int8, use_shared_archetype_scales);
     if (bench_attn && verify_golden_path.empty() && prompt.empty()) {
         engine.benchmark_global_attention_kernel();
         return 0;

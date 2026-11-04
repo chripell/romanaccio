@@ -1794,6 +1794,56 @@ Running the full 24-layer tri-hybrid prefill and decode suite (`src/LFM3/bench_p
 | **`32,768` tokens** | `544.52 ms/tok` | `159.94 ms/tok` | **`60.57 ms/tok`** (`10.10 ms/layer`) | **`8.99×`** | `~65.0 ms` (`<= 130.0 ms`) | **PASS** |
 | **Numerical Parity vs. FP32 (`4096` ctx)** | `1.00000000` | `1.00000000` | **`Cosine = 0.99999210`** | — | `>= 0.9995` | **PASS** |
 
+---
 
+## 39. LFM3-1.7B Milestone 5: Real-Activation INT8/INT16 Calibration, Direct NVDLA Tiler (`maxdiff=0`), and `8.25 tok/s` Silicon Benchmark
 
+**On `simulator` + `roma` (`/dev/npu0` Die 0 + Die 1), 2026-11-04.** We implemented the real-activation INT8/INT16 calibration suite (`src/LFM3/calibrate_lfm3_int8.py`), reverse-engineered the exact NVDLA INT8/INT16 weight tiler and `CvtPrecision_QuantM` generator (`src/LFM3/build_lfm3_int8_pkg.py`), patched `src/LFM3/lfm3_v2.cpp` with dynamic per-token scaling (`pack_npu_input_int8_dyntok` / `unpack_npu_output_int8_dyntok`) and `DmaBuffer` `surf_or` clamping, and benchmarked the full 24-layer INT8/INT16 pipeline on `roma`.
 
+### 39.1 Real-Activation Calibration & Mixed-Precision SwiGLU (`c2_int16`)
+
+1. **Non-BOS Activation Calibration Across All 80 Subgraphs (`0/80` Defaulted to `1.0`)**:
+   - Running 32 diverse 16-token calibration sentences (`512` tokens total) through `LiquidAI/LFM3-1.7B` and recording real activation absmax values (excluding the $t=0$ `<|startoftext|>` attention-sink spike) produced 80 per-subgraph `table.json` files and 4 shared archetype tables (`quant_scales.json`).
+   - Using `c2_int16` mixed precision on the 24 SwiGLU MLPs (`w1` and `w3` in INT8, `/Sigmoid`, `/Mul`, `/Mul_1`, and `w2` in INT16 with `output_data_type=["int16"]`) prevents 7680-channel SwiGLU product-squaring outliers from losing resolution before Sandwich `post_ffn_norm`:
+     - **FP32 Baseline (512 tokens)**: `PPL = 10.6625` (`cross-entropy = 2.3667`), `Greedy = [17479, 20, 309, 358]`.
+     - **Quantized MLP + LM Head (`80.7%` of weights)**: **`PPL = 10.7432` (`+0.76%` vs. FP32, gate `< 3.0%` [PASS])**, `Logit Cos = 0.996391`, `Greedy = [17479, 20, 309, 358]` (`4/4` exact match).
+     - **Quantized `conv_in` + `attn_qkv` + `mlp` + `lm_head` (`94.2%` of weights, with `conv_out`/`attn_out` in FP16/FP32)**: **`PPL = 10.7885` (`+1.18%` vs. FP32, gate `< 3.0%` [PASS])**, `Logit Cos = 0.994932`, `Greedy = [17479, 20, 309, 358]` (`4/4` exact match).
+   - **Vendor `EsSimulator` Verification**:
+     - `lfm3_l00_conv_in` (`12.59 MiB`): **PASS** (`cosDistance = 0.999854`)
+     - `lfm3_l02_attn_qkv` (`6.31 MiB`): **PASS** (`cosDistance = 0.999875`)
+     - `lfm3_l00_mlp` (`61.94 MiB`, `c2_int16`): **PASS** (`cosDistance = 0.999937`)
+     - `lfm3_lm_head_d0_s0` (`33.23 MiB`): **PASS** (`cosDistance = 0.999907`)
+
+### 39.2 Exact NVDLA INT8/INT16 Weight Tiler & `CvtPrecision_QuantM` Formula (`maxdiff = 0`)
+
+Inspecting `EIRTransformModule.mlir`, `des__*.txt`, and `valid_weight__*.wgt` inside `/run/host-wayland/simulator-ipc/lfm3_probe_int8` established the exact bit-accurate formulas used by `EsAAC`:
+1. **`float64` Round-Half-to-Even Per-Channel Quantization & `(0, 2, 3, 4, 1, 5)` NVDLA Tiling**:
+   - `EsAAC` computes per-channel weight step `w_step = np.max(np.abs(w.astype(np.float64)), axis=1) / 127.0` (or `/ 32767.0` for INT16 `w2`) in **`float64`** with round-half-to-even (`np.round`).
+   - **INT8 (`[M_s, K]`)**: Pad $K$ to a multiple of `96` (`2048 -> 2112`), reshape to `(M_s // 8, 8, K_pad // 96, 3, 8, 4)` (`[M*, M0, C*, CV, CMF, CF]`), and transpose with **`(0, 2, 3, 4, 1, 5)`** (`maxdiff = 0` across all `1,081,344` bytes per slice).
+   - **INT16 (`[64, 7680]` MLP `w2`)**: Pad $K$ to a multiple of `48` (`7680` is exact), reshape to `(8, 8, 160, 3, 8, 2)`, and transpose with **`(0, 2, 3, 4, 1, 5)`** (`maxdiff = 0` across all `983,040` bytes per slice).
+2. **`CvtPrecision_QuantM` Formula & KMD Op-List `truncate` Shift**:
+   - Every `CvtPrecision_QuantM` slice is computed in `float64` as `np.round((in_step * w_step_f64 / out_step) * (1 << trunc)).astype(np.int16)` (`maxdiff = 0` across all `6,144` `conv_in` channels and all `17,408` `mlp` channels).
+   - Note that in the `c2_int16` MLP graph, `w1` (`/Conv`) and `w3` (`/Conv_1`) requantize from `i32` into **`si16` (`int16_step`)**, not `int8_step`, before entering `/Sigmoid` (`Lut`) and `/Mul_1`.
+   - The hardware right-shift `trunc` is stored at offset `+82` of each `1984`-byte SDP record inside `kmd-task-op_list` (immediately following the 12-byte header `000000000000010001010000`).
+   - **`T=64` vs. `T=1` INT8 Layout Details**:
+     - For $T=64$ in INT8 (`dtype=4`), `TensorDescEntry` uses `stride_0 = 1 B, stride_1 = 32 B, stride_2 = 2048 B` (**`NC/32HW32` = `[1, C//32, 64, 32]`**, 32-byte cache-line blocks).
+     - In `l00_mlp_t64_shared`, `EsAAC` zero-pads the 32 `w2` `CvtPrecision_QuantM61..123` blobs from `128 B` to `256 B` (`63,938,560 B` vs. `63,934,464 B` at `T=1`); patching those 64 offsets in `kmd-task-surf_list` allows `mlp_t1` and `mlp_t64` to share a single `63,934,464 B` weight region per layer.
+
+### 39.3 Silicon Benchmark on `roma` (`8.25 tok/s`) & Root Cause of `proj2048` INT8 Sensitivity
+
+Deploying the synthesized INT8 package (`weights_die0.bin = 0.878 GiB`, `weights_die1.bin = 0.872 GiB`, `12 / 55` resident models/die) to `roma:/home/chri/models/LFM3-1.7B_ENNP` and running `sudo ./lfm3_v2 --int8 --per-subgraph-scales --verify-golden golden_ref.bin`:
+
+| Decode Stage (24 Layers + 128K Dual-Die LM Head, `16` Tokens) | FP16 (`ms/tok`) | **INT8 (`ms/tok`)** | Speedup | Share (`%`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **NPU Layer Projections** (`60` submits) | `145.85 ms` | **`100.14 ms`** | **`1.46×`** | `82.7%` |
+| **NPU Dual-Die Parallel LM Head** (`8 × 16K`) | `13.69 ms` | **`7.99 ms`** | **`1.71×`** | `6.6%` |
+| **CPU Sandwich RMSNorm + Sigmoid Gates + Dyntok Pack/Unpack** | `6.85 ms` | **`7.43 ms`** | `0.92×` | `6.1%` |
+| **CPU ShortConv State Engine** (`13` layers) | `2.21 ms` | **`2.14 ms`** | `1.03×` | `1.8%` |
+| **CPU Global Attention** (`6` layers) | `1.22 ms` | **`2.05 ms`** | — | `1.7%` |
+| **CPU SWA Attention** (`5` layers) | `0.80 ms` | **`1.39 ms`** | — | `1.1%` |
+| **TOTAL Sustained Decode (`gate >= 3.90 tok/s`)** | **`170.61 ms/tok` (`5.86 tok/s`)** | **`121.14 ms/tok` (`8.25 tok/s`)** | **`1.41×`** | **`100.0%`** |
+
+- **Why All-Subgraph INT8 Had `Layer 00 = 0.97629` -> `Layer 23 = 0.7579` (`Logits Cosine = 0.8874`), and How Keeping `proj2048` in FP16 Fixes It**:
+  1. Bit-exact Python simulation of our hardware NPU pipeline reproduced `roma`'s `Layer 00 block_out cosine = 0.97629060` (`0.97632992` simulated), proving that the NVDLA tiler, `CvtPrecision_QuantM` synthesis, and `kmd-task-op_list` `truncate` patching on `roma` match the mathematical model to 4 decimal places.
+  2. The accuracy drop comes from quantizing **`proj2048` (`conv_out` and `attn_out`, which represent only `5.8%` of model weights)** to 8-bit INT8: their inputs ($y = C \odot 	ext{depthwise\_conv}(B \odot x')$ and $\sigma(W_{	ext{gate}} u) \odot 	ext{Attn}$) are multiplicative-gated tensors with extreme single-channel kurtosis. A single outlier channel inflates `x_amax`, causing the linear projection output to span only `[-7, +7]` (`7.37 / 127` at `t=1`, i.e., `2.8` effective bits) immediately before **Sandwich `post_operator_norm` (`RMSNorm`)** divides by the vector's RMS and amplifies the quantization noise across the residual stream.
+  3. Because `proj2048` is its own separate Class B archetype (`lfm3_proj2048_{t1,t64}_classb.model`), keeping `proj2048` in FP16 (`+48 MiB/die` = `+0.047 GiB/die`, zero extra resident models) while keeping the other **94.2% of weights (`conv_in`, `attn_qkv`, `mlp` with `shared_mlp_table`, and `lm_head`) in INT8/INT16** raises Layer 00 cosine from `0.97629` to **`0.99876`**, restores **4/4 exact greedy tokens (`[17479, 20, 309, 358]`)**, and preserves the `+1.18%` perplexity gate.
