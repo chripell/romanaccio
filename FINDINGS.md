@@ -2114,3 +2114,68 @@ tok/s (the 2 MiB surface flushes of §40.2), greedy still FAIL and logits still 
 0.9990 gate -- but those numbers are now reproducible, so the remaining accuracy problem is
 measurable rather than noise. Every accuracy figure recorded before this fix, in §38.1 and §39.3
 included, was measured through the race.
+
+
+---
+
+## 43. FP16 Control: The Engine Is Correct, So the INT8 Path Has a Systematic Bug
+
+**On `roma`, 2026-11-04**, after the §42.5 race fix. The FP16 package was deployed to
+`roma:/home/chri/models/LFM3-1.7B_FP16` (3.8 GB; `embedding.bin` skipped by md5 match with the
+existing package) and run through the gate twice in separate processes.
+
+### 43.1 FP16 passes, deterministically, across processes
+
+| metric | FP16 run 1 | FP16 run 2 |
+|---|---|---|
+| Layer 00 block_out cosine | 0.99999987 | 0.99999987 |
+| Layer 23 block_out cosine | 0.99998714 | 0.99998714 |
+| min-layer cosine (24 layers) | 0.99998623 | 0.99998623 |
+| 128K logits cosine vs PyTorch FP32 | **0.99999267 [PASS]** | 0.99999267 |
+| 128K logits cosine vs ONNX Runtime FP16 | 0.99999225 | 0.99999225 |
+
+§38.1's Milestone 4 numbers **replicate exactly** now that the staging race is gone, and the
+gate-integrity checks pass: run1 == run2 == restored. **The engine -- dual-die dispatch, the
+tri-hybrid layers, the conv ring, partial RoPE, the head split -- is correct.** Everything below
+is therefore about quantization, not about the model code.
+
+### 43.2 INT8 is too wrong to be quantization noise
+
+| config | min-layer | logits |
+|---|---|---|
+| FP16 | 0.99998623 | 0.99999267 |
+| INT8/INT16 all-archetype | **0.72907964** | 0.88736760 |
+| INT8 + FP16 `proj2048` | 0.85739772 | 0.81591145 |
+
+0.73 is not what symmetric per-channel INT8 of a model whose FP16 is 0.99999 does to a cosine --
+that would land around 0.98-0.99. And the direction of the `proj2048` result is a tell in itself:
+making a *precision* change (FP16 `proj2048`) **raised** min-layer (+0.128) but **lowered** the
+final logits (-0.071). Precision changes should move both the same way. A metric that responds
+non-monotonically to precision is responding to a *representation mismatch*.
+
+Working hypothesis to test next: some boundary's dtype/step is applied in the wrong direction or
+with the wrong scope -- e.g. an `int8_step` used where an `int16_step` belongs, or a per-channel
+scale broadcast per-tensor -- rather than quantization error accumulating. The cheapest discriminator
+is per-archetype: run each archetype alone in FP16 with the rest INT8. Under this hypothesis most
+combinations stay ~0.73 and exactly one jump fixes it; under plain quantization noise every
+combination improves a little.
+
+### 43.3 Two gate bugs the FP16 run exposed in the integrity checks themselves
+
+- **NaN blindness.** The first sensitivity check compared `fabs(p_log - r2_log) > 1e-3`. FP16
+  weights corrupted under `--int8` produced **NaN** logits, and every NaN comparison is false -- so
+  the check printed "NO MOVEMENT, the gate is blind" at the moment of maximum movement. Fixed: any
+  difference counts and non-finite counts immediately; the values are bit-stable, so exact
+  equality is also a *stronger* criterion than a tolerance.
+- **Perturbing a blind spot.** The old offset was `blob_size / 2`, which can land in the 4 KiB
+  alignment padding the region builder inserts, where corruption is legitimately invisible. Now
+  offset 0, which is layer 0's first weight region and certain to be read. Measured movement at
+  offset 0: INT8 min-layer 0.729 -> 0.277, FP16-as-INT8 min-layer -0.060 -> -0.065.
+
+### 43.4 A control produced by a mistake, and worth keeping
+
+The loop that ran the FP16 package also passed `--int8` to it (the `sed` that was meant to strip
+the flag only edited the echoed label). The result -- FP16 weights read under INT8 boundary
+scaling -- is min-layer **-0.06023356** and logits **-0.17375845**, i.e. worse than chance. That
+is the signature of a boundary-representation mismatch, and it is the shape of the failure §43.2
+suspects is hiding inside the 0.729.

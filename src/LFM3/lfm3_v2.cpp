@@ -2772,18 +2772,26 @@ int main(int argc, char **argv) {
                     deterministic ? "identical" : "DIFFERS on identical weights and input");
         if (!deterministic) gate_ok = false;
 
+        // Perturb from offset 0 -- layer 0's first weight region -- because it is certain to be
+        // read. Mid-blob offsets can land in the 4 KiB alignment padding the region builder
+        // inserts, where corruption is legitimately invisible.
         const size_t span = 1u << 20;
-        const size_t off = (engine.weight_blob_bytes(0) / 2) & ~static_cast<size_t>(4095);
+        const size_t off = 0;
         double p_min = 0.0, p_log = 0.0;
         std::vector<float> p_layers, p_emb;
         if (engine.perturb_weights(0, off, span, 0xFF) &&
             prefill_metrics(p_min, p_log, p_layers, p_emb)) {
-            const bool sensitive = std::fabs(p_min - r2_min) > 1e-3 ||
-                                   std::fabs(p_log - r2_log) > 1e-3;
+            // Any difference counts, and a non-finite metric counts loudest. Comparing with a
+            // fixed epsilon is not merely weaker, it is wrong here: std::fabs(NaN) > 1e-3 is
+            // false, so the first version of this check called NaN logits "no movement" --
+            // blind at the moment of maximum sensitivity. The values are bit-stable, so exact
+            // equality is also a strictly stronger criterion than a tolerance.
+            const bool sensitive = !std::isfinite(p_min) || !std::isfinite(p_log) ||
+                                   p_min != r2_min || p_log != r2_log;
             std::printf("  • SENSITIVITY  XOR 0xFF over %zu B at %zu: min-layer %.8f (%+.3e), "
                         "logits %.8f (%+.3e) -> %s\n",
                         span, off, p_min, p_min - r2_min, p_log, p_log - r2_log,
-                        sensitive ? "metrics moved" : "NO MOVEMENT, the gate is blind");
+                        sensitive ? "metrics moved" : "NO MOVEMENT at all, the gate is blind");
             if (!sensitive) gate_ok = false;
         } else {
             std::printf("  • SENSITIVITY  skipped: perturbation or prefill failed\n");
