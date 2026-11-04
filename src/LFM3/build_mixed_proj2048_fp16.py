@@ -140,8 +140,35 @@ def main() -> int:
     manifest = json.loads((args.out / "manifest.json").read_text())
     manifest["precision"] = "int8"
     manifest["precision_note"] = ("mixed: conv_in/attn_qkv/mlp/lm_head INT8+INT16, "
-                                  "proj2048 (conv_out, attn_out) FP16 -- FINDINGS 39.3")
+                                  "proj2048 (conv_out, attn_out) FP16 -- FINDINGS 39.3/41.2")
+    manifest["proj2048_precision"] = "fp16"
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    # A package directory that looks complete but cannot run is how this script's first deploy
+    # failed: the INT8 source carries no embedding.bin, and tokenizer.json / golden_ref.bin live
+    # outside every package. Gather what exists, then say plainly what does not, rather than
+    # letting it surface as a board-side error two gigabytes into a transfer.
+    runtime_files = {
+        "embedding.bin": [PKG_FP16 / "embedding.bin"],
+        "tokenizer.json": [MODEL_DIR / "tokenizer.json", PKG_FP16 / "tokenizer.json"],
+        "golden_ref.bin": [PKG_FP16 / "golden_ref.bin", PKG_INT8 / "golden_ref.bin"],
+        "cpu_weights.bin": [PKG_INT8 / "cpu_weights.bin"],
+    }
+    missing = []
+    for name, candidates in runtime_files.items():
+        dst = args.out / name
+        if dst.exists() or dst.is_symlink():
+            continue
+        src = next((c for c in candidates if c.is_file()), None)
+        if src is None:
+            missing.append(name)
+            continue
+        shutil.copy2(src, dst)
+        print(f"[+] Gathered {name} from {src.parent.name}/ ({dst.stat().st_size:,} B)")
+    if missing:
+        print(f"[!] NOT RUNNABLE YET -- absent from every candidate location: {missing}")
+        print("    golden_ref.bin comes from inspect_and_golden.py and currently exists only on")
+        print("    the board; copy it in before deploying or the accuracy gate cannot run.")
 
     total = sum(int(v["weight_size"]) for v in new_map.values())
     print(f"[+] Wrote {args.out} ({total:,} B of weight regions across both dies)")
