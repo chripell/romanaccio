@@ -1921,3 +1921,80 @@ artifact. §39.3 reports `Layer 00 = 0.99876` and `4/4 exact` for the same comma
 deployed package predates the proj2048-in-FP16 fix, or that fix lives in a flag/package
 combination the repo does not record. Until the passing configuration is captured in
 `manifest.json` and re-measured, treat Milestone 5 as **not accepted**.
+
+
+---
+
+## 41. The Reported Output Size Is a 2 MiB Bucket, and the Golden Gate Is Not Sensitive to the Package
+
+**On `roma`, 2026-11-04**, follow-ups A (recover Milestone 5's passing configuration) and
+B (why `output_sizes[0]` reports 2 MiB for a 6 KiB tensor).
+
+### 41.1 B answered: the driver reports a 2 MiB bucket for any output over 4 KiB
+
+`LFM3_DUMP_SURFACES=1` prints every slot `ModelInfo` reports:
+
+| archetype | in (bytes) | out (bytes) | true output tensor |
+|---|---|---|---|
+| `conv_in_t1` (INT8) | `2048, 12988416` | **`2097152`** | 6144 int8 |
+| `proj2048_t1` (FP16) | `2048, 4329472` | `4096` | 2048 fp16 = 4096 |
+| `attn_qkv_t1` (INT8) | `2048, 6496256` | `4096` | 2048 int8, page-padded |
+| `mlp_t1` (INT8/INT16) | `2048, 63934464` | `4096` | 2048 int16 = 4096 |
+| all four `*_t64` | `131072, …` | **`2097152`** | 131072–393216 |
+| `lm_head_d*_s*` | `2048` | **`2097152`** | 16000 int8 |
+
+`input_sizes[1]` is the **weight** entry and matches the loadable's `memory_list` exactly
+(`conv_in` id=1 size 12,988,416; `ModelReader` dump), so the query is reading real entries --
+but `output_sizes[0]` is the true page-padded tensor only when that tensor is `<= 4096` bytes.
+Above that it returns a fixed **2 MiB**, the same size as the per-model `/dmabuf:npu`
+command-stream mapping (§34.2). Consequences:
+
+- `output_sizes[0]` must **never** be used to size a tensor buffer or a descriptor. The tensor
+  size is known analytically (`T x C x elemsize`, page-padded); take it from there.
+- It also explains §40.2: the loadable's declared output allocation for these models is 2 MiB,
+  so a 32 KiB DMA buffer is smaller than what the hardware may write, and the resulting
+  neighbour corruption is what made the clamped build nondeterministic. The allocation has to
+  cover the declared entry even though the descriptor may be smaller.
+- Therefore the ~46 ms/token flush cost in §40.2 is **not** recoverable by shrinking buffers.
+  `DmaBuffer::flush_cache()` takes only an fd, so it maintains the whole 2 MiB; recovering it
+  needs ranged cache maintenance (a length-capable `ES_SYS_*` entry point) or `NoCache` output
+  buffers. That is now the single largest decode win available (~1.6x).
+
+### 41.2 A: the mixed-precision package did not reproduce §39.3, and the gate did not move
+
+`build_mixed_proj2048_fp16.py` derives a package from the deployed INT8 one changing exactly one
+variable -- `proj2048` (13 `conv_out` + 11 `attn_out`) becomes the FP16 archetype (147,352 B vs
+84,520 B), FP16 weight regions (+49.5 MB/die), and `input_dtype/output_dtype = fp16` for those 24
+subgraphs. Confirmed loaded: the FP16 `proj2048_t1` reports `out=4096` where the INT8 one
+reported `2097152`.
+
+| package | Layer 00 cos | min-layer cos | logits cos | greedy | driver ms/tok | decode |
+|---|---|---|---|---|---|---|
+| all-INT8 (deployed) | 0.97629060 | 0.72907964 | 0.88736760 | FAIL | 80.56 | 8.5 tok/s |
+| mixed, proj2048 FP16 | **0.97629060** | **0.72907964** | **0.88736760** | FAIL | **93.97** | 5.4 tok/s |
+
+Two facts that cannot both be innocuous:
+
+1. **The NPU really did read different weights** -- driver time rose 80.6 -> 94.0 ms/token, which
+   is what doubling the proj2048 regions costs. The swap took effect.
+2. **Every accuracy figure is identical to eight decimal places** across the two packages, and
+   each package is reproducible run to run. `Layer 00 block_out` is computed *through* `conv_out`,
+   the very subgraph that changed.
+
+An accuracy metric that does not move when the weights it measures are replaced is not measuring
+them. So the `--verify-golden` comparison is insensitive to the package -- plausibly comparing
+against a stale or uninitialized buffer, or reading a golden that does not correspond to this
+engine build. **Until that is fixed, no accuracy claim in §38.1 or §39.3 can be trusted in either
+direction**, including the ones that passed: 0.99998714 layer-23 cosine and 4/4 greedy tokens were
+produced by the same comparison machinery.
+
+This also retires the "Milestone 5 needs the FP16 proj2048 fix" hypothesis as untested rather than
+confirmed: §39.3's `0.97629 -> 0.99876` improvement is not reproducible from the deployed package,
+and the mixed package that should produce it does not move the number at all.
+
+### 41.3 Corrected decode accounting
+
+With entry-sized buffers the honest INT8 numbers are: driver 94.0 ms/token (mixed) or 80.6
+(all-INT8), master 180 ms/token, i.e. **5.4-6.2 tok/s**, not the 8.25 tok/s in §39.3 -- the
+difference is cache maintenance over 2 MiB output surfaces (86 ms/token of it). §39.3's 8.25 was
+measured with 32 KiB buffers, i.e. under the MMZ corruption of §40.2.

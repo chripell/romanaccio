@@ -984,6 +984,22 @@ public:
                 out_arch.id = info.model_id;
                 out_arch.in_surface_bytes  = info.input_sizes[0];
                 out_arch.out_surface_bytes = info.output_sizes[0];
+                // The INT8 conv_in loadable declares its Class B output as a 6,144-byte tensor
+                // entry (memory id 5, flags 9), yet output_sizes[0] reports 2 MiB -- the size of
+                // the driver's fixed command-stream dmabuf (FINDINGS 34.2), not a tensor. Dump
+                // every reported slot so the real tensor index can be identified rather than
+                // guessed; buffer sizing was being driven by the wrong number.
+                if (std::getenv("LFM3_DUMP_SURFACES")) {
+                    std::printf("      %-40s in=%u [", rel.c_str(), info.num_inputs);
+                    for (unsigned i = 0; i < info.num_inputs && i < 10; ++i)
+                        std::printf("%s%llu", i ? "," : "",
+                                    (unsigned long long)info.input_sizes[i]);
+                    std::printf("] out=%u [", info.num_outputs);
+                    for (unsigned i = 0; i < info.num_outputs && i < 10; ++i)
+                        std::printf("%s%llu", i ? "," : "",
+                                    (unsigned long long)info.output_sizes[i]);
+                    std::printf("]\n");
+                }
                 // For a static loadable (the LM head slices) the weights stream from the driver's
                 // own copy, so the file size is the right byte count; a Class B archetype reports
                 // the bound region size instead, which the submit sites already know.
