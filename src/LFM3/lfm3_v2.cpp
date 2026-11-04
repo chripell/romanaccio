@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -968,6 +969,22 @@ public:
             }
             m_w_blob[d]->flush_cache();
 
+            // Identify the weights actually loaded. Two packages with different proj2048 weights
+            // produced bit-identical accuracy metrics AND bit-identical corruption deltas
+            // (FINDINGS 41.2), which is impossible unless both runs read the same bytes -- so the
+            // blob's identity has to be printed, not assumed from the working directory.
+            {
+                const uint8_t *bp = static_cast<const uint8_t *>(m_w_blob[d]->data());
+                const size_t n = m_w_blob[d]->size();
+                uint64_t head = 1469598103934665603ULL, tail = 1469598103934665603ULL;
+                const size_t span = std::min<size_t>(65536, n);
+                for (size_t i = 0; i < span; ++i) { head ^= bp[i]; head *= 1099511628211ULL; }
+                for (size_t i = n - span; i < n; ++i) { tail ^= bp[i]; tail *= 1099511628211ULL; }
+                std::printf("[+] Die %u weight blob: %s (%zu B) fnv head=%016llx tail=%016llx\n",
+                            d, w_file.c_str(), n, (unsigned long long)head,
+                            (unsigned long long)tail);
+            }
+
             // Buffers are allocated *after* the archetypes are loaded (see below), because their
             // size has to cover the largest surface the driver reports for those loadables.
             // Preparing them before that would force a descriptor to be clamped to an allocation
@@ -1607,6 +1624,33 @@ public:
     /// Binds every layer of a die to one weight region per archetype. Timing experiment only:
     /// the numbers it prints are for bandwidth attribution, and its generated text is garbage.
     void set_ab_shared_weights(bool on) { m_ab_shared_weights = on; }
+
+    /**
+     * @brief XORs a span of a die's resident weight blob, for the golden-gate integrity tests.
+     *
+     * An accuracy gate that cannot fail is worse than no gate: FINDINGS §41.2 found the metrics
+     * identical to eight decimals across two packages with demonstrably different weights. The
+     * only way to know a gate measures anything is to break the thing it measures and watch the
+     * number move.
+     *
+     * The span has to be large. One byte out of ~470M is a ~1e-7 relative perturbation, which
+     * cannot move a cosine in the eighth decimal -- a one-byte null test passes vacuously and
+     * proves nothing. Corrupt a whole region instead. The blob is already SMMU-prepared, so the
+     * NPU sees the change after the flush; the caller restores it by XORing the same span again.
+     */
+    bool perturb_weights(int die, size_t offset, size_t len, uint8_t xor_mask) {
+        if (die < 0 || die > 1 || !m_w_blob[die]) return false;
+        if (offset >= m_w_blob[die]->size() || len == 0 || offset + len > m_w_blob[die]->size())
+            return false;
+        uint8_t *p = static_cast<uint8_t *>(m_w_blob[die]->data()) + offset;
+        for (size_t i = 0; i < len; ++i) p[i] ^= xor_mask;
+        m_w_blob[die]->flush_cache();
+        return true;
+    }
+
+    size_t weight_blob_bytes(int die) const {
+        return (die >= 0 && die <= 1 && m_w_blob[die]) ? m_w_blob[die]->size() : 0;
+    }
 
     const std::vector<float>& logits() const { return m_logits; }
     float* logits_mut() { return m_logits.data(); }
@@ -2499,14 +2543,28 @@ int main(int argc, char **argv) {
     init_fp16_lut();
     omp_set_num_threads(8);
 
-    std::string pkg_dir = "/home/chri/models/LFM3-1.7B_ENNP";
+    // Prefer the directory the binary is run from. Every invocation so far has been
+    // `cd <package> && ./lfm3_v2 ...`, but the default used to be a hardcoded absolute board
+    // path, so running from a *different* package silently loaded the hardcoded one. That is how
+    // the mixed-precision experiment "reproduced" the all-INT8 numbers bit for bit (FINDINGS
+    // 41.4) and nearly got a working accuracy gate condemned as blind. Fail loudly instead.
+    std::string pkg_dir = ".";
     if (!file_exists(pkg_dir + "/cpu_weights.bin")) {
-        if (file_exists("/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/cpu_weights.bin")) {
+        if (file_exists("/home/chri/models/LFM3-1.7B_ENNP/cpu_weights.bin")) {
+            pkg_dir = "/home/chri/models/LFM3-1.7B_ENNP";
+        } else if (file_exists("/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg/cpu_weights.bin")) {
             pkg_dir = "/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg";
         } else {
             pkg_dir = "/tmp/lfm3_pkg";
         }
     }
+    if (!file_exists(pkg_dir + "/cpu_weights.bin")) {
+        std::printf("FAIL: no LFM3 package at '%s' (expected cpu_weights.bin). Pass --model-dir.\n",
+                    pkg_dir.c_str());
+        return 1;
+    }
+    std::printf("[+] Resolved package directory: %s\n",
+                std::filesystem::absolute(pkg_dir).string().c_str());
 
     std::string verify_golden_path;
     std::string prompt;
@@ -2634,6 +2692,94 @@ int main(int argc, char **argv) {
         std::printf("  • 128K Logits Cosine vs PyTorch FP32        : %.8f [gate >= 0.9990: %s]\n",
                     pt_cos, (pt_cos >= 0.9990) ? "PASS" : "FAIL");
         std::printf("  • 128K Logits Cosine vs ONNX Runtime FP16   : %.8f\n", ort_cos);
+
+        // ------------------------------------------------------------------
+        // [1b/3] Gate-integrity tests: determinism, then sensitivity.
+        //
+        // §41.2 found every accuracy figure identical to eight decimals across two packages whose
+        // proj2048 weights genuinely differed (driver time moved 80.6 -> 94.0 ms/token). Before
+        // any number above is believed -- passing or failing -- two properties must hold:
+        //   (1) DETERMINISM: re-running the same prefill in this process reproduces it exactly.
+        //   (2) SENSITIVITY: corrupting a whole weight region moves the metrics.
+        // A gate that fails (1) is measuring noise; one that fails (2) is not measuring the model.
+        // Note (2) needs a *large* perturbation: one byte out of ~470M is a ~1e-7 relative change
+        // and cannot move a cosine in the eighth decimal, so a one-byte null test passes
+        // vacuously -- which is how the first version of this test fooled itself.
+        // ------------------------------------------------------------------
+        auto prefill_metrics = [&](double &min_cos, double &logit_cos,
+                                   std::vector<float> &lay, std::vector<float> &emb) -> bool {
+            engine.reset_state();
+            StageTimers t;
+            lay.assign(24 * 2048, 0.0f);
+            emb.assign(2048, 0.0f);
+            if (!engine.prefill(in_ids, t, &lay, &emb)) return false;
+            min_cos = 1.0;
+            for (int l = 0; l < 24; ++l)
+                min_cos = std::min(min_cos, cosine_similarity(lay.data() + l * 2048,
+                                                              gold_layers.data() + l * 2048, 2048));
+            logit_cos = cosine_similarity(engine.logits().data(), gold_pt_logits.data(), 128000);
+            return true;
+        };
+
+        bool gate_ok = true;
+        std::printf("\n[1b/3] Gate integrity\n");
+
+        double r2_min = 0.0, r2_log = 0.0;
+        std::vector<float> r2_layers, r2_emb;
+        if (!prefill_metrics(r2_min, r2_log, r2_layers, r2_emb)) {
+            std::printf("FAIL: second clean prefill failed\n");
+            return 1;
+        }
+        const bool deterministic = (r2_min == min_layer_cos) && (r2_log == pt_cos);
+        std::printf("  • DETERMINISM  run1: min-layer %.8f logits %.8f | run2: %.8f %.8f -> %s\n",
+                    min_layer_cos, pt_cos, r2_min, r2_log,
+                    deterministic ? "identical" : "DIFFERS on identical weights and input");
+        if (!deterministic) gate_ok = false;
+
+        const size_t span = 1u << 20;
+        const size_t off = (engine.weight_blob_bytes(0) / 2) & ~static_cast<size_t>(4095);
+        double p_min = 0.0, p_log = 0.0;
+        std::vector<float> p_layers, p_emb;
+        if (engine.perturb_weights(0, off, span, 0xFF) &&
+            prefill_metrics(p_min, p_log, p_layers, p_emb)) {
+            const bool sensitive = std::fabs(p_min - r2_min) > 1e-3 ||
+                                   std::fabs(p_log - r2_log) > 1e-3;
+            std::printf("  • SENSITIVITY  XOR 0xFF over %zu B at %zu: min-layer %.8f (%+.3e), "
+                        "logits %.8f (%+.3e) -> %s\n",
+                        span, off, p_min, p_min - r2_min, p_log, p_log - r2_log,
+                        sensitive ? "metrics moved" : "NO MOVEMENT, the gate is blind");
+            if (!sensitive) gate_ok = false;
+        } else {
+            std::printf("  • SENSITIVITY  skipped: perturbation or prefill failed\n");
+            gate_ok = false;
+        }
+
+        double r3_min = 0.0, r3_log = 0.0;
+        std::vector<float> r3_layers, r3_emb;
+        if (!engine.perturb_weights(0, off, span, 0xFF)) {
+            std::printf("FAIL: could not restore the perturbed span\n");
+            return 1;
+        }
+        if (!prefill_metrics(r3_min, r3_log, r3_layers, r3_emb)) {
+            std::printf("FAIL: prefill after restore failed\n");
+            return 1;
+        }
+        const bool restored = (r3_min == r2_min) && (r3_log == r2_log);
+        std::printf("  • RESTORE      min-layer %.8f logits %.8f -> %s\n", r3_min, r3_log,
+                    restored ? "reproduces run 2" : "does NOT reproduce run 2");
+        if (!restored) gate_ok = false;
+        actual_layers = r3_layers;
+        actual_emb_norm = r3_emb;
+        // Continue from the restored run, not from run 1: if the two differ, the number the gate
+        // finally judges should at least be one this process can reproduce.
+        pt_cos = r3_log;
+
+        if (!gate_ok) {
+            std::printf("\nFAIL: the golden gate is not trustworthy (see above). Aborting before "
+                        "the decode test, because a gate that cannot fail will also happily "
+                        "report a pass it did not earn.\n");
+            return 1;
+        }
 
         std::printf("\n[2/3] Running %d-Token Greedy Autoregressive Decode...\n", n_gen);
         std::vector<int32_t> pred_gen;

@@ -1962,6 +1962,10 @@ command-stream mapping (§34.2). Consequences:
 
 ### 41.2 A: the mixed-precision package did not reproduce §39.3, and the gate did not move
 
+> **RETRACTED — see §42.** The two packages were never both run: `lfm3_v2` defaulted to a
+> hardcoded absolute package path, so the "mixed" run loaded the all-INT8 package. The gate is
+> *not* blind (§42.2), and the mixed package *does* change the metrics (§42.3).
+
 `build_mixed_proj2048_fp16.py` derives a package from the deployed INT8 one changing exactly one
 variable -- `proj2048` (13 `conv_out` + 11 `attn_out`) becomes the FP16 archetype (147,352 B vs
 84,520 B), FP16 weight regions (+49.5 MB/die), and `input_dtype/output_dtype = fp16` for those 24
@@ -1998,3 +2002,76 @@ With entry-sized buffers the honest INT8 numbers are: driver 94.0 ms/token (mixe
 (all-INT8), master 180 ms/token, i.e. **5.4-6.2 tok/s**, not the 8.25 tok/s in §39.3 -- the
 difference is cache maintenance over 2 MiB output surfaces (86 ms/token of it). §39.3's 8.25 was
 measured with 32 KiB buffers, i.e. under the MMZ corruption of §40.2.
+
+
+---
+
+## 42. The Golden Gate Is Sound; the Package Path Default Was Not
+
+**On `roma`, 2026-11-04.** §41.2 concluded the accuracy gate was insensitive to the package. That
+conclusion was wrong, and the reason matters more than the conclusion.
+
+### 42.1 Root cause: a hardcoded default package directory
+
+`lfm3_v2` resolved its package as `pkg_dir = "/home/chri/models/LFM3-1.7B_ENNP"` unless
+`--model-dir` was given. Every invocation in this project has been `cd <package> && ./lfm3_v2 ...`,
+which *looks* like it selects the package and does not. Printing the weight blob's path and an FNV
+checksum of its first/last 64 KiB at load time showed both "different" runs loading
+`LFM3-1.7B_ENNP/weights_die0.bin` with identical checksums.
+
+Fixed: the default is now the working directory, the resolved absolute path is printed, and a
+missing `cpu_weights.bin` is a hard error naming the directory that was tried. **Lesson: a
+benchmark that can load the wrong input silently is worse than one that fails, and the fix is to
+print the identity of every input, not to trust `cd`.**
+
+### 42.2 The gate is sensitive; my first null test was too weak to tell
+
+Gate-integrity checks are now built into `--verify-golden` and run before the decode test, which
+aborts if they fail:
+
+- **SENSITIVITY** — XOR `0xFF` over 1 MiB of the resident weight blob: min-layer cosine moves
+  `+3.789e-02`, logits `-1.369e-01`. The gate responds.
+- The first version of this test corrupted **one byte** and "passed" only because a 1-in-470M
+  perturbation cannot move a cosine in the eighth decimal. A null test that cannot fail is not a
+  null test; the perturbation has to be large enough that silence is meaningful.
+- **RESTORE** — XOR the same span back and re-run: reproduces the previous run exactly.
+
+### 42.3 A real bug the integrity check exposed: the first prefill's logits are wrong
+
+`min-layer` cosine is perfectly stable across repeated in-process prefills, but the **logits**
+cosine is not, and the first prefill is always the odd one out:
+
+| package | run 1 logits | run 2 logits | run 3 (after restore) | min-layer (all runs) |
+|---|---|---|---|---|
+| all-INT8 | 0.81665552 | 0.88736760 | 0.88736760 | 0.72907964 |
+| mixed (proj2048 FP16) | 0.75894509 | 0.81591145 | 0.81591145 | 0.85739772 |
+
+Run 1 also varies *between processes* (0.81665552, 0.81665802, 0.79928895 for the same package),
+while run 2 onward is reproducible. Since the 24-layer residual stream is bit-stable, the defect is
+localized to the **LM-head/logits path on its first invocation** — not to the layer stack, and not
+to MMZ corruption (§40.2's buffer fix is separately confirmed by the stable min-layer values).
+Prime suspects, in order: the dual-threaded head sharing one `lm_tok_ratio[1]` array by reference
+across both die threads, and `reset_state()` clearing the conv rings, SWA caches and `m_pos` but
+**not** the global KV or its INT8 scale/sum arrays.
+
+Consequence for the record: §38.1's and §39.3's logits figures came from a first-prefill
+measurement, so they are the *unstable* number. The reproducible values are the run-2 ones above.
+
+### 42.4 The mixed-precision experiment, run for the first time
+
+With the path bug fixed, FP16 `proj2048` (13 `conv_out` + 11 `attn_out`, +49.5 MB/die) against an
+otherwise all-INT8 package:
+
+| metric | all-INT8 | mixed | direction |
+|---|---|---|---|
+| min-layer cosine | 0.72907964 | **0.85739772** | better, confirming §39.3's mechanism |
+| stable logits cosine | **0.88736760** | 0.81591145 | worse |
+| greedy 4/4 | FAIL | FAIL | unchanged |
+| driver ms/token | 80.6 | 94.0 | +17% for the FP16 regions |
+
+So §39.3's diagnosis (per-channel INT8 on `proj2048` amplifies through sandwich RMSNorm) is
+directionally confirmed — intermediate layers improve markedly — but it does **not** deliver the
+claimed end-to-end win: final logits get worse and greedy still fails. Both packages sit far below
+the `>= 0.9990` gate, so the dominant error is elsewhere. The next step is a per-archetype
+ablation (revert one archetype at a time to FP16 and watch min-layer *and* logits) rather than
+another single-variable guess, and it must be done with the run-2 numbers, not run-1.
