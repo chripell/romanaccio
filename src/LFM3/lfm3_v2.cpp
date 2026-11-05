@@ -48,6 +48,10 @@
 #include <omp.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #endif
@@ -439,6 +443,8 @@ struct SubgraphScaleInfo {
     float in_step    = 1.0f / 127.0f;
     float out_thresh = 1.0f;
     float out_step   = 1.0f / 127.0f;
+    const float *in_inv_smooth = nullptr;
+    const float *out_step_chan = nullptr;
 };
 
 static inline BoundaryDtype parse_boundary_dtype(const std::string &s) {
@@ -489,82 +495,77 @@ struct DieModels {
     int resident_count = 0;
 };
 
-// RMSNorm in FP32
+// RMSNorm in FP32 (with 4-way unrolled sum-of-squares accumulator to break FP32 FMA latency chains)
 static void rms_norm_f32(const float *x, const float *w, float *out, int T, int C, float eps = 1e-5f) {
     #pragma omp parallel for if(T > 1) schedule(static)
     for (int t = 0; t < T; ++t) {
         const float *row = x + static_cast<size_t>(t) * C;
         float *orow = out + static_cast<size_t>(t) * C;
-        float sum_sq = 0.0f;
-        for (int c = 0; c < C; ++c) sum_sq += row[c] * row[c];
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int c = 0;
+        for (; c + 3 < C; c += 4) {
+            s0 += row[c + 0] * row[c + 0];
+            s1 += row[c + 1] * row[c + 1];
+            s2 += row[c + 2] * row[c + 2];
+            s3 += row[c + 3] * row[c + 3];
+        }
+        float sum_sq = (s0 + s1) + (s2 + s3);
+        for (; c < C; ++c) sum_sq += row[c] * row[c];
         float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(C) + eps);
-        for (int c = 0; c < C; ++c) orow[c] = row[c] * inv_rms * w[c];
+        #pragma omp simd
+        for (int i = 0; i < C; ++i) orow[i] = row[i] * inv_rms * w[i];
     }
 }
 
-// Pack [T, C] FP32 into NPU FP16/INT8/INT16 input buffer (with L2 staging)
-alignas(64) static uint16_t g_stage_fp16[64 * 6144];
-alignas(64) static int8_t   g_stage_int8[64 * 6144];
-alignas(64) static int16_t  g_stage_int16[64 * 6144];
+// Pack [T, C] FP32 directly into CacheMode::Cached NPU FP16/INT8/INT16 input buffer (and unpack directly
+// from CacheMode::Cached output buffer after flush_cache(), eliminating intermediate staging memcpy and locks).
 
-/**
- * @brief Serializes every use of the g_stage_* buffers above.
- *
- * The dual-die LM head calls unpack_npu_output() from two std::threads, and both staged through
- * the same global buffer -- which is why the first prefill's logits differed from every later one
- * and varied between processes while the 24-layer residual stream stayed bit-stable
- * (FINDINGS 42.3). These buffers cannot be made thread_local: the T=64 unpack path reads them
- * from inside an OpenMP region, whose workers would each see their own zero-filled copy. So the
- * lock goes at the two dispatchers instead. The layer loop is single-threaded, so this is one
- * uncontended lock per call; the head's two threads are the only contenders.
- *
- * The typed pack and unpack leaves are NOT thread-safe; reach them only through
- * pack_npu_input() and unpack_npu_output(), which hold this lock.
- */
-static std::mutex g_stage_mutex;
-
-static void pack_npu_input_fp16(const float *src_tc, uint16_t *dst_npu, int T, int C) {
+static void pack_npu_input_fp16(const float *src_tc, uint16_t *dst_npu, int T, int C, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     if (T == 1) {
         for (int c = 0; c < C; ++c) {
-            g_stage_fp16[c] = fp32_to_fp16(src_tc[c]);
+            dst_npu[c] = fp32_to_fp16(src_tc[c]);
         }
-        std::memcpy(dst_npu, g_stage_fp16, static_cast<size_t>(C) * sizeof(uint16_t));
         return;
     }
     const int c_blocks = C / 16;
     #pragma omp parallel for schedule(static)
     for (int cb = 0; cb < c_blocks; ++cb) {
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < T_valid; ++t) {
             const float *s = src_tc + static_cast<size_t>(t) * C + cb * 16;
-            uint16_t *d = g_stage_fp16 + (static_cast<size_t>(cb) * T + t) * 16;
+            uint16_t *d = dst_npu + (static_cast<size_t>(cb) * T + t) * 16;
             for (int k = 0; k < 16; ++k) {
                 d[k] = fp32_to_fp16(s[k]);
             }
         }
+        if (T_valid < T) {
+            std::memset(dst_npu + (static_cast<size_t>(cb) * T + T_valid) * 16, 0,
+                        static_cast<size_t>(T - T_valid) * 16 * sizeof(uint16_t));
+        }
     }
-    std::memcpy(dst_npu, g_stage_fp16, static_cast<size_t>(T) * C * sizeof(uint16_t));
 }
 
-// Unpack NPU NCHW [1, C_out, T, 1] FP16 output into [T, C_out] FP32
-static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int T, int C_out) {
-    std::memcpy(g_stage_fp16, src_nchw, static_cast<size_t>(T) * C_out * sizeof(uint16_t));
+// Unpack NPU NCHW [1, C_out, T, 1] FP16 output into [T_valid, C_out] FP32
+static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int T, int C_out, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     if (T == 1) {
         for (int c = 0; c < C_out; ++c) {
-            dst_tc[c] = fp16_to_fp32(g_stage_fp16[c]);
+            dst_tc[c] = fp16_to_fp32(src_nchw[c]);
         }
         return;
     }
     #pragma omp parallel for collapse(2) schedule(static)
-    for (int t0 = 0; t0 < T; t0 += 16) {
+    for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
+            const int dt_end = std::min(16, T_valid - t0);
             float tile[16][16];
             for (int dc = 0; dc < 16; ++dc) {
-                const uint16_t *s_row = g_stage_fp16 + static_cast<size_t>(c0 + dc) * T + t0;
-                for (int dt = 0; dt < 16; ++dt) {
+                const uint16_t *s_row = src_nchw + static_cast<size_t>(c0 + dc) * T + t0;
+                for (int dt = 0; dt < dt_end; ++dt) {
                     tile[dt][dc] = fp16_to_fp32(s_row[dt]);
                 }
             }
-            for (int dt = 0; dt < 16; ++dt) {
+            for (int dt = 0; dt < dt_end; ++dt) {
                 std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
             }
         }
@@ -572,306 +573,335 @@ static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int 
 }
 
 // Pack [T, C] FP32 into NPU INT8 input buffer (in_step = threshold / 127.0f, clamped to [-127, 127])
-static void pack_npu_input_int8(const float *src_tc, int8_t *dst_npu, int T, int C, float in_step) {
+// Note: For T > 1, NVDLA INT8 FEATURE surfaces use 32-byte atoms = 32 INT8 channels ([C/32, T, 32],
+// line_stride=32, surf_stride=32*T).
+static void pack_npu_input_int8(const float *src_tc, int8_t *dst_npu, int T, int C, float in_step,
+                                const float *in_inv_smooth = nullptr, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     const float inv_step = (in_step > 1e-12f) ? (1.0f / in_step) : 0.0f;
     if (T == 1) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        float32x4_t v_inv    = vdupq_n_f32(inv_step);
-        int8x16_t   v_min_s8 = vdupq_n_s8(-127);
-        int c = 0;
-        for (; c + 15 < C; c += 16) {
-            vst1q_s8(g_stage_int8 + c, neon_scale_clamp_f32_to_s8x16(src_tc + c, v_inv, v_min_s8));
+        if (in_inv_smooth) {
+            #pragma omp simd
+            for (int c = 0; c < C; ++c) {
+                dst_npu[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * (in_inv_smooth[c] * inv_step), 127.0f));
+            }
+            return;
         }
-        for (; c < C; ++c) {
-            g_stage_int8[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
-        }
-#else
+        #pragma omp simd
         for (int c = 0; c < C; ++c) {
-            g_stage_int8[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
+            dst_npu[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
         }
-#endif
-        std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(C) * sizeof(int8_t));
         return;
     }
 
-    const int c_blocks = C / 16;
+    const int c_blocks = C / 32;
     #pragma omp parallel for schedule(static)
     for (int cb = 0; cb < c_blocks; ++cb) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        float32x4_t v_inv    = vdupq_n_f32(inv_step);
-        int8x16_t   v_min_s8 = vdupq_n_s8(-127);
-#endif
-        for (int t = 0; t < T; ++t) {
-            const float *s = src_tc + static_cast<size_t>(t) * C + cb * 16;
-            int8_t *d      = g_stage_int8 + (static_cast<size_t>(cb) * T + t) * 16;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-            vst1q_s8(d, neon_scale_clamp_f32_to_s8x16(s, v_inv, v_min_s8));
-#else
-            for (int k = 0; k < 16; ++k) {
-                d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * inv_step, 127.0f));
+        if (in_inv_smooth) {
+            const float *sm = in_inv_smooth + cb * 32;
+            for (int t = 0; t < T_valid; ++t) {
+                const float *s = src_tc + static_cast<size_t>(t) * C + cb * 32;
+                int8_t *d      = dst_npu + (static_cast<size_t>(cb) * T + t) * 32;
+                #pragma omp simd
+                for (int k = 0; k < 32; ++k) {
+                    d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * (sm[k] * inv_step), 127.0f));
+                }
             }
-#endif
+        } else {
+            for (int t = 0; t < T_valid; ++t) {
+                const float *s = src_tc + static_cast<size_t>(t) * C + cb * 32;
+                int8_t *d      = dst_npu + (static_cast<size_t>(cb) * T + t) * 32;
+                #pragma omp simd
+                for (int k = 0; k < 32; ++k) {
+                    d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * inv_step, 127.0f));
+                }
+            }
+        }
+        if (T_valid < T) {
+            std::memset(dst_npu + (static_cast<size_t>(cb) * T + T_valid) * 32, 0,
+                        static_cast<size_t>(T - T_valid) * 32 * sizeof(int8_t));
         }
     }
-    std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(T) * C * sizeof(int8_t));
 }
 
 // Pack [T, C] FP32 into NPU INT16 input buffer (in_step = threshold / 32767.0f, clamped to [-32767, 32767])
-static void pack_npu_input_int16(const float *src_tc, int16_t *dst_npu, int T, int C, float in_step) {
+static void pack_npu_input_int16(const float *src_tc, int16_t *dst_npu, int T, int C, float in_step, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     const float inv_step = (in_step > 1e-12f) ? (1.0f / in_step) : 0.0f;
     if (T == 1) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        float32x4_t v_inv     = vdupq_n_f32(inv_step);
-        int16x8_t   v_min_s16 = vdupq_n_s16(-32767);
-        int c = 0;
-        for (; c + 15 < C; c += 16) {
-            vst1q_s16(g_stage_int16 + c + 0, neon_scale_clamp_f32_to_s16x8(src_tc + c + 0, v_inv, v_min_s16));
-            vst1q_s16(g_stage_int16 + c + 8, neon_scale_clamp_f32_to_s16x8(src_tc + c + 8, v_inv, v_min_s16));
-        }
-        for (; c < C; ++c) {
-            g_stage_int16[c] = static_cast<int16_t>(round_clamp_f32(src_tc[c] * inv_step, 32767.0f));
-        }
-#else
+        #pragma omp simd
         for (int c = 0; c < C; ++c) {
-            g_stage_int16[c] = static_cast<int16_t>(round_clamp_f32(src_tc[c] * inv_step, 32767.0f));
+            dst_npu[c] = static_cast<int16_t>(round_clamp_f32(src_tc[c] * inv_step, 32767.0f));
         }
-#endif
-        std::memcpy(dst_npu, g_stage_int16, static_cast<size_t>(C) * sizeof(int16_t));
         return;
     }
 
     const int c_blocks = C / 16;
     #pragma omp parallel for schedule(static)
     for (int cb = 0; cb < c_blocks; ++cb) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        float32x4_t v_inv     = vdupq_n_f32(inv_step);
-        int16x8_t   v_min_s16 = vdupq_n_s16(-32767);
-#endif
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < T_valid; ++t) {
             const float *s = src_tc + static_cast<size_t>(t) * C + cb * 16;
-            int16_t *d     = g_stage_int16 + (static_cast<size_t>(cb) * T + t) * 16;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-            vst1q_s16(d + 0, neon_scale_clamp_f32_to_s16x8(s + 0, v_inv, v_min_s16));
-            vst1q_s16(d + 8, neon_scale_clamp_f32_to_s16x8(s + 8, v_inv, v_min_s16));
-#else
+            int16_t *d     = dst_npu + (static_cast<size_t>(cb) * T + t) * 16;
             for (int k = 0; k < 16; ++k) {
                 d[k] = static_cast<int16_t>(round_clamp_f32(s[k] * inv_step, 32767.0f));
             }
-#endif
+        }
+        if (T_valid < T) {
+            std::memset(dst_npu + (static_cast<size_t>(cb) * T + T_valid) * 16, 0,
+                        static_cast<size_t>(T - T_valid) * 16 * sizeof(int16_t));
         }
     }
-    std::memcpy(dst_npu, g_stage_int16, static_cast<size_t>(T) * C * sizeof(int16_t));
 }
 
-// Unpack NPU NCHW [1, C_out, T, 1] INT8 output into [T, C_out] FP32
-static void unpack_npu_output_int8(const int8_t *src_nchw, float *dst_tc, int T, int C_out, float out_step) {
-    std::memcpy(g_stage_int8, src_nchw, static_cast<size_t>(T) * C_out * sizeof(int8_t));
+// Unpack NPU NCHW [1, C_out, T, 1] INT8 output into [T_valid, C_out] FP32
+static void unpack_npu_output_int8(const int8_t *src_nchw, float *dst_tc, int T, int C_out, float out_step,
+                                   const float *out_step_chan = nullptr, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     if (T == 1) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        float32x4_t v_step = vdupq_n_f32(out_step);
-        int c = 0;
-        for (; c + 15 < C_out; c += 16) {
-            neon_dequant_s8x16_to_f32(vld1q_s8(g_stage_int8 + c), v_step, dst_tc + c);
+        if (out_step_chan) {
+            #pragma omp simd
+            for (int c = 0; c < C_out; ++c) {
+                dst_tc[c] = static_cast<float>(src_nchw[c]) * out_step_chan[c];
+            }
+            return;
         }
-        for (; c < C_out; ++c) {
-            dst_tc[c] = static_cast<float>(g_stage_int8[c]) * out_step;
-        }
-#else
+        #pragma omp simd
         for (int c = 0; c < C_out; ++c) {
-            dst_tc[c] = static_cast<float>(g_stage_int8[c]) * out_step;
+            dst_tc[c] = static_cast<float>(src_nchw[c]) * out_step;
         }
-#endif
         return;
     }
 
     #pragma omp parallel for collapse(2) schedule(static)
-    for (int t0 = 0; t0 < T; t0 += 16) {
+    for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
+            const int dt_end = std::min(16, T_valid - t0);
             alignas(64) float tile[16][16];
             for (int dc = 0; dc < 16; ++dc) {
-                const int8_t *s_row = g_stage_int8 + static_cast<size_t>(c0 + dc) * T + t0;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                float row_f32[16];
-                neon_dequant_s8x16_to_f32(vld1q_s8(s_row), vdupq_n_f32(out_step), row_f32);
-                for (int dt = 0; dt < 16; ++dt) tile[dt][dc] = row_f32[dt];
-#else
-                for (int dt = 0; dt < 16; ++dt) {
-                    tile[dt][dc] = static_cast<float>(s_row[dt]) * out_step;
+                const int8_t *s_row = src_nchw + static_cast<size_t>(c0 + dc) * T + t0;
+                const float st_c = out_step_chan ? out_step_chan[c0 + dc] : out_step;
+                for (int dt = 0; dt < dt_end; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * st_c;
                 }
-#endif
             }
-            for (int dt = 0; dt < 16; ++dt) {
+            for (int dt = 0; dt < dt_end; ++dt) {
                 std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
 }
 
-// Unpack NPU NCHW [1, C_out, T, 1] INT16 output into [T, C_out] FP32
-static void unpack_npu_output_int16(const int16_t *src_nchw, float *dst_tc, int T, int C_out, float out_step) {
-    std::memcpy(g_stage_int16, src_nchw, static_cast<size_t>(T) * C_out * sizeof(int16_t));
+// Unpack NPU NCHW [1, C_out, T, 1] INT16 output into [T_valid, C_out] FP32
+static void unpack_npu_output_int16(const int16_t *src_nchw, float *dst_tc, int T, int C_out, float out_step,
+                                    const float *out_step_chan = nullptr, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     if (T == 1) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        float32x4_t v_step = vdupq_n_f32(out_step);
-        int c = 0;
-        for (; c + 15 < C_out; c += 16) {
-            neon_dequant_s16x8_to_f32(vld1q_s16(g_stage_int16 + c + 0), v_step, dst_tc + c + 0);
-            neon_dequant_s16x8_to_f32(vld1q_s16(g_stage_int16 + c + 8), v_step, dst_tc + c + 8);
+        if (out_step_chan) {
+            #pragma omp simd
+            for (int c = 0; c < C_out; ++c) {
+                dst_tc[c] = static_cast<float>(src_nchw[c]) * out_step_chan[c];
+            }
+            return;
         }
-        for (; c < C_out; ++c) {
-            dst_tc[c] = static_cast<float>(g_stage_int16[c]) * out_step;
-        }
-#else
+        #pragma omp simd
         for (int c = 0; c < C_out; ++c) {
-            dst_tc[c] = static_cast<float>(g_stage_int16[c]) * out_step;
+            dst_tc[c] = static_cast<float>(src_nchw[c]) * out_step;
         }
-#endif
         return;
     }
 
     #pragma omp parallel for collapse(2) schedule(static)
-    for (int t0 = 0; t0 < T; t0 += 16) {
+    for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
+            const int dt_end = std::min(16, T_valid - t0);
             alignas(64) float tile[16][16];
             for (int dc = 0; dc < 16; ++dc) {
-                const int16_t *s_row = g_stage_int16 + static_cast<size_t>(c0 + dc) * T + t0;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                float row_f32[16];
-                float32x4_t v_step = vdupq_n_f32(out_step);
-                neon_dequant_s16x8_to_f32(vld1q_s16(s_row + 0), v_step, row_f32 + 0);
-                neon_dequant_s16x8_to_f32(vld1q_s16(s_row + 8), v_step, row_f32 + 8);
-                for (int dt = 0; dt < 16; ++dt) tile[dt][dc] = row_f32[dt];
-#else
-                for (int dt = 0; dt < 16; ++dt) {
-                    tile[dt][dc] = static_cast<float>(s_row[dt]) * out_step;
+                const int16_t *s_row = src_nchw + static_cast<size_t>(c0 + dc) * T + t0;
+                const float st_c = out_step_chan ? out_step_chan[c0 + dc] : out_step;
+                for (int dt = 0; dt < dt_end; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * st_c;
                 }
-#endif
             }
-            for (int dt = 0; dt < 16; ++dt) {
+            for (int dt = 0; dt < dt_end; ++dt) {
                 std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
 }
 
-// Dynamic per-token INT8 input packer for homogeneous 1x1 linear projections
+// Dynamic per-token INT8 input packer for homogeneous 1x1 linear projections.
+// Note: For T > 1, NVDLA INT8 FEATURE surfaces use 32-byte atoms = 32 INT8 channels ([C/32, T, 32]).
 static void pack_npu_input_int8_dyntok(const float *src_tc, int8_t *dst_npu, int T, int C,
-                                       float in_thresh, float *scale_ratios) {
+                                       float in_thresh, float *scale_ratios,
+                                       const float *in_inv_smooth = nullptr, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     const float safe_thresh = std::max(in_thresh, 1e-8f);
     if (T == 1) {
         float amax = 0.0f;
-        for (int c = 0; c < C; ++c) {
-            float a = std::fabs(src_tc[c]);
-            if (a > amax) amax = a;
+        if (in_inv_smooth) {
+            for (int c = 0; c < C; ++c) {
+                float a = std::fabs(src_tc[c] * in_inv_smooth[c]);
+                if (a > amax) amax = a;
+            }
+            amax = std::max(amax, 1e-8f);
+            scale_ratios[0] = amax / safe_thresh;
+            const float inv_step = 127.0f / amax;
+            #pragma omp simd
+            for (int c = 0; c < C; ++c) {
+                dst_npu[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * (in_inv_smooth[c] * inv_step), 127.0f));
+            }
+        } else {
+            for (int c = 0; c < C; ++c) {
+                float a = std::fabs(src_tc[c]);
+                if (a > amax) amax = a;
+            }
+            amax = std::max(amax, 1e-8f);
+            scale_ratios[0] = amax / safe_thresh;
+            const float inv_step = 127.0f / amax;
+            #pragma omp simd
+            for (int c = 0; c < C; ++c) {
+                dst_npu[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
+            }
         }
-        amax = std::max(amax, 1e-8f);
-        scale_ratios[0] = amax / safe_thresh;
-        const float inv_step = 127.0f / amax;
-        for (int c = 0; c < C; ++c) {
-            g_stage_int8[c] = static_cast<int8_t>(round_clamp_f32(src_tc[c] * inv_step, 127.0f));
-        }
-        std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(C) * sizeof(int8_t));
         return;
     }
 
     float inv_step_tok[64];
+    for (int t = T_valid; t < T; ++t) {
+        scale_ratios[t] = 0.0f;
+        inv_step_tok[t] = 0.0f;
+    }
     #pragma omp parallel for schedule(static)
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < T_valid; ++t) {
         const float *row = src_tc + static_cast<size_t>(t) * C;
         float amax = 0.0f;
-        for (int c = 0; c < C; ++c) {
-            float a = std::fabs(row[c]);
-            if (a > amax) amax = a;
+        if (in_inv_smooth) {
+            for (int c = 0; c < C; ++c) {
+                float a = std::fabs(row[c] * in_inv_smooth[c]);
+                if (a > amax) amax = a;
+            }
+        } else {
+            for (int c = 0; c < C; ++c) {
+                float a = std::fabs(row[c]);
+                if (a > amax) amax = a;
+            }
         }
         amax = std::max(amax, 1e-8f);
         scale_ratios[t] = amax / safe_thresh;
         inv_step_tok[t] = 127.0f / amax;
     }
 
-    const int c_blocks = C / 16;
+    const int c_blocks = C / 32;
     #pragma omp parallel for schedule(static)
     for (int cb = 0; cb < c_blocks; ++cb) {
-        for (int t = 0; t < T; ++t) {
-            const float inv = inv_step_tok[t];
-            const float *s  = src_tc + static_cast<size_t>(t) * C + cb * 16;
-            int8_t *d       = g_stage_int8 + (static_cast<size_t>(cb) * T + t) * 16;
-            for (int k = 0; k < 16; ++k) {
-                d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * inv, 127.0f));
+        if (in_inv_smooth) {
+            const float *sm = in_inv_smooth + cb * 32;
+            for (int t = 0; t < T_valid; ++t) {
+                const float inv = inv_step_tok[t];
+                const float *s  = src_tc + static_cast<size_t>(t) * C + cb * 32;
+                int8_t *d       = dst_npu + (static_cast<size_t>(cb) * T + t) * 32;
+                #pragma omp simd
+                for (int k = 0; k < 32; ++k) {
+                    d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * (sm[k] * inv), 127.0f));
+                }
+            }
+        } else {
+            for (int t = 0; t < T_valid; ++t) {
+                const float inv = inv_step_tok[t];
+                const float *s  = src_tc + static_cast<size_t>(t) * C + cb * 32;
+                int8_t *d       = dst_npu + (static_cast<size_t>(cb) * T + t) * 32;
+                #pragma omp simd
+                for (int k = 0; k < 32; ++k) {
+                    d[k] = static_cast<int8_t>(round_clamp_f32(s[k] * inv, 127.0f));
+                }
             }
         }
+        if (T_valid < T) {
+            std::memset(dst_npu + (static_cast<size_t>(cb) * T + T_valid) * 32, 0,
+                        static_cast<size_t>(T - T_valid) * 32 * sizeof(int8_t));
+        }
     }
-    std::memcpy(dst_npu, g_stage_int8, static_cast<size_t>(T) * C * sizeof(int8_t));
 }
 
 // Dynamic per-token INT8 output unpacker for homogeneous 1x1 linear projections
 static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc, int T, int C_out,
-                                          float out_step, const float *scale_ratios) {
-    std::memcpy(g_stage_int8, src_nchw, static_cast<size_t>(T) * C_out * sizeof(int8_t));
+                                          float out_step, const float *scale_ratios,
+                                          const float *out_step_chan = nullptr, int T_valid = -1) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
     if (T == 1) {
-        const float step_tok = scale_ratios[0] * out_step;
-        for (int c = 0; c < C_out; ++c) {
-            dst_tc[c] = static_cast<float>(g_stage_int8[c]) * step_tok;
+        if (out_step_chan) {
+            const float r0 = scale_ratios[0];
+            #pragma omp simd
+            for (int c = 0; c < C_out; ++c) {
+                dst_tc[c] = static_cast<float>(src_nchw[c]) * (r0 * out_step_chan[c]);
+            }
+        } else {
+            const float step_tok = scale_ratios[0] * out_step;
+            #pragma omp simd
+            for (int c = 0; c < C_out; ++c) {
+                dst_tc[c] = static_cast<float>(src_nchw[c]) * step_tok;
+            }
         }
         return;
     }
 
     #pragma omp parallel for collapse(2) schedule(static)
-    for (int t0 = 0; t0 < T; t0 += 16) {
+    for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
+            const int dt_end = std::min(16, T_valid - t0);
             alignas(64) float tile[16][16];
             for (int dc = 0; dc < 16; ++dc) {
-                const int8_t *s_row = g_stage_int8 + static_cast<size_t>(c0 + dc) * T + t0;
-                for (int dt = 0; dt < 16; ++dt) {
-                    tile[dt][dc] = static_cast<float>(s_row[dt]) * (scale_ratios[t0 + dt] * out_step);
+                const int8_t *s_row = src_nchw + static_cast<size_t>(c0 + dc) * T + t0;
+                const float st_c = out_step_chan ? out_step_chan[c0 + dc] : out_step;
+                for (int dt = 0; dt < dt_end; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * (scale_ratios[t0 + dt] * st_c);
                 }
             }
-            for (int dt = 0; dt < 16; ++dt) {
+            for (int dt = 0; dt < dt_end; ++dt) {
                 std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
 }
 
-// Unified NPU Input Packer: routes FP32 [T, C] -> FP16, INT8 (static or dyntok), or INT16 DmaBuffer
+// Unified NPU Input Packer: routes FP32 [T_valid, C] -> FP16, INT8 (static or dyntok), or INT16 DmaBuffer
 static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C,
-                           const SubgraphScaleInfo &sc, float *dyntok_ratios = nullptr) {
-    std::lock_guard<std::mutex> stage_lk(g_stage_mutex);
+                           const SubgraphScaleInfo &sc, float *dyntok_ratios = nullptr, int T_valid = -1) {
     switch (sc.in_dtype) {
         case BoundaryDtype::Int8:
             if (dyntok_ratios) {
-                pack_npu_input_int8_dyntok(src_tc, dst_buf->as<int8_t>(), T, C, sc.in_thresh, dyntok_ratios);
+                pack_npu_input_int8_dyntok(src_tc, dst_buf->as<int8_t>(), T, C, sc.in_thresh, dyntok_ratios, sc.in_inv_smooth, T_valid);
             } else {
-                pack_npu_input_int8(src_tc, dst_buf->as<int8_t>(), T, C, sc.in_step);
+                pack_npu_input_int8(src_tc, dst_buf->as<int8_t>(), T, C, sc.in_step, sc.in_inv_smooth, T_valid);
             }
             break;
         case BoundaryDtype::Int16:
-            pack_npu_input_int16(src_tc, dst_buf->as<int16_t>(), T, C, sc.in_step);
+            pack_npu_input_int16(src_tc, dst_buf->as<int16_t>(), T, C, sc.in_step, T_valid);
             break;
         case BoundaryDtype::Fp16:
         default:
-            pack_npu_input_fp16(src_tc, dst_buf->as<uint16_t>(), T, C);
+            pack_npu_input_fp16(src_tc, dst_buf->as<uint16_t>(), T, C, T_valid);
             break;
     }
 }
 
-// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T, C_out]
+// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T_valid, C_out]
 static void unpack_npu_output(const DmaBuffer *src_buf, float *dst_tc, int T, int C_out,
-                              const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr) {
-    std::lock_guard<std::mutex> stage_lk(g_stage_mutex);
+                              const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr, int T_valid = -1) {
     switch (sc.out_dtype) {
         case BoundaryDtype::Int8:
             if (dyntok_ratios) {
-                unpack_npu_output_int8_dyntok(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, dyntok_ratios);
+                unpack_npu_output_int8_dyntok(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, dyntok_ratios, sc.out_step_chan, T_valid);
             } else {
-                unpack_npu_output_int8(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step);
+                unpack_npu_output_int8(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid);
             }
             break;
         case BoundaryDtype::Int16:
-            unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step);
+            unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid);
             break;
         case BoundaryDtype::Fp16:
         default:
-            unpack_npu_output_fp16(src_buf->as<uint16_t>(), dst_tc, T, C_out);
+            unpack_npu_output_fp16(src_buf->as<uint16_t>(), dst_tc, T, C_out, T_valid);
             break;
     }
 }
@@ -891,6 +921,7 @@ public:
     static constexpr int kHeadDim = 128;
     static constexpr int kSwaWin = 256;
     static constexpr int kChunk = 64;
+    static constexpr int kSwaCap = kSwaWin + kChunk; // 320 slots so T<=64 prefill never overwrites active SWA window
 
     bool init(const std::string &pkg_dir, int max_ctx = 4096) {
         auto t_init0 = std::chrono::steady_clock::now();
@@ -945,8 +976,8 @@ public:
         // 6. Allocate host state buffers (13 ShortConv rings, 5 SWA caches, 6 Global caches)
         pin_openmp_threads_numa();
         m_conv_state.assign(13 * kHidden * 6, 0.0f);
-        m_swa_k.assign(5 * kSwaWin * kKvHeads * kHeadDim, 0.0f);
-        m_swa_v.assign(5 * kSwaWin * kKvHeads * kHeadDim, 0.0f);
+        m_swa_k.assign(5 * kSwaCap * kKvHeads * kHeadDim, 0.0f);
+        m_swa_v.assign(5 * kSwaCap * kKvHeads * kHeadDim, 0.0f);
         m_glob_k.assign(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim, 0.0f);
         m_glob_v.assign(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim, 0.0f);
         m_glob_k_u8.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
@@ -956,6 +987,19 @@ public:
         m_glob_k_sum.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads);
         m_scores_ws.assign(8 * 16 * static_cast<size_t>( std::max(m_max_ctx, 32768) ), 0.0f);
         m_logits.assign(kVocab, 0.0f);
+
+        // Pre-allocate forward_chunk scratch buffers once for kChunk=64 tokens to eliminate
+        // 10 heap allocations/zero-fills per decode step.
+        m_buf_h.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_u.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_bcx.assign(static_cast<size_t>(kChunk) * 6144, 0.0f);
+        m_buf_qkv.assign(static_cast<size_t>(kChunk) * 3072, 0.0f);
+        m_buf_y.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_op_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_h_mid.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_v.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_mlp_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_gates.assign(static_cast<size_t>(kChunk) * kQHeads, 0.0f);
 
         // 7. Start Dual-Die WorkerPool & Load Models/Buffers on Die 0 and Die 1
         if (!m_pool.start(2)) {
@@ -1093,21 +1137,14 @@ public:
 
             size_t s_act1 = 4096, s_out1 = 32768, s_act64 = 262144, s_out64 = 786432;
             size_t s_lmout = 32768;
-            // Buffers must be at least as large as the memory entry the loadable declares, or the
-            // NPU writes past the allocation and corrupts neighbouring MMZ. Measured on roma: with
-            // the old fixed 32 KiB buffers the same binary and prompt produced logits cosine
-            // 0.7934 then 0.8678 (and min-layer 0.7462 / 0.7258) -- nondeterminism no
-            // deterministic feed-forward network can produce. With entry-sized buffers two runs
-            // returned 0.88736760 and 0.72907964 bit-identically.
-            // Entry-sized (2 MiB) buffers stay the DEFAULT, because they are the only
-            // configuration measured to be fully deterministic: with the smaller geometry-derived
-            // sizes, run 1 diverges from run 2+ in BOTH precisions (FP16 logits 0.99996877 vs
-            // 0.99999267; INT8 min-layer 0.73503351 vs 0.72907964, logits 0.84836137 vs
-            // 0.88736760), and runs 2 onward agree exactly. The ~32% of decode that smaller
-            // buffers buy is therefore not available until the first-run dependency is
-            // understood -- see 45.2. LFM3_SMALL_SURFACES=1 keeps the experiment reproducible.
-            const bool small_ab = std::getenv("LFM3_SMALL_SURFACES") != nullptr;
-            const bool m_wide_surfaces = !small_ab;
+            // Geometry-sized surface buffers (32 KiB for T=1 outputs, 256/768 KiB for T=64) are
+            // the default, avoiding 74 x 2 MiB = 148 MiB/token of whole-allocation cache-flush
+            // overhead (~54 ms/tok saved). As proven in FINDINGS §45.3, zero-initializing and
+            // flushing every surface buffer at init() and reset_state() eliminates the first-run
+            // stale-tail divergence so run 1 == run 2+ bit-identically in both FP16 and INT8.
+            // Set LFM3_WIDE_SURFACES=1 to opt into the 2 MiB entry-sized allocations.
+            const bool wide_ab = std::getenv("LFM3_WIDE_SURFACES") != nullptr;
+            const bool m_wide_surfaces = wide_ab;
             if (m_wide_surfaces) {
                 // Size every buffer to the largest entry its role reports rather than clamping
                 // the descriptor down to a convenient constant.
@@ -1140,13 +1177,15 @@ public:
             note_prod_cap(m_out_t1[d].get(), s_out1);
             note_prod_cap(m_out_t64[d].get(), s_out64);
             for (int s = 0; s < 4; ++s) note_prod_cap(m_lm_out[d][s].get(), s_lmout);
-            for (const DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
-                                       m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
-                                       m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
+            for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+                                 m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
+                                 m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
                 if (!b->is_valid()) {
                     std::printf("FAIL: DmaBuffer alloc on Die %u (%zu B)\n", d, b->size());
                     return false;
                 }
+                std::memset(b->data(), 0, b->size());
+                b->flush_cache();
             }
             std::printf("[+] Die %u surface buffers: act_t1=%zu out_t1=%zu act_t64=%zu "
                         "out_t64=%zu lm_out=%zu B (largest entry %.2f MiB, surfaces %s)\n",
@@ -1194,32 +1233,65 @@ public:
         std::fill(m_glob_v_sc.begin(), m_glob_v_sc.end(), 0.0f);
         std::fill(m_glob_k_sum.begin(), m_glob_k_sum.end(), 0);
         std::fill(m_logits.begin(), m_logits.end(), 0.0f);
+        for (uint16_t d = 0; d < 2; ++d) {
+            for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+                                 m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
+                                 m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
+                if (b && b->is_valid()) {
+                    std::memset(b->data(), 0, b->size());
+                    b->flush_cache();
+                }
+            }
+        }
         m_pos = 0;
     }
 
-    // Execute T tokens (either T=1 or T=64) across all 24 layers; if compute_logits is true,
-    // computes all 128,000 logits for the last token in the batch.
-    bool forward_chunk(const int32_t *token_ids, int T, bool compute_logits,
-                       StageTimers &timers, std::vector<float> *debug_layer_outs = nullptr,
+    // Execute T_valid tokens (1 <= T_valid <= 64) across all 24 layers; uses T_npu=1 for single-token
+    // decode and T_npu=64 for multi-token prefill (2 <= T_valid <= 64). If compute_logits is true,
+    // computes all 128,000 logits for the last valid token (T_valid - 1) in the batch.
+    bool forward_chunk(const int32_t *token_ids, int T_valid, bool compute_logits,
+                       StageTimers &timers,
+                       const float *visual_embeds = nullptr,
+                       size_t *visual_idx_io = nullptr,
+                       size_t max_visual_tokens = 0,
+                       std::vector<float> *debug_layer_outs = nullptr,
                        std::vector<float> *debug_emb_norm = nullptr) {
-        if (T != 1 && T != 64) {
-            std::printf("FAIL: forward_chunk requires T=1 or T=64 (got %d)\n", T);
+        if (T_valid < 1 || T_valid > kChunk) {
+            std::printf("FAIL: forward_chunk requires 1 <= T_valid <= %d (got %d)\n", kChunk, T_valid);
             return false;
         }
+        if (m_pos + T_valid > m_max_ctx) {
+            std::printf("FAIL: context limit reached (pos=%d + T_valid=%d > max_ctx=%d; pass --max-ctx N to increase)\n",
+                        m_pos, T_valid, m_max_ctx);
+            return false;
+        }
+        const int T = (T_valid == 1) ? 1 : kChunk;
 
-        std::vector<float> h(static_cast<size_t>(T) * kHidden);
-        std::vector<float> u(static_cast<size_t>(T) * kHidden);
-        std::vector<float> bcx(static_cast<size_t>(T) * 6144);
-        std::vector<float> qkv(static_cast<size_t>(T) * 3072);
-        std::vector<float> y(static_cast<size_t>(T) * kHidden);
-        std::vector<float> op_out(static_cast<size_t>(T) * kHidden);
-        std::vector<float> h_mid(static_cast<size_t>(T) * kHidden);
-        std::vector<float> v(static_cast<size_t>(T) * kHidden);
-        std::vector<float> mlp_out(static_cast<size_t>(T) * kHidden);
+        float *h       = m_buf_h.data();
+        float *u       = m_buf_u.data();
+        float *bcx     = m_buf_bcx.data();
+        float *qkv     = m_buf_qkv.data();
+        float *y       = m_buf_y.data();
+        float *op_out  = m_buf_op_out.data();
+        float *h_mid   = m_buf_h_mid.data();
+        float *v       = m_buf_v.data();
+        float *mlp_out = m_buf_mlp_out.data();
+        float *gates   = m_buf_gates.data();
 
-        // Lookup FP16 embeddings -> FP32
+        // Lookup FP16 embeddings -> FP32 for the T_valid tokens
         auto t0 = std::chrono::steady_clock::now();
-        m_embedding.gather(token_ids, static_cast<size_t>(T), h.data(), h.size());
+        m_embedding.gather(token_ids, static_cast<size_t>(T_valid), h,
+                           static_cast<size_t>(T_valid) * kHidden);
+        if (visual_embeds && visual_idx_io) {
+            for (int t = 0; t < T_valid; ++t) {
+                if (token_ids[t] == 125030 && *visual_idx_io < max_visual_tokens) {
+                    std::memcpy(h + static_cast<size_t>(t) * kHidden,
+                                visual_embeds + (*visual_idx_io) * kHidden,
+                                kHidden * sizeof(float));
+                    (*visual_idx_io)++;
+                }
+            }
+        }
         auto t1 = std::chrono::steady_clock::now();
         timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -1272,11 +1344,6 @@ public:
             };
             if (surface_overflow) return false;
 
-            // Bytes of the weight region to bind: with --weights-layer0 every layer of a die
-            // reuses that die's first region per archetype, so the streamed working set collapses
-            // from ~1.4 GiB to ~141 MB while bytes-per-submit stay identical. A/B against a normal
-            // run separates weight locality (SMMU/TLB and DRAM pages across a 1.4 GiB blob) from
-            // per-submit engine overhead. Numerically meaningless by design -- timing only.
             auto wsel = [&](int slot, size_t off, size_t sz) -> std::pair<size_t, size_t> {
                 if (!m_ab_shared_weights || ab[slot].sz == 0) return {off, sz};
                 return {ab[slot].off, ab[slot].sz};
@@ -1306,8 +1373,8 @@ public:
 
             // 1. Pre-operator Sandwich RMSNorm
             auto tn0 = std::chrono::steady_clock::now();
-            rms_norm_f32(h.data(), cw.op_norm, u.data(), T, kHidden);
-            pack_npu_input(u.data(), act_buf, T, kHidden, no.op_in_scale, op_in_ratios);
+            rms_norm_f32(h, cw.op_norm, u, T_valid, kHidden);
+            pack_npu_input(u, act_buf, T, kHidden, no.op_in_scale, op_in_ratios, T_valid);
             act_buf->flush_cache();
             auto tn1 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn1 - tn0).count();
@@ -1333,29 +1400,45 @@ public:
 
                 // CPU 7-tap depthwise ShortConv state update
                 auto tconv0 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, bcx.data(), T, 6144, no.op_in_scale, op_in_ratios);
+                unpack_npu_output(out_buf, bcx, T, 6144, no.op_in_scale, op_in_ratios, T_valid);
                 float *layer_st = m_conv_state.data() + static_cast<size_t>(conv_idx) * kHidden * 6;
                 const float *w_conv = cw.conv_weight;
 
-                #pragma omp parallel for if(T > 1) schedule(static)
-                for (int c = 0; c < kHidden; ++c) {
-                    float *st = &layer_st[c * 6];
-                    const float *kw = &w_conv[c * 7];
-                    for (int t = 0; t < T; ++t) {
-                        const float *p = bcx.data() + static_cast<size_t>(t) * 6144;
-                        float B  = p[c];
-                        float C  = p[kHidden + c];
-                        float xp = p[2 * kHidden + c];
-                        float xt = B * xp;
+                if (T_valid == 1) {
+                    const float *pB = bcx;
+                    const float *pC = bcx + kHidden;
+                    const float *pX = bcx + 2 * kHidden;
+                    for (int c = 0; c < kHidden; ++c) {
+                        float *st = &layer_st[c * 6];
+                        const float *kw = &w_conv[c * 7];
+                        float xt = pB[c] * pX[c];
                         float dw = st[0]*kw[0] + st[1]*kw[1] + st[2]*kw[2] +
                                    st[3]*kw[3] + st[4]*kw[4] + st[5]*kw[5] + xt*kw[6];
                         st[0] = st[1]; st[1] = st[2]; st[2] = st[3];
                         st[3] = st[4]; st[4] = st[5]; st[5] = xt;
-                        y[static_cast<size_t>(t) * kHidden + c] = C * dw;
+                        y[c] = pC[c] * dw;
+                    }
+                } else {
+                    #pragma omp parallel for schedule(static)
+                    for (int c = 0; c < kHidden; ++c) {
+                        float *st = &layer_st[c * 6];
+                        const float *kw = &w_conv[c * 7];
+                        for (int t = 0; t < T_valid; ++t) {
+                            const float *p = bcx + static_cast<size_t>(t) * 6144;
+                            float B  = p[c];
+                            float C  = p[kHidden + c];
+                            float xp = p[2 * kHidden + c];
+                            float xt = B * xp;
+                            float dw = st[0]*kw[0] + st[1]*kw[1] + st[2]*kw[2] +
+                                       st[3]*kw[3] + st[4]*kw[4] + st[5]*kw[5] + xt*kw[6];
+                            st[0] = st[1]; st[1] = st[2]; st[2] = st[3];
+                            st[3] = st[4]; st[4] = st[5]; st[5] = xt;
+                            y[static_cast<size_t>(t) * kHidden + c] = C * dw;
+                        }
                     }
                 }
                 conv_idx++;
-                pack_npu_input(y.data(), act_buf, T, kHidden, no.op_out_scale, op_out_ratios);
+                pack_npu_input(y, act_buf, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
                 act_buf->flush_cache();
                 auto tconv1 = std::chrono::steady_clock::now();
                 timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tconv1 - tconv0).count();
@@ -1370,7 +1453,7 @@ public:
                 }
 
                 auto tn2 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, op_out.data(), T, kHidden, no.op_out_scale, op_out_ratios);
+                unpack_npu_output(out_buf, op_out, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
                 auto tn3 = std::chrono::steady_clock::now();
                 timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tn3 - tn2).count();
 
@@ -1394,19 +1477,29 @@ public:
                     return false;
                 }
 
-                // Compute 16-head sigmoid gate g_h = sigmoid(W_gate * u_t)
+                // Compute 16-head sigmoid gate g_h = sigmoid(W_gate * u_t) (4-head register blocked)
                 auto tg0 = std::chrono::steady_clock::now();
-                std::vector<float> gates(static_cast<size_t>(T) * kQHeads);
-                #pragma omp parallel for if(T > 1) schedule(static)
-                for (int t = 0; t < T; ++t) {
-                    const float *u_row = u.data() + static_cast<size_t>(t) * kHidden;
-                    float *g_row = gates.data() + static_cast<size_t>(t) * kQHeads;
-                    for (int h_idx = 0; h_idx < kQHeads; ++h_idx) {
-                        const float *wg = cw.gate_proj + static_cast<size_t>(h_idx) * kHidden;
-                        float dot = 0.0f;
-                        #pragma omp simd reduction(+:dot)
-                        for (int c = 0; c < kHidden; ++c) dot += u_row[c] * wg[c];
-                        g_row[h_idx] = 1.0f / (1.0f + std::exp(-dot));
+                #pragma omp parallel for if(T_valid > 1) schedule(static)
+                for (int t = 0; t < T_valid; ++t) {
+                    const float *u_row = u + static_cast<size_t>(t) * kHidden;
+                    float *g_row = gates + static_cast<size_t>(t) * kQHeads;
+                    for (int h_idx = 0; h_idx < kQHeads; h_idx += 4) {
+                        const float *wg0 = cw.gate_proj + static_cast<size_t>(h_idx + 0) * kHidden;
+                        const float *wg1 = cw.gate_proj + static_cast<size_t>(h_idx + 1) * kHidden;
+                        const float *wg2 = cw.gate_proj + static_cast<size_t>(h_idx + 2) * kHidden;
+                        const float *wg3 = cw.gate_proj + static_cast<size_t>(h_idx + 3) * kHidden;
+                        float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+                        for (int c = 0; c < kHidden; ++c) {
+                            float uv = u_row[c];
+                            dot0 += uv * wg0[c];
+                            dot1 += uv * wg1[c];
+                            dot2 += uv * wg2[c];
+                            dot3 += uv * wg3[c];
+                        }
+                        g_row[h_idx + 0] = 1.0f / (1.0f + std::exp(-dot0));
+                        g_row[h_idx + 1] = 1.0f / (1.0f + std::exp(-dot1));
+                        g_row[h_idx + 2] = 1.0f / (1.0f + std::exp(-dot2));
+                        g_row[h_idx + 3] = 1.0f / (1.0f + std::exp(-dot3));
                     }
                 }
                 auto tg1 = std::chrono::steady_clock::now();
@@ -1414,20 +1507,20 @@ public:
 
                 // QK-Norm + RoPE + KV Cache Update + GQA Attention
                 auto tattn0 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, qkv.data(), T, 3072, no.op_in_scale, op_in_ratios);
+                unpack_npu_output(out_buf, qkv, T, 3072, no.op_in_scale, op_in_ratios, T_valid);
 
                 float *k_cache = is_swa
-                    ? (m_swa_k.data() + static_cast<size_t>(swa_idx) * kSwaWin * kKvHeads * kHeadDim)
+                    ? (m_swa_k.data() + static_cast<size_t>(swa_idx) * kSwaCap * kKvHeads * kHeadDim)
                     : (m_glob_k.data() + static_cast<size_t>(glob_idx) * m_max_ctx * kKvHeads * kHeadDim);
                 float *v_cache = is_swa
-                    ? (m_swa_v.data() + static_cast<size_t>(swa_idx) * kSwaWin * kKvHeads * kHeadDim)
+                    ? (m_swa_v.data() + static_cast<size_t>(swa_idx) * kSwaCap * kKvHeads * kHeadDim)
                     : (m_glob_v.data() + static_cast<size_t>(glob_idx) * m_max_ctx * kKvHeads * kHeadDim);
                 int cur_glob_idx = glob_idx;
                 if (is_swa) swa_idx++; else glob_idx++;
 
                 const float *inv_freq = is_swa ? m_swa_inv_freq : m_glob_inv_freq;
                 int n_rot_pairs = is_swa ? 64 : 32;
-                int s_cap = is_swa ? kSwaWin : m_max_ctx;
+                int s_cap = is_swa ? kSwaCap : m_max_ctx;
                 uint8_t  *k_u8_layer  = !is_swa ? (m_glob_k_u8.data()  + static_cast<size_t>(cur_glob_idx) * kKvHeads * s_cap * kHeadDim) : nullptr;
                 uint8_t  *v_u8_layer  = !is_swa ? (m_glob_v_u8.data()  + static_cast<size_t>(cur_glob_idx) * kKvHeads * s_cap * kHeadDim) : nullptr;
                 float    *k_sc_layer  = !is_swa ? (m_glob_k_sc.data()  + static_cast<size_t>(cur_glob_idx) * kKvHeads * s_cap) : nullptr;
@@ -1435,11 +1528,11 @@ public:
                 uint16_t *k_sum_layer = !is_swa ? (m_glob_k_sum.data() + static_cast<size_t>(cur_glob_idx) * kKvHeads * s_cap) : nullptr;
 
                 // Apply q_norm, k_norm, FP32 RoPE, and store K, V into Head-Major cache [kv_h][s_cap][128]
-                #pragma omp parallel for if(T > 1) schedule(static)
-                for (int t = 0; t < T; ++t) {
+                #pragma omp parallel for if(T_valid > 1) schedule(static)
+                for (int t = 0; t < T_valid; ++t) {
                     int abs_pos = m_pos + t;
-                    int slot = is_swa ? (abs_pos % kSwaWin) : abs_pos;
-                    float *qkv_t = qkv.data() + static_cast<size_t>(t) * 3072;
+                    int slot = is_swa ? (abs_pos % kSwaCap) : abs_pos;
+                    float *qkv_t = qkv + static_cast<size_t>(t) * 3072;
 
                     float cos_tab[64], sin_tab[64];
                     for (int i = 0; i < n_rot_pairs; ++i) {
@@ -1492,15 +1585,15 @@ public:
                 }
 
                 // Execute GQA Attention + multiply by head gate g_h
-                if (!is_swa && T == 1 && (m_pos + 1) >= 256) {
-                    run_gqa_attention_int8_swar(qkv.data(), k_u8_layer, v_u8_layer, k_sc_layer, v_sc_layer,
-                                                k_sum_layer, gates.data(), y.data(), m_pos + 1, s_cap);
+                if (!is_swa && T_valid == 1 && (m_pos + 1) >= 256) {
+                    run_gqa_attention_int8_swar(qkv, k_u8_layer, v_u8_layer, k_sc_layer, v_sc_layer,
+                                                k_sum_layer, gates, y, m_pos + 1, s_cap);
                 } else {
-                    run_gqa_attention(qkv.data(), k_cache, v_cache, gates.data(), y.data(),
-                                      T, m_pos, is_swa, s_cap);
+                    run_gqa_attention(qkv, k_cache, v_cache, gates, y,
+                                      T_valid, m_pos, is_swa, s_cap);
                 }
 
-                pack_npu_input(y.data(), act_buf, T, kHidden, no.op_out_scale, op_out_ratios);
+                pack_npu_input(y, act_buf, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
                 act_buf->flush_cache();
                 auto tattn1 = std::chrono::steady_clock::now();
                 double attn_dt = std::chrono::duration<double, std::milli>(tattn1 - tattn0).count();
@@ -1517,7 +1610,7 @@ public:
                 }
 
                 auto tattn2 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, op_out.data(), T, kHidden, no.op_out_scale, op_out_ratios);
+                unpack_npu_output(out_buf, op_out, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
                 auto tattn3 = std::chrono::steady_clock::now();
                 if (is_swa) timers.cpu_swa_ms += std::chrono::duration<double, std::milli>(tattn3 - tattn2).count();
                 else        timers.cpu_glob_ms += std::chrono::duration<double, std::milli>(tattn3 - tattn2).count();
@@ -1525,10 +1618,11 @@ public:
 
             // 2. Sandwich post_operator_norm + Residual + ffn_norm
             auto tn4 = std::chrono::steady_clock::now();
-            rms_norm_f32(op_out.data(), cw.post_op_norm, op_out.data(), T, kHidden);
-            for (int i = 0; i < T * kHidden; ++i) h_mid[i] = h[i] + op_out[i];
-            rms_norm_f32(h_mid.data(), cw.ffn_norm, v.data(), T, kHidden);
-            pack_npu_input(v.data(), act_buf, T, kHidden, no.mlp_scale);
+            rms_norm_f32(op_out, cw.post_op_norm, op_out, T_valid, kHidden);
+            #pragma omp simd
+            for (int i = 0; i < T_valid * kHidden; ++i) h_mid[i] = h[i] + op_out[i];
+            rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
+            pack_npu_input(v, act_buf, T, kHidden, no.mlp_scale, nullptr, T_valid);
             act_buf->flush_cache();
             auto tn5 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn5 - tn4).count();
@@ -1549,37 +1643,41 @@ public:
 
             // 4. Sandwich post_ffn_norm + Residual
             auto tn6 = std::chrono::steady_clock::now();
-            unpack_npu_output(out_buf, mlp_out.data(), T, kHidden, no.mlp_scale);
-            rms_norm_f32(mlp_out.data(), cw.post_ffn_norm, mlp_out.data(), T, kHidden);
-            for (int i = 0; i < T * kHidden; ++i) h[i] = h_mid[i] + mlp_out[i];
+            unpack_npu_output(out_buf, mlp_out, T, kHidden, no.mlp_scale, nullptr, T_valid);
+            rms_norm_f32(mlp_out, cw.post_ffn_norm, mlp_out, T_valid, kHidden);
+            #pragma omp simd
+            for (int i = 0; i < T_valid * kHidden; ++i) h[i] = h_mid[i] + mlp_out[i];
             auto tn7 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn7 - tn6).count();
 
             if (debug_layer_outs) {
-                const float *last_h = h.data() + static_cast<size_t>(T - 1) * kHidden;
+                const float *last_h = h + static_cast<size_t>(T_valid - 1) * kHidden;
                 std::memcpy(debug_layer_outs->data() + static_cast<size_t>(l) * kHidden,
                             last_h, kHidden * sizeof(float));
             }
         }
 
-        m_pos += T;
-        timers.tokens_run += T;
+        m_pos += T_valid;
+        timers.tokens_run += T_valid;
 
         if (!compute_logits) return true;
 
         // Final embedding_norm on the last token's hidden state [1, 2048]
         auto tfn0 = std::chrono::steady_clock::now();
-        const float *last_h = h.data() + static_cast<size_t>(T - 1) * kHidden;
+        const float *last_h = h + static_cast<size_t>(T_valid - 1) * kHidden;
         float h_final[kHidden];
         rms_norm_f32(last_h, m_emb_norm_weight, h_final, 1, kHidden);
         if (debug_emb_norm) {
             debug_emb_norm->assign(h_final, h_final + kHidden);
         }
 
-        // Broadcast normalized [1, 2048] vector (FP16 or INT8) to both Die 0 and Die 1 activation buffers
+        // Broadcast normalized [1, 2048] vector (FP16 or INT8) to both Die 0 and Die 1 activation buffers.
+        // Do NOT use dyntok on the static EsAAC-compiled LM head slices: their internal CvtPrecision_QuantM
+        // was calibrated against static input_threshold=20.82, so scaling h_final (amax ~10.1) up by 2.05x
+        // drives all logits > 13.1 into +127 output saturation and makes slice d0_s0 (out_step=0.21785)
+        // systematically beat slice d0_s1 (out_step=0.21118, where token 17479 ' Monday' lives).
         const SubgraphScaleInfo &lm_in_sc = m_die_models[0].lm_head_scale[0];
-        float lm_tok_ratio[1] = {1.0f};
-        pack_npu_input(h_final, m_act_t1[0].get(), 1, kHidden, lm_in_sc, lm_tok_ratio);
+        pack_npu_input(h_final, m_act_t1[0].get(), 1, kHidden, lm_in_sc);
         size_t lm_copy_bytes = static_cast<size_t>(kHidden) * dtype_elem_size(lm_in_sc.in_dtype);
         std::memcpy(m_act_t1[1]->data(), m_act_t1[0]->data(), lm_copy_bytes);
         m_act_t1[0]->flush_cache();
@@ -1633,7 +1731,7 @@ public:
                     return;
                 }
                 float *dst_fp32 = m_logits.data() + (static_cast<size_t>(logical_die) * 64000 + s * 16000);
-                unpack_npu_output(out_b, dst_fp32, 1, 16000, lm_sc, lm_tok_ratio);
+                unpack_npu_output(out_b, dst_fp32, 1, 16000, lm_sc);
             }
         };
 
@@ -1655,24 +1753,36 @@ public:
         return ok_d0 && ok_d1;
     }
 
-    // High-level prefill: processes full 64-token chunks with T=64 graphs and tail tokens with T=1
-    bool prefill(const std::vector<int32_t> &tokens, StageTimers &timers,
-                 std::vector<float> *debug_layer_outs = nullptr,
-                 std::vector<float> *debug_emb_norm = nullptr) {
+    // High-level prefill: batches prompt tokens in chunks of up to 64 valid tokens (t = 0..63)
+    // onto the T=64 NPU graphs so weight streaming happens once per 64 tokens instead of once per token.
+    // Set LFM3_PREFILL_T1=1 to force the unbatched T=1 path.
+    bool prefill_multimodal(const std::vector<int32_t> &tokens, StageTimers &timers,
+                            const float *visual_embeds, size_t num_visual_tokens,
+                            std::vector<float> *debug_layer_outs = nullptr,
+                            std::vector<float> *debug_emb_norm = nullptr) {
+        const bool force_t1 = std::getenv("LFM3_PREFILL_T1") != nullptr;
         int n = static_cast<int>(tokens.size());
         int idx = 0;
-        while (idx + kChunk <= n) {
-            bool is_last = (idx + kChunk == n);
-            if (!forward_chunk(tokens.data() + idx, kChunk, is_last, timers,
-                               is_last ? debug_layer_outs : nullptr,
-                               is_last ? debug_emb_norm : nullptr)) {
-                return false;
+        size_t visual_idx = 0;
+        if (!force_t1) {
+            constexpr int kPrefillBatch = 64;
+            while (idx < n) {
+                int step = std::min(kPrefillBatch, n - idx);
+                bool is_last = (idx + step == n);
+                if (!forward_chunk(tokens.data() + idx, step, is_last, timers,
+                                   visual_embeds, &visual_idx, num_visual_tokens,
+                                   is_last ? debug_layer_outs : nullptr,
+                                   is_last ? debug_emb_norm : nullptr)) {
+                    return false;
+                }
+                idx += step;
             }
-            idx += kChunk;
+            return true;
         }
         while (idx < n) {
             bool is_last = (idx + 1 == n);
             if (!forward_chunk(tokens.data() + idx, 1, is_last, timers,
+                               visual_embeds, &visual_idx, num_visual_tokens,
                                is_last ? debug_layer_outs : nullptr,
                                is_last ? debug_emb_norm : nullptr)) {
                 return false;
@@ -1680,6 +1790,17 @@ public:
             idx++;
         }
         return true;
+    }
+
+    bool prefill(const std::vector<int32_t> &tokens, StageTimers &timers,
+                 std::vector<float> *debug_layer_outs = nullptr,
+                 std::vector<float> *debug_emb_norm = nullptr) {
+        return prefill_multimodal(tokens, timers, nullptr, 0, debug_layer_outs, debug_emb_norm);
+    }
+
+    bool prefill(const std::vector<int32_t> &tokens, StageTimers &timers,
+                 const float *visual_embeds, size_t num_visual_tokens) {
+        return prefill_multimodal(tokens, timers, visual_embeds, num_visual_tokens, nullptr, nullptr);
     }
 
     void set_quant_options(bool force_int8, bool use_shared_archetype_scales) {
@@ -1814,6 +1935,7 @@ public:
     float* logits_mut() { return m_logits.data(); }
     const Tokenizer& tokenizer() const { return m_tokenizer; }
     int pos() const { return m_pos; }
+    bool is_quant_active() const { return m_layer_npu[0].op_in_scale.in_dtype != BoundaryDtype::Fp16; }
 
     // Standalone Attention Microbenchmark at 512, 4096, and 32768 context (PLAN.md Milestone 4 Gate)
     void benchmark_global_attention_kernel() {
@@ -2161,7 +2283,8 @@ private:
                            const float *gates, float *attn_out_chunk,
                            int T, int pos_base, bool is_swa, int s_cap) {
         if (T == 1) {
-            int n_valid = is_swa ? std::min(pos_base + 1, kSwaWin) : (pos_base + 1);
+            const int p_min   = is_swa ? std::max(0, pos_base - kSwaWin + 1) : 0;
+            const int n_valid = pos_base - p_min + 1;
             const int n_splits = (n_valid >= 256) ? 2 : 1;
 
             // Single-OpenMP-Region Flash-Decoding (Online Softmax) over (kv_h = 0..3, sp = 0..n_splits-1).
@@ -2199,10 +2322,14 @@ private:
                         // 1. 4-token x 4-head register-blocked Q * K^T over tile
                         int dt = 0;
                         for (; dt + 3 < tile_len; dt += 4) {
-                            const float *k0 = k_head + static_cast<size_t>(s_base + dt + 0) * kHeadDim;
-                            const float *k1 = k_head + static_cast<size_t>(s_base + dt + 1) * kHeadDim;
-                            const float *k2 = k_head + static_cast<size_t>(s_base + dt + 2) * kHeadDim;
-                            const float *k3 = k_head + static_cast<size_t>(s_base + dt + 3) * kHeadDim;
+                            int sl0 = is_swa ? ((p_min + s_base + dt + 0) % kSwaCap) : (s_base + dt + 0);
+                            int sl1 = is_swa ? ((p_min + s_base + dt + 1) % kSwaCap) : (s_base + dt + 1);
+                            int sl2 = is_swa ? ((p_min + s_base + dt + 2) % kSwaCap) : (s_base + dt + 2);
+                            int sl3 = is_swa ? ((p_min + s_base + dt + 3) % kSwaCap) : (s_base + dt + 3);
+                            const float *k0 = k_head + static_cast<size_t>(sl0) * kHeadDim;
+                            const float *k1 = k_head + static_cast<size_t>(sl1) * kHeadDim;
+                            const float *k2 = k_head + static_cast<size_t>(sl2) * kHeadDim;
+                            const float *k3 = k_head + static_cast<size_t>(sl3) * kHeadDim;
                             float a00=0, a01=0, a02=0, a03=0;
                             float a10=0, a11=0, a12=0, a13=0;
                             float a20=0, a21=0, a22=0, a23=0;
@@ -2227,7 +2354,8 @@ private:
                             }
                         }
                         for (; dt < tile_len; ++dt) {
-                            const float *kv_ptr = k_head + static_cast<size_t>(s_base + dt) * kHeadDim;
+                            int sl = is_swa ? ((p_min + s_base + dt) % kSwaCap) : (s_base + dt);
+                            const float *kv_ptr = k_head + static_cast<size_t>(sl) * kHeadDim;
                             float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
                             for (int d = 0; d < kHeadDim; ++d) {
                                 float kv = kv_ptr[d];
@@ -2269,10 +2397,14 @@ private:
                             float p30 = sc_tile[dt+3][0], p31 = sc_tile[dt+3][1], p32 = sc_tile[dt+3][2], p33 = sc_tile[dt+3][3];
                             if ((p00+p01+p02+p03 + p10+p11+p12+p13 + p20+p21+p22+p23 + p30+p31+p32+p33) <= 1e-8f) continue;
 
-                            const float *v0 = v_head + static_cast<size_t>(s_base + dt + 0) * kHeadDim;
-                            const float *v1 = v_head + static_cast<size_t>(s_base + dt + 1) * kHeadDim;
-                            const float *v2 = v_head + static_cast<size_t>(s_base + dt + 2) * kHeadDim;
-                            const float *v3 = v_head + static_cast<size_t>(s_base + dt + 3) * kHeadDim;
+                            int sl0 = is_swa ? ((p_min + s_base + dt + 0) % kSwaCap) : (s_base + dt + 0);
+                            int sl1 = is_swa ? ((p_min + s_base + dt + 1) % kSwaCap) : (s_base + dt + 1);
+                            int sl2 = is_swa ? ((p_min + s_base + dt + 2) % kSwaCap) : (s_base + dt + 2);
+                            int sl3 = is_swa ? ((p_min + s_base + dt + 3) % kSwaCap) : (s_base + dt + 3);
+                            const float *v0 = v_head + static_cast<size_t>(sl0) * kHeadDim;
+                            const float *v1 = v_head + static_cast<size_t>(sl1) * kHeadDim;
+                            const float *v2 = v_head + static_cast<size_t>(sl2) * kHeadDim;
+                            const float *v3 = v_head + static_cast<size_t>(sl3) * kHeadDim;
                             for (int d = 0; d < kHeadDim; ++d) {
                                 float vv0 = v0[d], vv1 = v1[d], vv2 = v2[d], vv3 = v3[d];
                                 o_loc[0][d] += p00*vv0 + p10*vv1 + p20*vv2 + p30*vv3;
@@ -2284,7 +2416,8 @@ private:
                         for (; dt < tile_len; ++dt) {
                             float p0 = sc_tile[dt][0], p1 = sc_tile[dt][1], p2 = sc_tile[dt][2], p3 = sc_tile[dt][3];
                             if ((p0 + p1 + p2 + p3) <= 1e-8f) continue;
-                            const float *vv_ptr = v_head + static_cast<size_t>(s_base + dt) * kHeadDim;
+                            int sl = is_swa ? ((p_min + s_base + dt) % kSwaCap) : (s_base + dt);
+                            const float *vv_ptr = v_head + static_cast<size_t>(sl) * kHeadDim;
                             for (int d = 0; d < kHeadDim; ++d) {
                                 float vv = vv_ptr[d];
                                 o_loc[0][d] += p0 * vv; o_loc[1][d] += p1 * vv;
@@ -2341,22 +2474,38 @@ private:
 
                 int qh_base = kv_h * 4;
                 float max_s[16];
-                int n_valid_arr[4];
+                int p_beg_arr[4], p_end_arr[4];
+                const int dt_cnt = std::min(4, T - t_base);
                 for (int dt = 0; dt < 4; ++dt) {
-                    int t = t_base + dt;
-                    int abs_pos = pos_base + t;
-                    n_valid_arr[dt] = is_swa ? std::min(abs_pos + 1, kSwaWin) : (abs_pos + 1);
-                    for (int g = 0; g < 4; ++g) {
-                        int idx = dt * 4 + g;
-                        const float *q_src = qkv_chunk + static_cast<size_t>(t) * 3072 + (qh_base + g) * kHeadDim;
-                        for (int d = 0; d < kHeadDim; ++d) q_local[d][idx] = q_src[d];
-                        max_s[idx] = -1e30f;
+                    if (dt < dt_cnt) {
+                        int t = t_base + dt;
+                        int abs_pos = pos_base + t;
+                        p_beg_arr[dt] = is_swa ? std::max(0, abs_pos - kSwaWin + 1) : 0;
+                        p_end_arr[dt] = abs_pos + 1;
+                        for (int g = 0; g < 4; ++g) {
+                            int idx = dt * 4 + g;
+                            const float *q_src = qkv_chunk + static_cast<size_t>(t) * 3072 + (qh_base + g) * kHeadDim;
+                            for (int d = 0; d < kHeadDim; ++d) q_local[d][idx] = q_src[d];
+                            max_s[idx] = -1e30f;
+                        }
+                    } else {
+                        p_beg_arr[dt] = 0;
+                        p_end_arr[dt] = 0;
+                        for (int g = 0; g < 4; ++g) {
+                            int idx = dt * 4 + g;
+                            for (int d = 0; d < kHeadDim; ++d) q_local[d][idx] = 0.0f;
+                            max_s[idx] = 0.0f;
+                        }
                     }
                 }
-                int max_valid = n_valid_arr[3];
+                const int p_min  = p_beg_arr[0];
+                const int p_max  = p_end_arr[dt_cnt - 1];
+                const int n_span = p_max - p_min;
 
-                for (int s = 0; s < max_valid; ++s) {
-                    const float *k_vec = k_head + static_cast<size_t>(s) * kHeadDim;
+                for (int s_rel = 0; s_rel < n_span; ++s_rel) {
+                    const int p = p_min + s_rel;
+                    const int slot = is_swa ? (p % kSwaCap) : p;
+                    const float *k_vec = k_head + static_cast<size_t>(slot) * kHeadDim;
                     float acc[16] = {0.0f};
                     for (int d = 0; d < kHeadDim; ++d) {
                         float kv = k_vec[d];
@@ -2364,41 +2513,45 @@ private:
                         #pragma omp simd
                         for (int idx = 0; idx < 16; ++idx) acc[idx] += qr[idx] * kv;
                     }
-                    for (int idx = 0; idx < 16; ++idx) {
+                    for (int idx = 0; idx < dt_cnt * 4; ++idx) {
                         int dt = idx >> 2;
-                        if (s < n_valid_arr[dt]) {
+                        if (p >= p_beg_arr[dt] && p < p_end_arr[dt]) {
                             float sc = acc[idx] * 0.0883883476f;
-                            scores[idx * m_max_ctx + s] = sc;
+                            scores[idx * m_max_ctx + s_rel] = sc;
                             if (sc > max_s[idx]) max_s[idx] = sc;
                         }
                     }
                 }
 
-                for (int idx = 0; idx < 16; ++idx) {
+                for (int idx = 0; idx < dt_cnt * 4; ++idx) {
                     int dt = idx >> 2;
                     int g = idx & 3;
-                    int n_valid = n_valid_arr[dt];
                     float *row_sc = scores + idx * m_max_ctx;
                     float ms = max_s[idx];
                     float sum_exp = 0.0f;
-                    for (int s = 0; s < n_valid; ++s) {
-                        float w = fast_expf_neg(row_sc[s] - ms);
-                        row_sc[s] = w;
+                    int s_beg = p_beg_arr[dt] - p_min;
+                    int s_end = p_end_arr[dt] - p_min;
+                    for (int s_rel = s_beg; s_rel < s_end; ++s_rel) {
+                        float w = fast_expf_neg(row_sc[s_rel] - ms);
+                        row_sc[s_rel] = w;
                         sum_exp += w;
                     }
                     float gate_val = gates[static_cast<size_t>(t_base + dt) * kQHeads + (qh_base + g)];
                     float inv_sum = gate_val / (sum_exp + 1e-12f);
-                    for (int s = 0; s < n_valid; ++s) row_sc[s] *= inv_sum;
+                    for (int s_rel = s_beg; s_rel < s_end; ++s_rel) row_sc[s_rel] *= inv_sum;
                 }
 
-                for (int s = 0; s < max_valid; ++s) {
-                    const float *v_vec = v_head + static_cast<size_t>(s) * kHeadDim;
-                    alignas(64) float p[16];
+                for (int s_rel = 0; s_rel < n_span; ++s_rel) {
+                    const int p = p_min + s_rel;
+                    const int slot = is_swa ? (p % kSwaCap) : p;
+                    const float *v_vec = v_head + static_cast<size_t>(slot) * kHeadDim;
+                    alignas(64) float p_wt[16];
                     float p_sum = 0.0f;
                     for (int idx = 0; idx < 16; ++idx) {
                         int dt = idx >> 2;
-                        float val = (s < n_valid_arr[dt]) ? scores[idx * m_max_ctx + s] : 0.0f;
-                        p[idx] = val;
+                        float val = (dt < dt_cnt && p >= p_beg_arr[dt] && p < p_end_arr[dt])
+                            ? scores[idx * m_max_ctx + s_rel] : 0.0f;
+                        p_wt[idx] = val;
                         p_sum += val;
                     }
                     if (p_sum <= 1e-8f) continue;
@@ -2406,11 +2559,11 @@ private:
                         float vv = v_vec[d];
                         float *orow = o_local[d];
                         #pragma omp simd
-                        for (int idx = 0; idx < 16; ++idx) orow[idx] += p[idx] * vv;
+                        for (int idx = 0; idx < 16; ++idx) orow[idx] += p_wt[idx] * vv;
                     }
                 }
 
-                for (int dt = 0; dt < 4; ++dt) {
+                for (int dt = 0; dt < dt_cnt; ++dt) {
                     int t = t_base + dt;
                     for (int g = 0; g < 4; ++g) {
                         int idx = dt * 4 + g;
@@ -2571,9 +2724,29 @@ private:
 
         const JsonValue &subs  = root["subgraphs"];
         const JsonValue &archs = root["archetype_shared"];
-        bool use_shared = m_use_shared_archetype_scales && archs.is_object();
 
-        auto parse_entry = [](const JsonValue &v, SubgraphScaleInfo &out) -> bool {
+        m_chan_scales_buf.clear();
+        std::string qcs_path = m_pkg_dir + "/quant_chan_scales.bin";
+        if (file_exists(qcs_path)) {
+            FILE *cf = std::fopen(qcs_path.c_str(), "rb");
+            if (cf) {
+                std::fseek(cf, 0, SEEK_END);
+                long sz = std::ftell(cf);
+                std::fseek(cf, 0, SEEK_SET);
+                if (sz > 0 && (sz % sizeof(float)) == 0) {
+                    m_chan_scales_buf.resize(static_cast<size_t>(sz) / sizeof(float));
+                    size_t n_read = std::fread(m_chan_scales_buf.data(), sizeof(float), m_chan_scales_buf.size(), cf);
+                    if (n_read != m_chan_scales_buf.size()) {
+                        m_chan_scales_buf.clear();
+                    }
+                }
+                std::fclose(cf);
+            }
+        }
+
+        bool use_shared = m_use_shared_archetype_scales && archs.is_object() && m_chan_scales_buf.empty();
+
+        auto parse_entry = [this](const JsonValue &v, SubgraphScaleInfo &out) -> bool {
             if (!v.is_object()) return false;
             out.in_dtype   = parse_boundary_dtype(v["input_dtype"].as_string("fp16"));
             out.out_dtype  = parse_boundary_dtype(v["output_dtype"].as_string("fp16"));
@@ -2581,7 +2754,19 @@ private:
             out.in_step    = static_cast<float>(v["input_step"].as_double(1.0 / 127.0));
             out.out_thresh = static_cast<float>(v["output_threshold"].as_double(1.0));
             out.out_step   = static_cast<float>(v["output_step"].as_double(1.0 / 127.0));
-            return (std::fabs(out.in_thresh - 1.0f) > 1e-5f);
+            out.in_inv_smooth = nullptr;
+            out.out_step_chan = nullptr;
+            if (!m_chan_scales_buf.empty() && v.has("in_smooth_offset") && v.has("out_step_offset")) {
+                size_t in_off  = static_cast<size_t>(v["in_smooth_offset"].as_int64(0));
+                size_t in_cnt  = static_cast<size_t>(v["in_smooth_count"].as_int64(0));
+                size_t out_off = static_cast<size_t>(v["out_step_offset"].as_int64(0));
+                size_t out_cnt = static_cast<size_t>(v["out_step_count"].as_int64(0));
+                if (in_off + in_cnt <= m_chan_scales_buf.size() && out_off + out_cnt <= m_chan_scales_buf.size()) {
+                    out.in_inv_smooth = m_chan_scales_buf.data() + in_off;
+                    out.out_step_chan = m_chan_scales_buf.data() + out_off;
+                }
+            }
+            return v.has("input_threshold") && (out.in_inv_smooth != nullptr || std::fabs(out.in_thresh - 1.0f) > 1e-5f);
         };
 
         for (int l = 0; l < kNumLayers; ++l) {
@@ -2618,8 +2803,9 @@ private:
             }
         }
 
-        std::printf("[+] Loaded quant_scales.json (%s scales, MLP out=%s, LMHead=%s)\n",
+        std::printf("[+] Loaded quant_scales.json (%s scales, SmoothQuant=%s, MLP out=%s, LMHead=%s)\n",
                     use_shared ? "archetype_shared" : "per-subgraph",
+                    m_chan_scales_buf.empty() ? "off" : "on",
                     (m_layer_npu[0].mlp_scale.out_dtype == BoundaryDtype::Int16) ? "int16" : "int8",
                     (m_die_models[0].lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? "int8" : "fp16");
         return true;
@@ -2645,6 +2831,7 @@ private:
     Tokenizer m_tokenizer;
 
     std::vector<float> m_cpu_weights_buf;
+    std::vector<float> m_chan_scales_buf;
     const float *m_emb_norm_weight = nullptr;
     LayerCpuWeights m_layer_cpu[kNumLayers];
     LayerNpuOffsets m_layer_npu[kNumLayers];
@@ -2672,6 +2859,8 @@ private:
     std::vector<uint16_t> m_glob_k_sum;
     std::vector<float> m_scores_ws;
     std::vector<float> m_logits;
+    std::vector<float> m_buf_h, m_buf_u, m_buf_bcx, m_buf_qkv, m_buf_y,
+                       m_buf_op_out, m_buf_h_mid, m_buf_v, m_buf_mlp_out, m_buf_gates;
 };
 
 static double cosine_similarity(const float *a, const float *b, size_t n) {
@@ -2700,11 +2889,225 @@ static std::string format_lfm3_chat(const std::string &user_prompt,
     return out;
 }
 
+static void run_daemon_server(Lfm3Engine &engine, int port) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::perror("socket failed");
+        return;
+    }
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        std::perror("bind failed");
+        close(server_fd);
+        return;
+    }
+    if (listen(server_fd, 5) < 0) {
+        std::perror("listen failed");
+        close(server_fd);
+        return;
+    }
+
+    std::printf("\n=================================================================\n");
+    std::printf(" LFM3-1.7B Resident Daemon Server listening on 0.0.0.0:%d\n", port);
+    std::printf(" Hot weights resident in dual-die MMZ, ready for OpenAI queries\n");
+    std::printf("=================================================================\n\n");
+
+    while (!g_interrupt_flag.load()) {
+        sockaddr_in client_addr{};
+        socklen_t addrlen = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+        if (client_fd < 0) {
+            if (g_interrupt_flag.load()) break;
+            continue;
+        }
+
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        std::printf("[Daemon] Client connected from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
+
+        std::string req_line;
+        char buf[4096];
+        bool got_newline = false;
+        std::vector<char> leftover;
+        while (!got_newline && !g_interrupt_flag.load()) {
+            ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            for (ssize_t i = 0; i < n; ++i) {
+                if (!got_newline) {
+                    if (buf[i] == '\n') {
+                        got_newline = true;
+                    } else {
+                        req_line.push_back(buf[i]);
+                    }
+                } else {
+                    leftover.push_back(buf[i]);
+                }
+            }
+        }
+
+        if (req_line.empty()) {
+            close(client_fd);
+            continue;
+        }
+
+        std::string parse_err;
+        auto j = eswin::JsonValue::parse(req_line, parse_err);
+        if (!parse_err.empty() || !j.is_object()) {
+            std::string err_resp = "{\"type\":\"error\",\"message\":\"Invalid JSON request: " + parse_err + "\"}\n";
+            send(client_fd, err_resp.data(), err_resp.size(), 0);
+            close(client_fd);
+            continue;
+        }
+
+        std::string prompt = j["prompt"].as_string("");
+        int max_new_tokens = j["max_tokens"].as_int(128);
+        float temperature = static_cast<float>(j["temperature"].as_double(0.1));
+        int top_k = j["top_k"].as_int(50);
+        bool no_think = j["no_think"].as_bool(true);
+        bool raw = j["raw"].as_bool(false);
+        bool return_logits = j["return_logits"].as_bool(false) || (max_new_tokens == 0);
+        int image_bytes = j["image_bytes"].as_int(0);
+
+        std::vector<float> visual_embeds;
+        if (image_bytes > 0 && (image_bytes % (Lfm3Engine::kHidden * sizeof(float)) == 0)) {
+            visual_embeds.resize(image_bytes / sizeof(float));
+            char *raw_dst = reinterpret_cast<char*>(visual_embeds.data());
+            size_t bytes_read = 0;
+            if (!leftover.empty()) {
+                size_t to_copy = std::min(leftover.size(), static_cast<size_t>(image_bytes));
+                std::memcpy(raw_dst, leftover.data(), to_copy);
+                bytes_read += to_copy;
+            }
+            while (bytes_read < static_cast<size_t>(image_bytes)) {
+                ssize_t r = recv(client_fd, raw_dst + bytes_read, image_bytes - bytes_read, 0);
+                if (r <= 0) break;
+                bytes_read += r;
+            }
+        }
+
+        engine.reset_state();
+        SamplerParams sp;
+        sp.temperature = temperature;
+        sp.top_k = top_k;
+        sp.repeat_penalty = 1.1f;
+        sp.repeat_window = 64;
+        Sampler sampler(sp);
+
+        std::string formatted = prompt;
+        if (!raw && prompt.find("<|im_start|>") == std::string::npos) {
+            formatted = format_lfm3_chat(prompt, "You are a helpful AI assistant.", !no_think);
+        }
+
+        std::vector<int32_t> prompt_ids = engine.tokenizer().encode(formatted, false);
+        for (int32_t id : prompt_ids) sampler.accept(id);
+
+        StageTimers prefill_t, decode_t;
+        g_in_generation.store(true);
+
+        const float *vis_ptr = visual_embeds.empty() ? nullptr : visual_embeds.data();
+        size_t num_vis_tok = visual_embeds.size() / Lfm3Engine::kHidden;
+
+        if (!engine.prefill(prompt_ids, prefill_t, vis_ptr, num_vis_tok)) {
+            std::string err_resp = "{\"type\":\"error\",\"message\":\"Prefill failed on NPU\"}\n";
+            send(client_fd, err_resp.data(), err_resp.size(), 0);
+            g_in_generation.store(false);
+            close(client_fd);
+            continue;
+        }
+
+        if (return_logits) {
+            std::ostringstream l_ss;
+            l_ss << "{\"type\":\"logits\",\"prompt_tokens\":" << prompt_ids.size()
+                 << ",\"prefill_ms\":" << prefill_t.total_ms() << ",\"logits\":{";
+            const auto &all_logits = engine.logits();
+            if (j["requested_tokens"].is_array()) {
+                const auto &arr = j["requested_tokens"].as_array();
+                for (size_t qi = 0; qi < arr.size(); ++qi) {
+                    int32_t tid = arr[qi].as_int(-1);
+                    if (tid >= 0 && tid < Lfm3Engine::kVocab) {
+                        if (qi > 0) l_ss << ",";
+                        l_ss << "\"" << tid << "\":" << all_logits[tid];
+                    }
+                }
+            }
+            l_ss << "}}\n";
+            std::string l_resp = l_ss.str();
+            send(client_fd, l_resp.data(), l_resp.size(), 0);
+            g_in_generation.store(false);
+            close(client_fd);
+            std::printf("[Daemon] Decision query completed: %zu prompt tok, %.1f ms prefill\n",
+                        prompt_ids.size(), prefill_t.total_ms());
+            continue;
+        }
+
+        int step = 0;
+        for (; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
+            int32_t next_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
+            sampler.accept(next_id);
+
+            if (next_id == 124900) break; // <|im_end|>
+            if (next_id == 124902) {      // </think>
+                if (step + 1 < max_new_tokens) {
+                    engine.forward_chunk(&next_id, 1, true, decode_t);
+                }
+                continue;
+            }
+
+            std::string piece = engine.tokenizer().decode_token(next_id);
+            std::ostringstream esc;
+            for (char c : piece) {
+                if (c == '"') esc << "\\\"";
+                else if (c == '\\') esc << "\\\\";
+                else if (c == '\n') esc << "\\n";
+                else if (c == '\r') esc << "\\r";
+                else if (c == '\t') esc << "\\t";
+                else esc << c;
+            }
+
+            std::string tok_event = "{\"type\":\"token\",\"token_id\":" + std::to_string(next_id) +
+                                    ",\"text\":\"" + esc.str() + "\"}\n";
+#if defined(MSG_NOSIGNAL)
+            if (send(client_fd, tok_event.data(), tok_event.size(), MSG_NOSIGNAL) < 0) break;
+#else
+            if (send(client_fd, tok_event.data(), tok_event.size(), 0) < 0) break;
+#endif
+            if (step + 1 < max_new_tokens) {
+                if (!engine.forward_chunk(&next_id, 1, true, decode_t)) break;
+            }
+        }
+        g_in_generation.store(false);
+
+        std::string done_event = "{\"type\":\"done\",\"prompt_tokens\":" + std::to_string(prompt_ids.size()) +
+                                 ",\"completion_tokens\":" + std::to_string(step) +
+                                 ",\"prefill_ms\":" + std::to_string(prefill_t.total_ms()) +
+                                 ",\"decode_ms\":" + std::to_string(decode_t.total_ms()) + "}\n";
+#if defined(MSG_NOSIGNAL)
+        send(client_fd, done_event.data(), done_event.size(), MSG_NOSIGNAL);
+#else
+        send(client_fd, done_event.data(), done_event.size(), 0);
+#endif
+        close(client_fd);
+        std::printf("[Daemon] Turn completed: %zu prompt tok (%.1f ms), %d decode tok (%.1f ms = %.2f tok/s)\n",
+                    prompt_ids.size(), prefill_t.total_ms(), step, decode_t.total_ms(),
+                    decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0);
+    }
+    close(server_fd);
+    std::printf("[+] LFM3 Daemon shut down cleanly.\n");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::signal(SIGINT, sigint_handler);
+    std::signal(SIGPIPE, SIG_IGN);
     init_fp16_lut();
     omp_set_num_threads(8);
 
@@ -2744,6 +3147,8 @@ int main(int argc, char **argv) {
     bool force_int8 = false;
     bool use_shared_archetype_scales = true;
     bool ab_shared_weights = false;
+    bool daemon_mode = false;
+    int daemon_port = 8088;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -2768,6 +3173,12 @@ int main(int argc, char **argv) {
         else if (a == "--int8") force_int8 = true;
         else if (a == "--per-subgraph-scales") use_shared_archetype_scales = false;
         else if (a == "--weights-layer0") ab_shared_weights = true;
+        else if (a == "--daemon" || a == "--server") {
+            daemon_mode = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                daemon_port = std::stoi(argv[++i]);
+            }
+        }
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
                         "          [--int8] [--per-subgraph-scales] [--weights-layer0] [--prompt TEXT] [--max-tokens N]\n"
@@ -2790,6 +3201,11 @@ int main(int argc, char **argv) {
     }
 
     if (!engine.init(pkg_dir, max_ctx)) return 1;
+
+    if (daemon_mode) {
+        run_daemon_server(engine, daemon_port);
+        return 0;
+    }
 
     if (bench_attn) {
         engine.benchmark_global_attention_kernel();
@@ -2853,10 +3269,16 @@ int main(int argc, char **argv) {
         double pt_cos  = cosine_similarity(engine.logits().data(), gold_pt_logits.data(), 128000);
         double ort_cos = cosine_similarity(engine.logits().data(), gold_ort_logits.data(), 128000);
 
-        std::printf("  • Min Layer Cosine across all 24 layers     : %.8f\n", min_layer_cos);
+        const bool is_int8_pkg = engine.is_quant_active();
+        const double min_layer_gate = is_int8_pkg ? 0.9800 : 0.9990;
+        const double logit_gate     = is_int8_pkg ? 0.9900 : 0.9990;
+        const double speed_gate     = is_int8_pkg ? 4.00   : 1.80;
+
+        std::printf("  • Min Layer Cosine across all 24 layers     : %.8f [gate >= %.4f: %s]\n",
+                    min_layer_cos, min_layer_gate, (min_layer_cos >= min_layer_gate) ? "PASS" : "FAIL");
         std::printf("  • Final embedding_norm Cosine               : %.8f\n", emb_cos);
-        std::printf("  • 128K Logits Cosine vs PyTorch FP32        : %.8f [gate >= 0.9990: %s]\n",
-                    pt_cos, (pt_cos >= 0.9990) ? "PASS" : "FAIL");
+        std::printf("  • 128K Logits Cosine vs PyTorch FP32        : %.8f [gate >= %.4f: %s]\n",
+                    pt_cos, logit_gate, (pt_cos >= logit_gate) ? "PASS" : "FAIL");
         std::printf("  • 128K Logits Cosine vs ONNX Runtime FP16   : %.8f\n", ort_cos);
 
         // ------------------------------------------------------------------
@@ -2983,18 +3405,20 @@ int main(int argc, char **argv) {
         }
 
         std::printf("\n[3/3] Per-Stage Timing Breakdown & Throughput Gate Verification:\n");
-        prefill_timers.print_report("Prefill (6 tokens, T=1 path)");
+        const bool force_t1 = (std::getenv("LFM3_PREFILL_T1") != nullptr);
+        prefill_timers.print_report(force_t1 ? "Prefill (6 tokens, T=1 path)"
+                                             : "Prefill (6 tokens, T=64 batched path)");
         decode_timers.print_report("Autoregressive Decode (16 tokens)");
         decode_timers.print_arch_report();
         engine.print_extent_report();
 
         double decode_tok_s = 1000.0 * decode_timers.tokens_run / decode_timers.total_ms();
-        bool speed_pass = (decode_tok_s >= 1.80);
+        bool speed_pass = (decode_tok_s >= speed_gate);
         std::printf("\n  • Greedy 4-Token Exact Match : %s\n", all_match ? "PASS (4/4 exact)" : "FAIL");
-        std::printf("  • Sustained FP16 Decode Speed: %.2f tokens/sec (gate >= 1.80 tok/s) [%s]\n",
-                    decode_tok_s, speed_pass ? "PASS" : "FAIL");
+        std::printf("  • Sustained %s Decode Speed: %.2f tokens/sec (gate >= %.2f tok/s) [%s]\n",
+                    is_int8_pkg ? "INT8" : "FP16", decode_tok_s, speed_gate, speed_pass ? "PASS" : "FAIL");
         std::printf("=================================================================\n");
-        return (all_match && pt_cos >= 0.9990 && speed_pass) ? 0 : 1;
+        return (all_match && min_layer_cos >= min_layer_gate && pt_cos >= logit_gate && speed_pass) ? 0 : 1;
     }
 
     // -------------------------------------------------------------------------
@@ -3007,11 +3431,24 @@ int main(int argc, char **argv) {
     sp.repeat_window = 64;
     sp.max_consecutive_duplicates = 2;
     Sampler sampler(sp);
+    std::string current_image_path;
+    std::vector<float> current_image_embeds;
 
     auto run_chat_turn = [&](const std::string &user_text) {
         engine.reset_state();
         sampler.reset();
-        std::string formatted = format_lfm3_chat(user_text, system_prompt, enable_thinking);
+        std::string prompt_text = user_text;
+        const float *vis_ptr = nullptr;
+        size_t num_vis_tok = 0;
+        if (!current_image_embeds.empty()) {
+            num_vis_tok = current_image_embeds.size() / Lfm3Engine::kHidden;
+            vis_ptr = current_image_embeds.data();
+            std::string vis_str = "<|vision_start|>";
+            for (size_t vi = 0; vi < num_vis_tok; ++vi) vis_str += "<|image|>";
+            vis_str += "<|vision_end|>\n";
+            prompt_text = vis_str + user_text;
+        }
+        std::string formatted = format_lfm3_chat(prompt_text, system_prompt, enable_thinking);
         std::vector<int32_t> prompt_ids = engine.tokenizer().encode(formatted, false);
         for (int32_t id : prompt_ids) sampler.accept(id);
 
@@ -3019,7 +3456,7 @@ int main(int argc, char **argv) {
         g_interrupt_flag.store(false);
         g_in_generation.store(true);
 
-        if (!engine.prefill(prompt_ids, prefill_t)) {
+        if (!engine.prefill(prompt_ids, prefill_t, vis_ptr, num_vis_tok)) {
             std::printf("\n[ERROR: prefill failed]\n");
             g_in_generation.store(false);
             return;
@@ -3074,7 +3511,7 @@ int main(int argc, char **argv) {
     }
 
     std::cout << COLOR_BOLD << COLOR_CYAN
-              << "LFM3-1.7B Interactive Dual-Die Chat REPL (type '/exit' to quit, '/nothink' to toggle thinking)"
+              << "LFM3-1.7B Interactive Dual-Die Chat REPL (type '/exit' to quit, '/nothink' to toggle thinking, '/image <path>' to load image)"
               << COLOR_RESET << std::endl;
     std::string line;
     while (true) {
@@ -3085,6 +3522,36 @@ int main(int argc, char **argv) {
             enable_thinking = !enable_thinking;
             std::cout << COLOR_YELLOW << (enable_thinking ? "[Thinking enabled]" : "[Thinking disabled]")
                       << COLOR_RESET << std::endl;
+            continue;
+        }
+        if (line.rfind("/image ", 0) == 0) {
+            std::string p = line.substr(7);
+            while (!p.empty() && std::isspace(p.front())) p.erase(0, 1);
+            while (!p.empty() && std::isspace(p.back())) p.pop_back();
+            if (!file_exists(p)) {
+                std::cout << COLOR_RED << "[File not found: " << p << "]" << COLOR_RESET << std::endl;
+                continue;
+            }
+            current_image_path = p;
+            current_image_embeds.clear();
+            if (p.rfind(".bin") != std::string::npos || p.rfind(".raw") != std::string::npos) {
+                FILE *f = std::fopen(p.c_str(), "rb");
+                if (f) {
+                    std::fseek(f, 0, SEEK_END);
+                    long sz = std::ftell(f);
+                    std::fseek(f, 0, SEEK_SET);
+                    if (sz > 0 && sz % (Lfm3Engine::kHidden * sizeof(float)) == 0) {
+                        current_image_embeds.resize(sz / sizeof(float));
+                        if (std::fread(current_image_embeds.data(), 1, sz, f) == static_cast<size_t>(sz)) {
+                            std::cout << COLOR_GREEN << "[Loaded " << (sz / (Lfm3Engine::kHidden * sizeof(float)))
+                                      << " visual tokens from " << p << "]" << COLOR_RESET << std::endl;
+                        }
+                    }
+                    std::fclose(f);
+                }
+            } else {
+                std::cout << COLOR_GREEN << "[Image selected: " << p << ". Note: use client/server or .bin visual embeddings]" << COLOR_RESET << std::endl;
+            }
             continue;
         }
         if (line.empty()) continue;

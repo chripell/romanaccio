@@ -5,7 +5,11 @@ Milestone 5: Direct NVDLA INT8/INT16 Weight & CvtPrecision_QuantM Package Builde
 Synthesizes:
   - 8 Shared Class B Archetype Loadables (lfm3_{conv_in,proj2048,attn_qkv,mlp}_{t1,t64}_classb.model)
   - Contiguous 4K-aligned per-die weight blobs (weights_die0.bin = 0.878 GiB, weights_die1.bin = 0.872 GiB)
-    using the verified maxdiff=0 float64 NVDLA INT8/INT16 weight tiler and CvtPrecision_QuantM formula
+    using the verified maxdiff=0 float64 NVDLA INT8/INT16 weight tiler and CvtPrecision_QuantM formula,
+    with SmoothQuant input channel balancing (1 / s_in[c]) and per-output-channel CvtPrecision_QuantM
+    output steps (out_step_chan[c]) to eliminate Sandwich-RMSNorm denominator-anchor sink quantization
+    collapse and t=0 boundary clipping without recompiling any .model files.
+  - Per-channel scale sidecar (quant_chan_scales.bin) + updated quant_scales.json
   - 8 x 16,000-channel INT8 LM Head slices (lfm3_lm_head_d{0,1}_s{0..3}.model, 33.23 MiB each)
 """
 
@@ -17,11 +21,17 @@ import shutil
 import subprocess
 from pathlib import Path
 import numpy as np
+import torch
+import torch.nn.functional as F
 from safetensors import safe_open
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eswin_compiler"))
 from backend.flatbuffer_emitter import ModelReader, ModelWriter
 from backend.dynamic_weight_binding import find_weight_regions
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from calibrate_lfm3_int8 import CALIB_SENTENCES
 
 MODEL_DIR   = Path("/home/chri/aixigua/deep/models/LFM3-1.7B")
 TABLES_DIR  = Path("/home/chri/aixigua/deep/artifacts/lfm3_quant_tables")
@@ -42,7 +52,7 @@ TRUNCS = {
 }
 
 
-def patch_model_truncates(src_model: Path, dst_model: Path, new_truncs: list[int], align_mlp_t64_to_t1: Path = None):
+def patch_model_truncates(src_model: Path, dst_model: Path, new_truncs: list[int], align_mlp_t1_to_t64: Path = None):
     m = ModelReader.read_file(str(src_model))
     for b in m.blobs:
         if b.name == "kmd-task-op_list":
@@ -54,35 +64,40 @@ def patch_model_truncates(src_model: Path, dst_model: Path, new_truncs: list[int
                 op_bytes[off] = val
             b.data = bytes(op_bytes)
 
-    if align_mlp_t64_to_t1 is not None:
-        m_t1 = ModelReader.read_file(str(align_mlp_t64_to_t1))
-        r1 = find_weight_regions(m_t1)[0]
-        r64 = find_weight_regions(m)[0]
+    if align_mlp_t1_to_t64 is not None:
+        m_t64 = ModelReader.read_file(str(align_mlp_t1_to_t64))
+        r1 = find_weight_regions(m)[0]
+        r64 = find_weight_regions(m_t64)[0]
         for b in m.blobs:
             if b.name == "kmd-task-surf_list":
                 surf_bytes = bytearray(b.data)
-                for idx in range(60, 124):
-                    if r64.offsets[idx] != r1.offsets[idx]:
-                        b64 = struct.pack("<I", r64.offsets[idx])
+                for idx in range(123, 59, -1):
+                    if r1.offsets[idx] != r64.offsets[idx]:
                         b1  = struct.pack("<I", r1.offsets[idx])
-                        locs = [i for i in range(0, len(surf_bytes)-4, 4) if surf_bytes[i:i+4] == b64]
+                        b64 = struct.pack("<I", r64.offsets[idx])
+                        locs = [i for i in range(0, len(surf_bytes)-4, 4) if surf_bytes[i:i+4] == b1]
                         assert len(locs) == 1
-                        surf_bytes[locs[0]:locs[0]+4] = b1
+                        surf_bytes[locs[0]:locs[0]+4] = b64
                 b.data = bytes(surf_bytes)
-            elif b.name.startswith("CvtPrecision_QuantM") and len(b.data) == 256:
-                b.data = bytes(b.data)[:128]
-        r64.offsets = list(r1.offsets)
-        r64.size = r1.size
+            elif b.name.startswith("CvtPrecision_QuantM") and len(b.data) == 128:
+                b.data = bytes(b.data) * 2
+        for a in m.address_list:
+            if a.mem_id == r1.id:
+                a.size = r64.size
+        r1.offsets = list(r64.offsets)
+        r1.size = r64.size
 
     ModelWriter.write_file(m, str(dst_model))
 
 
-def tile_int8_slice(w_slice: np.ndarray) -> tuple[bytes, np.ndarray]:
-    """Quantizes [M_s, K] FP32 -> per-channel INT8 in float64 (round-to-even) and tiles for NVDLA CMAC."""
+def tile_int8_slice(w_slice: np.ndarray, max_ws: float = None) -> tuple[bytes, np.ndarray]:
+    """Quantizes [M_s, K] FP32/FP64 -> per-channel INT8 in float64 (round-to-even) and tiles for NVDLA CMAC."""
     M_s, K = w_slice.shape
     w_f64 = w_slice.astype(np.float64)
     w_amax = np.maximum(np.max(np.abs(w_f64), axis=1, keepdims=True), 1e-12)
     w_step = w_amax / 127.0
+    if max_ws is not None:
+        w_step = np.minimum(w_step, max_ws)
     w_q = np.clip(np.round(w_f64 / w_step), -127, 127).astype(np.int8)
     K_pad = ((K + 95) // 96) * 96
     wp = np.zeros((M_s, K_pad), dtype=np.int8)
@@ -92,7 +107,7 @@ def tile_int8_slice(w_slice: np.ndarray) -> tuple[bytes, np.ndarray]:
 
 
 def tile_int16_slice(w_slice: np.ndarray) -> tuple[bytes, np.ndarray]:
-    """Quantizes [M_s, K] FP32 -> per-channel INT16 in float64 (round-to-even) and tiles for NVDLA CMAC."""
+    """Quantizes [M_s, K] FP32/FP64 -> per-channel INT16 in float64 (round-to-even) and tiles for NVDLA CMAC."""
     M_s, K = w_slice.shape
     w_f64 = w_slice.astype(np.float64)
     w_amax = np.maximum(np.max(np.abs(w_f64), axis=1, keepdims=True), 1e-12)
@@ -105,53 +120,182 @@ def tile_int16_slice(w_slice: np.ndarray) -> tuple[bytes, np.ndarray]:
     return tiled.tobytes(), w_step[:, 0]
 
 
-def build_single_conv_region(w_f32: np.ndarray, tbl: dict, tmpl_model_path: Path, trunc: int) -> bytes:
+def collect_calibration_activations() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Runs 30 calibration sentences (with and without BOS at t=0) to collect channel statistics."""
+    print("[+] Collecting SmoothQuant & per-channel calibration statistics (60 x 16 tokens, including t=0)...")
+    tok = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+    batch_ids = []
+    for s in CALIB_SENTENCES[:30]:
+        body = tok.encode(s, add_special_tokens=False)
+        while len(body) < 16:
+            body = body + body
+        batch_ids.append(body[:16])
+        batch_ids.append(([tok.bos_token_id] + body[:15])[:16])
+    calib_ids = torch.tensor(batch_ids, dtype=torch.long)
+
+    model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), trust_remote_code=True, dtype=torch.float32)
+    model.eval()
+    cfg = json.loads((MODEL_DIR / "config.json").read_text())
+    layer_types = cfg["layer_types"]
+
+    calib_x, calib_y = {}, {}
+
+    def cap_hook(k: str, c_in: int, c_out: int = None):
+        def fn(m, i, o):
+            calib_x[k] = i[0].detach().reshape(-1, c_in).cpu()
+            if c_out is not None:
+                calib_y[k] = o.detach().reshape(-1, c_out).cpu()
+        return fn
+
+    hooks = []
+    for l in range(24):
+        layer = model.model.layers[l]
+        if layer_types[l] == "conv":
+            hooks.append(layer.conv.in_proj.register_forward_hook(cap_hook(f"lfm3_l{l:02d}_conv_in", 2048)))
+            hooks.append(layer.conv.out_proj.register_forward_hook(cap_hook(f"lfm3_l{l:02d}_conv_out", 2048)))
+        else:
+            hooks.append(layer.self_attn.q_proj.register_forward_hook(cap_hook(f"lfm3_l{l:02d}_attn_qkv", 2048)))
+            hooks.append(layer.self_attn.o_proj.register_forward_hook(cap_hook(f"lfm3_l{l:02d}_attn_out", 2048)))
+        hooks.append(layer.feed_forward.register_forward_hook(cap_hook(f"lfm3_l{l:02d}_mlp", 2048, 2048)))
+
+    with torch.no_grad():
+        model(calib_ids, use_cache=False)
+    for h in hooks:
+        h.remove()
+    del model
+    return calib_x, calib_y
+
+
+def build_single_conv_region(
+    w_f32: np.ndarray,
+    calib_x: torch.Tensor,
+    tmpl_model_path: Path,
+    trunc: int,
+) -> tuple[bytes, float, float, np.ndarray, np.ndarray]:
+    """
+    Builds a 1x1 Conv2D Class B weight region with SmoothQuant input channel balancing and
+    per-output-channel CvtPrecision_QuantM steps.
+    Returns (region_bytes, in_thresh, in_step, in_inv_smooth_f32, out_step_chan_f32).
+    """
     m = ModelReader.read_file(str(tmpl_model_path))
     reg = find_weight_regions(m)[0]
     buf = bytearray(reg.size)
-    in_s  = float(tbl["blob_info"]["input"]["int8_step"])
-    out_s = float(tbl["blob_info"]["output"]["int8_step"])
+
+    w0 = torch.from_numpy(w_f32).float()
+    x = calib_x.float()
+    s_x = x.pow(2).mean(dim=0).sqrt().clamp(min=1e-5)
+    s_w = w0.abs().amax(dim=0).clamp(min=1e-5)
+    s_in = (s_x / s_w).sqrt().clamp(min=0.05, max=20.0)
+    in_inv_smooth = (1.0 / s_in).float().numpy()
+
+    x_sc = x / s_in
+    amax_tok = x_sc.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    in_t = float(amax_tok.max().item())
+    in_s = in_t / 127.0
+    x_q = torch.clamp(torch.round(x_sc * (127.0 / amax_tok)), -127.0, 127.0).double()
+
+    w_sc = (w0 * s_in.unsqueeze(0)).double()
+    ws = w_sc.abs().amax(dim=1).clamp(min=1e-12) / 127.0
+    wq = torch.clamp(torch.round(w_sc / ws.unsqueeze(1)), -127.0, 127.0)
+    u_c = w_sc.norm(dim=1).clamp(min=1e-8)
+    y_norm_max = (F.linear(x_q, wq).abs().amax(dim=0)) * (in_s * ws)
+    qf = torch.quantile(y_norm_max / u_c, 0.80)
+    y_bound_c = torch.maximum(y_norm_max * 1.15, qf * u_c * 1.15)
+    out_s_c = (y_bound_c / 127.0).numpy()
+
+    w_sc_np = w_sc.numpy()
+    out_step_chan = np.zeros(w_f32.shape[0], dtype=np.float32)
     n_slices = len(reg.contents) // 2
     for s in range(n_slices):
-        w_bytes, w_step = tile_int8_slice(w_f32[s*512:(s+1)*512])
-        qm_f = np.round((in_s * w_step / out_s) * (1 << trunc))
-        assert np.max(np.abs(qm_f)) <= 32767, f"QuantM overflow: {np.max(np.abs(qm_f))}"
+        sl = slice(s * 512, (s + 1) * 512)
+        w_bytes, w_step = tile_int8_slice(w_sc_np[sl])
+        qm_f = np.clip(np.round((in_s * w_step / out_s_c[sl]) * (1 << trunc)), 1.0, 32767.0)
+        out_step_chan[sl] = ((in_s * w_step * (1 << trunc)) / qm_f).astype(np.float32)
         qm = qm_f.astype(np.int16).tobytes()
         buf[reg.offsets[2*s]:reg.offsets[2*s]+len(w_bytes)] = w_bytes
         buf[reg.offsets[2*s+1]:reg.offsets[2*s+1]+len(qm)]  = qm
-    return bytes(buf)
+
+    return bytes(buf), in_t, in_s, in_inv_smooth, out_step_chan
 
 
-def build_mlp_region(w1: np.ndarray, w3: np.ndarray, w2: np.ndarray, tbl: dict, tmpl_model_path: Path) -> bytes:
+def build_mlp_region(
+    w1: np.ndarray,
+    w3: np.ndarray,
+    w2: np.ndarray,
+    calib_x: torch.Tensor,
+    calib_y: torch.Tensor,
+    tbl: dict,
+    tmpl_model_path: Path,
+) -> tuple[bytes, float, float, np.ndarray, np.ndarray]:
+    """
+    Builds a SwiGLU MLP Class B weight region with SmoothQuant input channel balancing (with t=0
+    spike capping), per-layer in_s, and per-output-channel w2 output steps.
+    Returns (region_bytes, in_thresh, in_step, in_inv_smooth_f32, out_step_chan_f32).
+    """
     m = ModelReader.read_file(str(tmpl_model_path))
     reg = find_weight_regions(m)[0]
     buf = bytearray(reg.size)
-    in_s  = float(tbl["blob_info"]["input"]["int8_step"])
-    c0_s  = float(tbl["blob_info"]["/Conv_output_0"]["int16_step"])
-    c1_s  = float(tbl["blob_info"]["/Conv_1_output_0"]["int16_step"])
-    m1_s  = float(tbl["blob_info"]["/Mul_1_output_0"]["int16_step"])
-    out_s = float(tbl["blob_info"]["output"]["int16_step"])
+
+    c0_s = float(tbl["blob_info"]["/Conv_output_0"]["int16_step"])
+    c1_s = float(tbl["blob_info"]["/Conv_1_output_0"]["int16_step"])
+    m1_s = float(tbl["blob_info"]["/Mul_1_output_0"]["int16_step"])
+
+    w1_t = torch.from_numpy(w1).float()
+    w3_t = torch.from_numpy(w3).float()
+    w2_t = torch.from_numpy(w2).float()
+    x = calib_x.float()
+    y = calib_y.float()
+
+    s_x_95 = torch.quantile(x.abs(), 0.95, dim=0).clamp(min=1e-5)
+    s_x_max = x.abs().amax(dim=0).clamp(min=1e-5)
+    s_w = torch.maximum(w1_t.abs().amax(dim=0), w3_t.abs().amax(dim=0)).clamp(min=1e-5)
+    s_in_base = (s_x_95 / s_w).sqrt().clamp(min=0.05, max=25.0)
+    target_x = torch.quantile(s_x_95 / s_in_base, 0.98)
+    s_in = torch.maximum(s_in_base, s_x_max / target_x)
+    in_inv_smooth = (1.0 / s_in).float().numpy()
+
+    x_sc = x / s_in
+    in_t = float(x_sc.abs().amax().item() * 1.05)
+    in_s = in_t / 127.0
+
+    w1_sc_np = (w1_t * s_in.unsqueeze(0)).double().numpy()
+    w3_sc_np = (w3_t * s_in.unsqueeze(0)).double().numpy()
+    max_ws1 = 32767.0 * c0_s / (in_s * (1 << 14))
+    max_ws3 = 32767.0 * c1_s / (in_s * (1 << 15))
 
     for s in range(15):
-        wb, ws = tile_int8_slice(w1[s*512:(s+1)*512])
-        qm = np.round((in_s * ws / c0_s) * (1 << 14)).astype(np.int16).tobytes()
+        sl = slice(s * 512, (s + 1) * 512)
+        wb, ws = tile_int8_slice(w1_sc_np[sl], max_ws=max_ws1)
+        qm = np.clip(np.round((in_s * ws / c0_s) * (1 << 14)), 1.0, 32767.0).astype(np.int16).tobytes()
         buf[reg.offsets[2*s]:reg.offsets[2*s]+len(wb)] = wb
         buf[reg.offsets[2*s+1]:reg.offsets[2*s+1]+len(qm)] = qm
 
     for s in range(15):
         idx = 30 + 2 * s
-        wb, ws = tile_int8_slice(w3[s*512:(s+1)*512])
-        qm = np.round((in_s * ws / c1_s) * (1 << 15)).astype(np.int16).tobytes()
+        sl = slice(s * 512, (s + 1) * 512)
+        wb, ws = tile_int8_slice(w3_sc_np[sl], max_ws=max_ws3)
+        qm = np.clip(np.round((in_s * ws / c1_s) * (1 << 15)), 1.0, 32767.0).astype(np.int16).tobytes()
         buf[reg.offsets[idx]:reg.offsets[idx]+len(wb)] = wb
         buf[reg.offsets[idx+1]:reg.offsets[idx+1]+len(qm)] = qm
 
+    u2_c = w2_t.double().norm(dim=1).clamp(min=1e-8)
+    y_max_c = y.abs().amax(dim=0).double()
+    q80 = torch.quantile(y_max_c / u2_c, 0.80)
+    y_bound_c = torch.maximum(y_max_c * 1.20, q80 * u2_c * 1.20)
+    out_s_c = (y_bound_c / 32767.0).numpy()
+
+    out_step_chan = np.zeros(w2.shape[0], dtype=np.float32)
     for s in range(32):
         idx = 60 + 2 * s
-        wb, ws = tile_int16_slice(w2[s*64:(s+1)*64])
-        qm = np.round((m1_s * ws / out_s) * (1 << 28)).astype(np.int16).tobytes()
+        sl = slice(s * 64, (s + 1) * 64)
+        wb, ws = tile_int16_slice(w2[sl])
+        qm_f = np.clip(np.round((m1_s * ws / out_s_c[sl]) * (1 << 28)), 1.0, 32767.0)
+        out_step_chan[sl] = ((m1_s * ws * (1 << 28)) / qm_f).astype(np.float32)
+        qm = qm_f.astype(np.int16).tobytes() * 2
         buf[reg.offsets[idx]:reg.offsets[idx]+len(wb)] = wb
         buf[reg.offsets[idx+1]:reg.offsets[idx+1]+len(qm)] = qm
-    return bytes(buf)
+
+    return bytes(buf), in_t, in_s, in_inv_smooth, out_step_chan
 
 
 def main():
@@ -182,14 +326,20 @@ def main():
     for key, src_p in tmpl_paths.items():
         arch = key.rsplit("_", 1)[0]
         stem = f"lfm3_{key}"
+        dst_cb = PKG_INT8 / "models" / f"{stem}_classb.model"
+        if dst_cb.exists() and key not in ("mlp_t1", "mlp_t64"):
+            print(f"[+] Keeping existing Class B archetype {stem}_classb.model ({dst_cb.stat().st_size} B)")
+            continue
         patched_p = cb_work / f"{stem}.model"
-        align_t1 = tmpl_paths["mlp_t1"] if key == "mlp_t64" else None
-        patch_model_truncates(src_p, patched_p, TRUNCS[arch], align_mlp_t64_to_t1=align_t1)
+        align_t64 = tmpl_paths["mlp_t64"] if key == "mlp_t1" else None
+        patch_model_truncates(src_p, patched_p, TRUNCS[arch], align_mlp_t1_to_t64=align_t64)
         subprocess.run([VENV_PY, str(COMPILER_PY), "-m", str(patched_p), "-o", str(cb_work), "--convert-weights"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cb_out = cb_work / f"{stem}_classb.model"
-        shutil.copy2(cb_out, PKG_INT8 / "models" / f"{stem}_classb.model")
+        shutil.copy2(cb_out, dst_cb)
         print(f"[+] Built Class B archetype {stem}_classb.model ({cb_out.stat().st_size} B)")
+
+    calib_x, calib_y = collect_calibration_activations()
 
     st = safe_open(str(MODEL_DIR / "model.safetensors"), framework="pt")
     cfg = json.loads((MODEL_DIR / "config.json").read_text())
@@ -200,6 +350,32 @@ def main():
     die_files = {0: open(PKG_INT8 / "weights_die0.bin", "wb"), 1: open(PKG_INT8 / "weights_die1.bin", "wb")}
     die_offs  = {0: 0, 1: 0}
     w_map     = {}
+    chan_floats = []
+
+    def append_chan_vec(arr: np.ndarray) -> tuple[int, int]:
+        off = len(chan_floats)
+        arr_f32 = np.ascontiguousarray(arr, dtype=np.float32).ravel()
+        chan_floats.extend(arr_f32.tolist())
+        return off, int(arr_f32.size)
+
+    def record_scale_entry(k_name: str, in_dt: str, out_dt: str, in_t: float, in_s: float,
+                           in_inv: np.ndarray, out_step_c: np.ndarray):
+        in_off, in_cnt = append_chan_vec(in_inv)
+        out_off, out_cnt = append_chan_vec(out_step_c)
+        out_s_med = float(np.median(out_step_c))
+        out_div = 32767.0 if out_dt == "int16" else 127.0
+        qs["subgraphs"][k_name] = {
+            "input_dtype": in_dt,
+            "output_dtype": out_dt,
+            "input_threshold": float(in_t),
+            "input_step": float(in_s),
+            "output_threshold": float(out_s_med * out_div),
+            "output_step": float(out_s_med),
+            "in_smooth_offset": in_off,
+            "in_smooth_count": in_cnt,
+            "out_step_offset": out_off,
+            "out_step_count": out_cnt,
+        }
 
     for l in range(24):
         d_id = 0 if l < 12 else 1
@@ -207,38 +383,45 @@ def main():
         lt = layer_types[l]
         if lt == "conv":
             k_in, k_out = f"lfm3_l{l:02d}_conv_in", f"lfm3_l{l:02d}_conv_out"
-            t_in  = json.loads((TABLES_DIR / f"{k_in}_table.json").read_text())
-            t_out = json.loads((TABLES_DIR / f"{k_out}_table.json").read_text())
             w_in  = st.get_tensor(pfx + "conv.in_proj.weight").float().numpy()
             w_out = st.get_tensor(pfx + "conv.out_proj.weight").float().numpy()
-            b_in  = build_single_conv_region(w_in,  t_in,  tmpl_paths["conv_in_t1"],  22)
-            b_out = build_single_conv_region(w_out, t_out, tmpl_paths["proj2048_t1"], 22)
+            b_in, in_t_i, in_s_i, inv_i, osc_i = build_single_conv_region(
+                w_in, calib_x[k_in], tmpl_paths["conv_in_t1"], 22)
+            b_out, in_t_o, in_s_o, inv_o, osc_o = build_single_conv_region(
+                w_out, calib_x[k_out], tmpl_paths["proj2048_t1"], 22)
         else:
             k_in, k_out = f"lfm3_l{l:02d}_attn_qkv", f"lfm3_l{l:02d}_attn_out"
-            t_in  = json.loads((TABLES_DIR / f"{k_in}_table.json").read_text())
-            t_out = json.loads((TABLES_DIR / f"{k_out}_table.json").read_text())
             wq = st.get_tensor(pfx + "self_attn.q_proj.weight").float().numpy()
             wk = st.get_tensor(pfx + "self_attn.k_proj.weight").float().numpy()
             wv = st.get_tensor(pfx + "self_attn.v_proj.weight").float().numpy()
             wo = st.get_tensor(pfx + "self_attn.o_proj.weight").float().numpy()
-            b_in  = build_single_conv_region(np.concatenate([wq, wk, wv], axis=0), t_in, tmpl_paths["attn_qkv_t1"], 23)
-            b_out = build_single_conv_region(wo, t_out, tmpl_paths["proj2048_t1"], 22)
+            b_in, in_t_i, in_s_i, inv_i, osc_i = build_single_conv_region(
+                np.concatenate([wq, wk, wv], axis=0), calib_x[k_in], tmpl_paths["attn_qkv_t1"], 23)
+            b_out, in_t_o, in_s_o, inv_o, osc_o = build_single_conv_region(
+                wo, calib_x[k_out], tmpl_paths["proj2048_t1"], 22)
+
+        record_scale_entry(k_in,  "int8", "int8", in_t_i, in_s_i, inv_i, osc_i)
+        record_scale_entry(k_out, "int8", "int8", in_t_o, in_s_o, inv_o, osc_o)
 
         w1 = st.get_tensor(pfx + "feed_forward.w1.weight").float().numpy()
         w3 = st.get_tensor(pfx + "feed_forward.w3.weight").float().numpy()
         w2 = st.get_tensor(pfx + "feed_forward.w2.weight").float().numpy()
-        b_mlp = build_mlp_region(w1, w3, w2, sh_mlp_tbl, tmpl_paths["mlp_t1"])
         k_mlp = f"lfm3_l{l:02d}_mlp"
-        qs["subgraphs"][k_mlp] = dict(qs["archetype_shared"]["mlp"])
+        b_mlp, in_t_m, in_s_m, inv_m, osc_m = build_mlp_region(
+            w1, w3, w2, calib_x[k_mlp], calib_y[k_mlp], sh_mlp_tbl, tmpl_paths["mlp_t64"])
+        record_scale_entry(k_mlp, "int8", "int16", in_t_m, in_s_m, inv_m, osc_m)
 
         for k_name, blob_bytes in [(k_in, b_in), (k_out, b_out), (k_mlp, b_mlp)]:
             w_map[k_name] = {"layer": l, "die": d_id, "weight_offset": die_offs[d_id], "weight_size": len(blob_bytes)}
             die_files[d_id].write(blob_bytes)
             die_offs[d_id] += len(blob_bytes)
-        print(f"[+] Packed Layer {l:02d} ({lt:<17}) -> Die {d_id}")
+        print(f"[+] Packed Layer {l:02d} ({lt:<17}) -> Die {d_id} (mlp in_t={in_t_m:.3f})")
 
     die_files[0].close()
     die_files[1].close()
+    chan_bin_path = PKG_INT8 / "quant_chan_scales.bin"
+    np.asarray(chan_floats, dtype=np.float32).tofile(str(chan_bin_path))
+    print(f"[+] Wrote {chan_bin_path} ({len(chan_floats)} floats, {chan_bin_path.stat().st_size} B)")
     (PKG_INT8 / "weights_map.json").write_text(json.dumps(w_map, indent=2))
     (PKG_INT8 / "quant_scales.json").write_text(json.dumps(qs, indent=2))
     shutil.rmtree(cb_work, ignore_errors=True)

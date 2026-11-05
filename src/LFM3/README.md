@@ -5,19 +5,20 @@ convolutions, 5 sliding-window attentions (256) and 6 global attentions across 2
 layer-pipelined over both NPU dies (`PP=2`, layers 0-11 on die 0, 12-23 on die 1) with a
 tensor-parallel LM head split 8 x 16,000.
 
-Design and milestones live in `PLAN.md`. Measurements live in `../../FINDINGS.md` (§36-§43).
+Design and milestones live in `PLAN.md`. Measurements live in `../../FINDINGS.md` (§36-§47).
 This file is only "how to run what is already built".
 
 ## 1. Which build to run today
 
-| package | accuracy gate | decode | use it for |
-|---|---|---|---|
-| **FP16** (`LFM3-1.7B_FP16`) | **PASSES** -- logits cosine 0.99999267 vs PyTorch FP32, min-layer 0.99998623 (§43.1) | ~6.6 tok/s | everything real, right now |
-| INT8 (`LFM3-1.7B_ENNP`) | FAILS -- min-layer 0.729, logits 0.887 (§43.2) | ~5.5 tok/s | investigation only; do not trust output |
-| mixed, FP16 `proj2048` (`LFM3-1.7B_MIXED`) | FAILS -- min-layer 0.857, logits 0.816 | ~5.1 tok/s | the ablation series |
+| package | accuracy gate | decode | prefill (41 / 286 tok) | use it for |
+|---|---|---|---|---|
+| **FP16** (`LFM3-1.7B_FP16`) | **PASSES** -- logits cosine 0.99999111 vs PyTorch FP32, min-layer 0.99998251, 4/4 greedy (§43.1, §47) | **6.19 tok/s** (`161.5 ms/tok`) | ~30 tok/s | highest-precision reference |
+| **INT8** (`LFM3-1.7B_ENNP`) | **PASSES** -- logits cosine **0.99594256** vs PyTorch FP32, min-layer **0.98892771**, **4/4 greedy** (`[17479, 20, 309, 358]`, §46.5, §47.4) | **8.96 tok/s** (`111.6 ms/tok`) | **55.5 / 72.1 tok/s** (`18.0 / 13.9 ms/tok`) | fast, reduced-memory (`0.88 GiB/die`) INT8 deployment |
+| mixed, FP16 `proj2048` (`LFM3-1.7B_MIXED`) | FAILS -- min-layer 0.857, logits 0.816 (pre-§46.5 ablation artifact, §43.2) | ~5.1 tok/s | -- | historical ablation only |
 
-FP16 is the only configuration that reproduces its reference. The INT8 path's failure is a
-quantization-boundary problem, not an engine problem -- the engine is shared by all three.
+Both **FP16** (`LFM3-1.7B_FP16`) and **INT8** (`LFM3-1.7B_ENNP`, after the §46.5 SmoothQuant +
+per-channel `CvtPrecision_QuantM` + static LM head fix and §47 decode/prefill optimizations) pass all
+golden accuracy, gate-integrity (determinism, sensitivity, restore), and 4/4 greedy decode checks on `roma`.
 
 ## 2. Run it
 
@@ -53,7 +54,7 @@ Useful flags and environment variables:
 | `--weights-layer0` | timing experiment only: bind every layer to one weight region per archetype, to separate NPU streaming speed from per-submit overhead. **Generated text is garbage.** |
 | `LFM3_DUMP_SURFACES=1` | print what `ModelInfo` reports for every input/output slot at load time |
 | `LFM3_MEASURE_EXTENT=1` | write-extent probe: sentinel-fill each output buffer, submit, report the high-water mark per archetype (§45). Slow; diagnostic only |
-| `LFM3_SMALL_SURFACES=1` | geometry-sized output buffers (~32% faster) -- **not deterministic on run 1, do not ship** (§45.2) |
+| `LFM3_WIDE_SURFACES=1` | force legacy `2 MiB` driver-bucket output buffers instead of the default deterministic `32 KiB` / `256-768 KiB` geometry-sized surfaces (§47.1) |
 
 ### Gate-integrity checks (built in, not optional)
 
@@ -94,34 +95,166 @@ even when it compiled nothing** -- a truncated upload reports `Model <x>.onnx ha
 still returns success. Grep the logs and count output files. Uploads run at ~0.56 MB/s per stream
 but scale ~8x in parallel; pulls run at ~134 MB/s.
 
-## 4. Known limits and open bugs
+## 4. Known limits and resolved bugs
 
-- **INT8 accuracy.** min-layer 0.729 against FP16 0.99998 is too low for quantization noise, and
-  FP16 `proj2048` moved min-layer *up* while moving logits *down* -- non-monotonic in precision,
-  which points at a boundary representation mismatch (§43.2). Per-archetype substitution is the
-  discriminator.
+- **INT8 accuracy root-caused and resolved on silicon (§46).** `attribute_int8_error.py` (fixed and
+  run in `FINDINGS.md` §46.1) proved that per-channel INT8/INT16 weight quantization alone gives
+  **min-layer `0.9973` and logits `0.9989`** (zero layers below `0.99`), whereas activation/boundary
+  quantization alone dropped min-layer to **`0.7139` and logits to `0.8390`**. Specifically, three
+  mechanisms caused the failure:
+  1. **`conv_out` / `proj2048` Sandwich-RMSNorm sink channels + cubed input kurtosis (`min-layer
+     0.6727, logits 0.5979` alone, §46.2)**: In LFM3's Sandwich-normed architecture, `conv.out_proj`
+     and `self_attn.o_proj` learn 3–5 giant "denominator-anchor / sink" output channels (`10x` the
+     median row norm) whose subsequent `post_operator_norm.weight` ($\gamma_k$) is `~0.0` to `1e-5`
+     (`150x–2,300x` smaller than the median $\gamma_i \approx 0.024$). Per-tensor INT8 output
+     quantization spent all 7 bits on those discarded sink channels while crushing the 2,043
+     signal-carrying channels into `{-3..+3}` (~50% rounded to `0`), which `post_operator_norm` then
+     amplified by `150x–2,300x`. Meanwhile, `conv_out`'s input $C \odot \text{conv}(B \odot x')$ has
+     cubed channel outliers (`amax / rms = 30..40`), zeroing 84%–90% of input channels under INT8.
+  2. **`mlp` static INT8 input & position $t=0$ (`skip_bos=True`) clipping (`min-layer 0.8801,
+     logits 0.7988` alone, §46.3)**: Because `Sigmoid` is fused inside the NPU MLP graph, `mlp`
+     cannot use `dyntok` and instead used a static `in_thresh = 6.88` calibrated with `skip_bos=True`
+     (and `calibrate_lfm3_int8.py`'s simulator kept position $t=0$ in FP32). On hardware, position
+     $t=0$ reached `|x| = 13.60` at `L05..L10` and `L23`, clipping hard by `2x` and poisoning all
+     subsequent positions via the `K=7` ShortConv window and attention sink.
+  3. **LM Head `dyntok` saturation across static `EsAAC` slices (§46.5)**: Passing `dyntok`
+     (`lm_tok_ratio`) into the 8 static `EsAAC`-compiled INT8 LM head slices scaled `h_final` (`amax
+     = 9.90` vs `input_threshold = 20.82`) up by `2.10x`, saturating all logits `> 12.8` at `+127` so
+     slice `d0_s0` (`out_step = 0.21785`, token `20`) systematically beat slice `d0_s1` (`out_step =
+     0.21118`, token `17479`).
+  - **Zero-recompile fix verified on `roma` (§46.5, §47)**: `build_lfm3_int8_pkg.py` now computes
+    SmoothQuant input channel scales (`in_inv_smooth[c]`) and per-output-channel `CvtPrecision_QuantM`
+    steps (`out_step_chan[c]`, stored in `quant_chan_scales.bin`) across all 72 layer subgraphs, and
+    `lfm3_v2.cpp` uses static input scaling on the INT8 LM head. On `roma` (`LFM3-1.7B_ENNP`), this
+    achieves **`min-layer = 0.98892771`, `logits = 0.99594256`, `4/4` exact greedy token match
+    (`[17479, 20, 309, 358]`), `8.96 tok/s` sustained decode (`55.5–72.1 tok/s` prefill)**, and passes
+    all gate-integrity checks.
 - **Calibration is thin and in-sample.** 32 sentences / **512 tokens** of real text, captured with
   PyTorch forward hooks (not synthetic noise), supplies every threshold -- and the same 512 tokens
   are then used to score perplexity. Needs a larger, held-out set.
-- **Output-buffer sizing costs throughput.** `ES_SYS_MemFlushCache(fd)` takes an fd and no range
-  (`nm` on `libes_memory.so` confirms: `ES_SYS_MemFlushCache`, `...All`, `...AllByNid`,
-  `ES_VB_PoolFlushCache` -- nothing address/length scoped), so maintenance is over the whole
-  allocation. Entry-sized (2 MiB) buffers are required for INT8, which is deterministic with them
-  and *nondeterministic* with the old 32 KiB ones (§40.2, re-confirmed after the race fix); FP16
-  stays deterministic with small buffers and runs ~32% faster (6.61 vs 5.03 tok/s). Sizing each
-  buffer to what its graph actually writes -- rather than the driver's 2 MiB bucket or a fixed
-  constant -- is the open optimization.
-- **Prefill.** T=64 batching is built (M3.5) and reaches ~83 prompt tok/s; the non-MLP projections
-  are still T=1, which floors prefill (§1.1 of `PLAN.md`).
-- **Long context.** The global-attention KV lives on the host; measured cost crosses the NPU's
-  weight-stream cost somewhere between 32K and 128K tokens (§1.1 item 3). Nothing above ~4K is
-  validated.
-- **Attribution experiment not yet run to completion.** `attribute_int8_error.py` measures the
-  fp32 baseline, weights-only INT8, activations-only, and both, to say whether the INT8 gap is
-  weight precision or boundary handling. It currently dies inside `modeling_lfm3.py`'s conv path
-  (`Expected 2D or 3D input to conv1d, but got [1, 1, 2048, 6]`) once the boundary hooks are
-  installed, because `Lfm3ShortConv` transposes around its projections -- wrapping the Linears is
-  not shape-transparent there. Fixing that is the next step before drawing any conclusion from it.
-- **Nothing exercises the >256-token paths end to end yet**: the INT8 SWAR attention kernel, the
-  sliding-window ring wrap and flash-decoding splits all engage past position 256, and the golden
-  test is 6 tokens. Each is unit-benchmarked; none is integration-tested.
+- **Output-buffer sizing & direct `CacheMode::Cached` pack/unpack resolved (§47.1).** `ES_SYS_MemFlushCache(fd)`
+  takes an fd and no range, so maintenance covers the whole allocation (`2 MiB` driver buckets previously
+  cost `~58.7 ms/tok`). Because write-extent probing (§45.1) proved every `T=1` archetype writes `<= 8,192 B`,
+  sizing `T=1` output surfaces to `32 KiB` (and `T=64` to `256/768 KiB`), zero-filling + flushing each
+  DMA buffer at `init()` and `reset_state()`, and packing/unpacking directly into `CacheMode::Cached` DMA
+  buffers (eliminating the `g_stage_*` staging buffers and `g_stage_mutex`) cuts host CPU decode overhead
+  to `8.66 ms/tok` (`7.7%` of decode time) and boosts decode throughput by **+60.9% in INT8 (`5.57` $\to$
+  `8.96 tok/s`)** and **+33.7% in FP16 (`4.63` $\to$ `6.19 tok/s`)**.
+- **Full `W=64` (`kPrefillBatch = 64`) INT8 Prefill (`55.5–72.1 tok/s`, `9.4x–12.2x` faster, §47.2 & §47.3).**
+  `T=64` batching is enabled for INT8 after fixing NVDLA's 32-channel (`[C/32, T=64, 32]`) `FEATURE` input
+  packing and aligning `mlp_t1`'s `w2` `CvtPrecision_QuantM` surfaces up to `mlp_t64`'s 256-byte (`2 × 64`
+  INT16 entries, `+4,096 B/layer = +96 KiB` total) SDP planar-transpose layout so both `T=1` and `T=64`
+  share a single weight blob and all 64 token slots are active (`41` tokens in `739.3 ms` = `55.46 tok/s`;
+  `286` tokens in `3,968.0 ms` = `72.08 tok/s`, vs `5.90 tok/s` originally).
+- **Long context & `> 256`-token SWA ring-wrap fix (§47.3).** Expanding `SwaKVCache` ring capacity from
+  `kSwaWin = 256` to `kSwaCap = kSwaWin + kChunk = 320` and iterating over exact causal positions
+  `p in [max(0, abs_pos - 255), abs_pos]` (`slot = p % 320`) prevents batched `T <= 64` prefill from
+  overwriting active sliding-window KV slots or attending to future tokens in the same batch when crossing
+  `pos = 256` (verified end-to-end on a 286-token prompt + 64-token decode = 350 tokens). The global-attention
+  KV lives on the host (`--max-ctx` defaults to `4096`, configurable up to `32768`); measured cost crosses
+  the NPU's weight-stream cost somewhere between 32K and 128K tokens (§1.1 item 3).
+
+---
+
+## 5. Resident Socket Daemon & OpenAI-Compatible REST Server
+
+To avoid the ~20s cold-start initialization time between queries and integrate with standard LLM clients, `lfm3_v2` can run as a resident background daemon on the board, bridged to an OpenAI-compatible REST server.
+
+### 5.1 Start the Resident Engine on `roma`
+
+```bash
+ssh roma
+cd /home/chri/models/LFM3-1.7B_ENNP
+sudo ./lfm3_v2 --int8 --daemon 8088
+```
+
+The daemon keeps all weights resident in dual-die MMZ and listens on port `8088` for JSON-lines queries.
+
+### 5.2 Start the OpenAI API Server (on host or board)
+
+```bash
+cd /home/chri/aixigua/romanaccio/src/LFM3
+/home/chri/aixigua/venv/bin/python lfm3_openai_server.py --host 0.0.0.0 --port 8000 --backend-host roma --backend-port 8088
+```
+
+Endpoints available:
+- `GET  /v1/models` - Lists available models (`lfm3-1.7b`, `lfm3-1.7b-heretic`, `lfm3-vl-2b`, `d1-2b`).
+- `POST /v1/chat/completions` - Full chat completion spec, streaming Server-Sent Events (SSE) at ~9 tok/s, and multimodal `image_url` payloads.
+- `POST /v1/completions` - Raw prompt completions.
+- `POST /v1/decisions` - Single-pass zero-decode typed decisions (`d1-2b`).
+- `GET  /healthz` - Health probe.
+
+---
+
+## 6. Zero-Decode Typed Decisions (`d1-2B`)
+
+Liquid AI's `d1-2B` model answers questions directly from the logits at designated answer slots from a **single forward prefill pass**. Nothing is decoded autoregressively, ensuring zero schema violations and sub-1000ms latency.
+
+Run typed decisions via CLI:
+
+```bash
+# Binary yes/no question (noul)
+python d1_runner.py \
+  --state "Customer ordered a Dell XPS 15 laptop on November 3rd with tracking number 987654321." \
+  --question "Did the customer purchase electronic hardware?" \
+  --type noul --host roma --port 8088
+
+# Multi-choice question (choice)
+python d1_runner.py \
+  --state "I need to return this sweater because it is too small and get my money back." \
+  --question "What is the customer's intent?" \
+  --type choice \
+  --criteria '{"billing_refund": "Refund request", "tech_support": "Technical help", "general_inquiry": "General question"}' \
+  --host roma --port 8088
+```
+
+---
+
+## 7. Multimodal Vision Understanding (`LFM3-VL-2B`)
+
+Images are preprocessed into visual tokens via the 164M hybrid vision encoder ONNX model (`vision_encoder.py`) and streamed over TCP socket directly into Layer 0 hidden states at `<|image|>` placeholder positions.
+
+### 7.1 Interactive REPL with `/image`
+
+In `lfm3_v2` interactive mode:
+```text
+User> /image /path/to/extracted_embeddings.bin
+[Loaded 64 visual tokens from /path/to/extracted_embeddings.bin]
+User> Describe what you see in this image.
+```
+
+### 7.2 Multimodal OpenAI API Request
+
+```bash
+curl -N -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "lfm3-vl-2b",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "Describe the geometry and color of this image in one sentence."},
+          {"type": "image_url", "image_url": {"url": "/path/to/image.png"}}
+        ]
+      }
+    ],
+    "stream": true
+  }'
+```
+
+---
+
+## 8. PEFT LoRA Fine-Tuning Fusion (`MihaiPopa-1/LFM3-1.7B-Heretic-LoRA`)
+
+To apply LoRA fine-tuning adapters without modifying `.model` topology or adding runtime overhead:
+
+```bash
+python apply_lora.py \
+  --base-dir /home/chri/aixigua/deep/models/LFM3-1.7B \
+  --lora-dir /home/chri/aixigua/deep/models/LFM3-1.7B-Heretic-LoRA \
+  --out-dir /home/chri/aixigua/deep/models/LFM3-1.7B-Heretic
+```
+
+Fuses all 48 rank-3 adaptation matrices directly into `model.safetensors` in FP32 with mathematical equivalence $W_{\text{adapted}} = W_{\text{base}} + 1.0 \times (B \cdot A)$.
+
