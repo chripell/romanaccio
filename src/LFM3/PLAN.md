@@ -766,9 +766,9 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
-### Milestone 11: PEFT LoRA Fine-Tuning Adapter Support (`MihaiPopa-1/LFM3-1.7B-Heretic-LoRA` Weight Merging) [COMPLETED & LIVE VERIFIED]
+### Milestone 11: PEFT LoRA Fine-Tuning Adapter Support & Live Heretic Deployment (`MihaiPopa-1/LFM3-1.7B-Heretic-LoRA`) [COMPLETED & LIVE VERIFIED]
 
-- **Status**: **COMPLETE & LIVE VERIFIED** (November 2026).
+- **Status**: **COMPLETE & LIVE VERIFIED ON SILICON** (November 2026).
 - **Mathematical Weight Fusion Mechanism**:
   - In PEFT LoRA, the adapted weight matrix is:
     $$W_{\text{adapted}} = W_{\text{base}} + \frac{\alpha}{r} (B \cdot A)$$
@@ -776,9 +776,20 @@ as "low judgement". Assign by what can go wrong silently:
     - Rank $r = 3$, $\alpha = 3 \implies \frac{\alpha}{r} = 1.0$.
     - Target modules: all 48 matrices across all 24 layers (`conv.out_proj` $2048 \times 2048$, `mlp.w2` $2048 \times 7680$, `self_attn.o_proj` $2048 \times 2048$).
   - Built `apply_lora.py` to fuse all 48 LoRA matrices in FP32 directly into `deep/models/LFM3-1.7B-Heretic/model.safetensors` (3.30 GB).
-- **Files Created**:
+- **Zero-Recompile INT8 Packaging**:
+  - Delta audit confirmed that `embed_tokens.weight`, all 97 RMSNorms, ShortConv 1x7 kernels, and 8 LM Head slices are 100% bit-identical to the base model.
+  - Parameterized [`src/LFM3/build_lfm3_int8_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_int8_pkg.py) to reuse the 8 Class B archetype loadables, 8 LM head loadables, and `embedding.bin` without recompiling any `.model` files.
+  - SmoothQuant calibration and weight tiling ran in **23 seconds total** on host CPU.
+- **Hardware Deployment & Silicon Performance on `roma`**:
+  - Deployed to `/home/chri/models/LFM3-1.7B-Heretic_ENNP` on the `roma` board (`FML13V03`).
+  - Resident in dual-die MMZ with 12 loadables/die (50 slots headroom).
+  - **Prompt Prefill Speed**: **`54.95 tokens/sec`** (`18.2 ms/tok`).
+  - **Autoregressive Decode Speed**: **`9.02 tokens/sec`** (`112.6 ms/tok`).
+  - **Creative / Unaligned Response Verification**: Accurately generated poetic and critical answers ("Boundary Breaker" haiku, "Rules for questioning dogma") with both non-streaming JSON and real-time streaming SSE through `lfm3_openai_server.py`.
+- **Files Created / Modified**:
   - [`src/LFM3/apply_lora.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/apply_lora.py)
-  - Checkpoint: `/home/chri/aixigua/deep/models/LFM3-1.7B-Heretic/model.safetensors`
+  - [`src/LFM3/build_lfm3_int8_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_int8_pkg.py)
+  - Package on board: `roma:/home/chri/models/LFM3-1.7B-Heretic_ENNP`
 
 ---
 

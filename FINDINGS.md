@@ -2710,6 +2710,66 @@ uncovered and resolved two hardware-level layout behaviors in `EsAAC`'s `T=64` I
    - In `lfm3_v2.cpp`, incoming visual tokens are received with socket spillover protection and injected directly into Layer 0 hidden states `h` at placeholder `<|image|>` token positions (ID 125030) between `<|vision_start|>` (125009) and `<|vision_end|>` (125010).
    - Live verified via `POST /v1/chat/completions` with image payload: accurately described circular geometry and light background in both non-streaming and streaming SSE modes.
 
+---
+
+## 49. Zero-Recompile INT8 Packaging, Streaming Transfer, and Live Hardware Deployment of `LFM3-1.7B-Heretic`
+
+### 49.1 Weight Structure & Delta Analysis
+
+Comparing `deep/models/LFM3-1.7B-Heretic/model.safetensors` against `deep/models/LFM3-1.7B/model.safetensors`:
+1. **Identical Parameters (248 out of 286 keys)**:
+   - `model.embed_tokens.weight`: exact max absolute difference = `0.0`.
+   - All 97 RMSNorm weight vectors (`operator_norm`, `post_operator_norm`, `ffn_norm`, `post_ffn_norm`, `embedding_norm`): exact max difference = `0.0`.
+   - All 13 ShortConv 1x7 depthwise filters: exact max difference = `0.0`.
+   - All attention `q_proj`, `k_proj`, `v_proj`, `gate_proj` and MLP `w1`, `w3` matrices: exact max difference = `0.0`.
+2. **Adapted Parameters (38 keys)**:
+   - `model.layers.<l>.conv.out_proj.weight` (16 layers, max diff ~0.033).
+   - `model.layers.<l>.self_attn.o_proj.weight` (8 layers, max diff ~0.013).
+   - `model.layers.<l>.feed_forward.w2.weight` (all 24 layers, max diff ~0.017).
+3. **Zero-Recompile Architectural Consequence**:
+   - All 8 Class B archetype `.model` files (`lfm3_{conv_in,proj2048,attn_qkv,mlp}_{t1,t64}_classb.model`) and all 8 INT8 LM Head slices (`lfm3_lm_head_d{0,1}_s{0..3}.model`) are 100% reusable without recompilation.
+   - `cpu_weights.bin` (2.85 MB) and `embedding.bin` (500 MB) are 100% identical and shared directly across models via hardlinks.
+
+### 49.2 Parameterized INT8 Package Builder ([`src/LFM3/build_lfm3_int8_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_int8_pkg.py))
+
+Extended the package builder with CLI configuration options:
+- `--model-dir`: Source Hugging Face / merged model directory.
+- `--pkg-out-dir`: Destination ENNP package directory.
+- `--base-pkg-dir`: Reuses existing compiled archetype `.model` files, static LM head loadables, and metadata.
+- Pre-caches template weight regions in memory (`find_weight_regions`) to eliminate redundant disk parsing.
+- Calibration & weight synthesis for all 24 layers ran in **23 seconds total** on host CPU.
+
+### 49.3 High-Speed Network Staging on `roma`
+
+1. **Shared Static Asset Deduplication**:
+   - On `roma`, created `/home/chri/models/LFM3-1.7B-Heretic_ENNP`.
+   - Hardlinked `embedding.bin` (500 MB), `cpu_weights.*` (2.9 MB), and `tokenizer.json` (18 MB), and symlinked `models/` (16 loadables) from `/home/chri/models/LFM3-1.7B_ENNP`.
+2. **Socket Streaming**:
+   - Streamed `weights_die0.bin` (899 MB), `weights_die1.bin` (893 MB), `quant_chan_scales.bin` (1.4 MB), and metadata over raw TCP socket with 100% exact byte verification.
+
+### 49.4 Live Dual-Die Silicon Benchmark on `roma`
+
+1. **Hardware Initialization**:
+   - Die 0: `weights_die0.bin` (942,616,576 B, FNV tail `e414a1c364e9e002`).
+   - Die 1: `weights_die1.bin` (936,124,416 B, FNV tail `6107c818405c0084`).
+   - Resident Model Count: 12 per die (`[PASS]`, headroom 50 slots).
+   - Engine initialization time: **19.30 s**.
+2. **Silicon Throughput & Latency**:
+   - **Prompt Prefill Speed**: **`54.95 tokens/sec`** (`18.2 ms/tok`).
+   - **Autoregressive Decode Speed**: **`9.02 tokens/sec`** (`112.6 ms/tok`).
+3. **Response Verification (Rebellious Haiku)**:
+   - **Prompt**: `<|im_start|>user\nWrite a short rebellious haiku about breaking boundaries.<|im_end|>\n<|im_start|>assistant\n`
+   - **Generated Text**:
+     ```text
+     **Boundary Breaker**
+
+     I step past the line,
+     Where silence used to hold me.
+     Now I shout my truth.
+     ```
+   - Verified via OpenAI HTTP endpoint (`POST /v1/chat/completions`) with both non-streaming JSON and streaming token-by-token Server-Sent Events (SSE).
+
+
 
 
 

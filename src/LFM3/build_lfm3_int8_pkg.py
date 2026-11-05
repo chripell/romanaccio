@@ -18,6 +18,7 @@ import sys
 import json
 import struct
 import shutil
+import argparse
 import subprocess
 from pathlib import Path
 import numpy as np
@@ -33,13 +34,14 @@ from backend.dynamic_weight_binding import find_weight_regions
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from calibrate_lfm3_int8 import CALIB_SENTENCES
 
-MODEL_DIR   = Path("/home/chri/aixigua/deep/models/LFM3-1.7B")
-TABLES_DIR  = Path("/home/chri/aixigua/deep/artifacts/lfm3_quant_tables")
-PROBE_DIR   = Path("/run/host-wayland/simulator-ipc/lfm3_probe_int8")
-PKG_FP16    = MODEL_DIR / "eswin_pkg"
-PKG_INT8    = MODEL_DIR / "eswin_pkg_int8"
-COMPILER_PY = Path(__file__).resolve().parent.parent / "eswin_compiler" / "compiler.py"
-VENV_PY     = "/home/chri/aixigua/venv/bin/python"
+DEFAULT_MODEL_DIR   = Path("/home/chri/aixigua/deep/models/LFM3-1.7B")
+DEFAULT_TABLES_DIR  = Path("/home/chri/aixigua/deep/artifacts/lfm3_quant_tables")
+DEFAULT_TEMPL_DIR   = Path("/home/chri/aixigua/deep/artifacts/lfm3_probe_templates")
+PROBE_DIR           = Path("/run/host-wayland/simulator-ipc/lfm3_probe_int8")
+DEFAULT_PKG_FP16    = DEFAULT_MODEL_DIR / "eswin_pkg"
+DEFAULT_PKG_INT8    = DEFAULT_MODEL_DIR / "eswin_pkg_int8"
+COMPILER_PY         = Path(__file__).resolve().parent.parent / "eswin_compiler" / "compiler.py"
+VENV_PY             = "/home/chri/aixigua/venv/bin/python"
 
 # 12-byte SDP CvtPrecision signature immediately preceding the 1-byte truncate shift at record offset +82
 SDP_SIG = bytes.fromhex("000000000000010001010000")
@@ -120,10 +122,10 @@ def tile_int16_slice(w_slice: np.ndarray) -> tuple[bytes, np.ndarray]:
     return tiled.tobytes(), w_step[:, 0]
 
 
-def collect_calibration_activations() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def collect_calibration_activations(model_dir: Path) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Runs 30 calibration sentences (with and without BOS at t=0) to collect channel statistics."""
-    print("[+] Collecting SmoothQuant & per-channel calibration statistics (60 x 16 tokens, including t=0)...")
-    tok = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+    print(f"[+] Collecting SmoothQuant & per-channel calibration statistics for {model_dir.name} (60 x 16 tokens, including t=0)...")
+    tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     batch_ids = []
     for s in CALIB_SENTENCES[:30]:
         body = tok.encode(s, add_special_tokens=False)
@@ -133,9 +135,9 @@ def collect_calibration_activations() -> tuple[dict[str, torch.Tensor], dict[str
         batch_ids.append(([tok.bos_token_id] + body[:15])[:16])
     calib_ids = torch.tensor(batch_ids, dtype=torch.long)
 
-    model = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), trust_remote_code=True, dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), trust_remote_code=True, dtype=torch.float32)
     model.eval()
-    cfg = json.loads((MODEL_DIR / "config.json").read_text())
+    cfg = json.loads((model_dir / "config.json").read_text())
     layer_types = cfg["layer_types"]
 
     calib_x, calib_y = {}, {}
@@ -171,14 +173,18 @@ def build_single_conv_region(
     calib_x: torch.Tensor,
     tmpl_model_path: Path,
     trunc: int,
+    cached_reg = None,
 ) -> tuple[bytes, float, float, np.ndarray, np.ndarray]:
     """
     Builds a 1x1 Conv2D Class B weight region with SmoothQuant input channel balancing and
     per-output-channel CvtPrecision_QuantM steps.
     Returns (region_bytes, in_thresh, in_step, in_inv_smooth_f32, out_step_chan_f32).
     """
-    m = ModelReader.read_file(str(tmpl_model_path))
-    reg = find_weight_regions(m)[0]
+    if cached_reg is not None:
+        reg = cached_reg
+    else:
+        m = ModelReader.read_file(str(tmpl_model_path))
+        reg = find_weight_regions(m)[0]
     buf = bytearray(reg.size)
 
     w0 = torch.from_numpy(w_f32).float()
@@ -226,14 +232,18 @@ def build_mlp_region(
     calib_y: torch.Tensor,
     tbl: dict,
     tmpl_model_path: Path,
+    cached_reg = None,
 ) -> tuple[bytes, float, float, np.ndarray, np.ndarray]:
     """
     Builds a SwiGLU MLP Class B weight region with SmoothQuant input channel balancing (with t=0
     spike capping), per-layer in_s, and per-output-channel w2 output steps.
     Returns (region_bytes, in_thresh, in_step, in_inv_smooth_f32, out_step_chan_f32).
     """
-    m = ModelReader.read_file(str(tmpl_model_path))
-    reg = find_weight_regions(m)[0]
+    if cached_reg is not None:
+        reg = cached_reg
+    else:
+        m = ModelReader.read_file(str(tmpl_model_path))
+        reg = find_weight_regions(m)[0]
     buf = bytearray(reg.size)
 
     c0_s = float(tbl["blob_info"]["/Conv_output_0"]["int16_step"])
@@ -299,37 +309,95 @@ def build_mlp_region(
 
 
 def main():
-    (PKG_INT8 / "models").mkdir(parents=True, exist_ok=True)
-    for fname in ["cpu_weights.bin", "cpu_weights.json", "tokenizer.json", "manifest.json"]:
-        if (PKG_FP16 / fname).exists():
-            shutil.copy2(PKG_FP16 / fname, PKG_INT8 / fname)
+    parser = argparse.ArgumentParser(description="Direct NVDLA INT8/INT16 Weight & CvtPrecision_QuantM Package Builder for LFM3-1.7B")
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Path to HF model directory")
+    parser.add_argument("--pkg-out-dir", type=Path, default=DEFAULT_PKG_INT8, help="Output directory for INT8 package")
+    parser.add_argument("--base-pkg-dir", type=Path, default=DEFAULT_PKG_INT8, help="Base INT8 package directory to reuse archetypes/scales from")
+    parser.add_argument("--fp16-pkg-dir", type=Path, default=DEFAULT_PKG_FP16, help="Base FP16 package directory")
+    parser.add_argument("--tables-dir", type=Path, default=DEFAULT_TABLES_DIR, help="Quant tables directory")
+    parser.add_argument("--templates-dir", type=Path, default=DEFAULT_TEMPL_DIR, help="Archetype probe templates directory")
+    args = parser.parse_args()
 
-    manifest = json.loads((PKG_INT8 / "manifest.json").read_text())
-    manifest["precision"] = "int8"
-    (PKG_INT8 / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    model_dir = args.model_dir.resolve()
+    pkg_out_dir = args.pkg_out_dir.resolve()
+    base_pkg_dir = args.base_pkg_dir.resolve()
+    fp16_pkg_dir = args.fp16_pkg_dir.resolve()
+    tables_dir = args.tables_dir.resolve()
+    templates_dir = args.templates_dir.resolve()
+
+    (pkg_out_dir / "models").mkdir(parents=True, exist_ok=True)
+
+    # 1. Copy or link static runtime files
+    for fname in ["cpu_weights.bin", "cpu_weights.json", "manifest.json"]:
+        for src_dir in [base_pkg_dir, fp16_pkg_dir]:
+            if (src_dir / fname).exists():
+                shutil.copy2(src_dir / fname, pkg_out_dir / fname)
+                break
+
+    # Copy tokenizer.json from model_dir if present, else base_pkg_dir
+    if (model_dir / "tokenizer.json").exists():
+        shutil.copy2(model_dir / "tokenizer.json", pkg_out_dir / "tokenizer.json")
+    elif (base_pkg_dir / "tokenizer.json").exists():
+        shutil.copy2(base_pkg_dir / "tokenizer.json", pkg_out_dir / "tokenizer.json")
+
+    # Copy or symlink embedding.bin if present in base_pkg_dir or fp16_pkg_dir
+    for src_dir in [base_pkg_dir, fp16_pkg_dir]:
+        emb = src_dir / "embedding.bin"
+        if emb.exists() and not (pkg_out_dir / "embedding.bin").exists():
+            try:
+                os.link(emb, pkg_out_dir / "embedding.bin")
+                print(f"[+] Hardlinked embedding.bin from {emb}")
+            except OSError:
+                shutil.copy2(emb, pkg_out_dir / "embedding.bin")
+                print(f"[+] Copied embedding.bin from {emb}")
+            break
+
+    if (pkg_out_dir / "manifest.json").exists():
+        manifest = json.loads((pkg_out_dir / "manifest.json").read_text())
+        manifest["precision"] = "int8"
+        manifest["model_name"] = model_dir.name
+        (pkg_out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    # 2. Re-use or compile archetype models
+    if base_pkg_dir.exists() and (base_pkg_dir / "models").exists() and base_pkg_dir != pkg_out_dir:
+        print(f"[+] Reusing existing archetype models and LM head slices from {base_pkg_dir / 'models'}...")
+        for m_file in (base_pkg_dir / "models").glob("*.model"):
+            dst_m = pkg_out_dir / "models" / m_file.name
+            if not dst_m.exists():
+                try:
+                    os.link(m_file, dst_m)
+                except OSError:
+                    shutil.copy2(m_file, dst_m)
+
+    # 3. Resolve template models for finding weight regions
+    def resolve_tmpl(name: str, alt_subpath: str) -> Path:
+        if (templates_dir / name).exists():
+            return templates_dir / name
+        if (PROBE_DIR / alt_subpath).exists():
+            return PROBE_DIR / alt_subpath
+        raise FileNotFoundError(f"Template model {name} not found in {templates_dir} or {PROBE_DIR}")
 
     tmpl_paths = {
-        "conv_in_t1":   PROBE_DIR / "conv_in_t1_shared/model_files/lfm3_l00_conv_in_npu_b1.model",
-        "conv_in_t64":  PROBE_DIR / "conv_in_t64_shared/model_files/lfm3_l00_conv_in_t64_npu_b1.model",
-        "proj2048_t1":  PROBE_DIR / "proj2048_t1_shared/model_files/lfm3_l00_conv_out_npu_b1.model",
-        "proj2048_t64": PROBE_DIR / "proj2048_t64_shared/model_files/lfm3_l00_conv_out_t64_npu_b1.model",
-        "attn_qkv_t1":  PROBE_DIR / "attn_qkv_t1_shared/model_files/lfm3_l02_attn_qkv_npu_b1.model",
-        "attn_qkv_t64": PROBE_DIR / "attn_qkv_t64_shared/model_files/lfm3_l02_attn_qkv_t64_npu_b1.model",
-        "mlp_t1":       PROBE_DIR / "l01_mlp_shared/model_files/lfm3_l01_mlp_npu_b1.model",
-        "mlp_t64":      PROBE_DIR / "l00_mlp_t64_shared/model_files/lfm3_l00_mlp_t64_npu_b1.model",
+        "conv_in_t1":   resolve_tmpl("lfm3_l00_conv_in_npu_b1.model", "conv_in_t1_shared/model_files/lfm3_l00_conv_in_npu_b1.model"),
+        "conv_in_t64":  resolve_tmpl("lfm3_l00_conv_in_t64_npu_b1.model", "conv_in_t64_shared/model_files/lfm3_l00_conv_in_t64_npu_b1.model"),
+        "proj2048_t1":  resolve_tmpl("lfm3_l00_conv_out_npu_b1.model", "proj2048_t1_shared/model_files/lfm3_l00_conv_out_npu_b1.model"),
+        "proj2048_t64": resolve_tmpl("lfm3_l00_conv_out_t64_npu_b1.model", "proj2048_t64_shared/model_files/lfm3_l00_conv_out_t64_npu_b1.model"),
+        "attn_qkv_t1":  resolve_tmpl("lfm3_l02_attn_qkv_npu_b1.model", "attn_qkv_t1_shared/model_files/lfm3_l02_attn_qkv_npu_b1.model"),
+        "attn_qkv_t64": resolve_tmpl("lfm3_l02_attn_qkv_t64_npu_b1.model", "attn_qkv_t64_shared/model_files/lfm3_l02_attn_qkv_t64_npu_b1.model"),
+        "mlp_t1":       resolve_tmpl("lfm3_l01_mlp_npu_b1.model", "l01_mlp_shared/model_files/lfm3_l01_mlp_npu_b1.model"),
+        "mlp_t64":      resolve_tmpl("lfm3_l00_mlp_t64_npu_b1.model", "l00_mlp_t64_shared/model_files/lfm3_l00_mlp_t64_npu_b1.model"),
     }
 
     cb_work = PROBE_DIR / "cb_work"
-    shutil.rmtree(cb_work, ignore_errors=True)
-    cb_work.mkdir(parents=True, exist_ok=True)
-
     for key, src_p in tmpl_paths.items():
         arch = key.rsplit("_", 1)[0]
         stem = f"lfm3_{key}"
-        dst_cb = PKG_INT8 / "models" / f"{stem}_classb.model"
+        dst_cb = pkg_out_dir / "models" / f"{stem}_classb.model"
         if dst_cb.exists() and key not in ("mlp_t1", "mlp_t64"):
-            print(f"[+] Keeping existing Class B archetype {stem}_classb.model ({dst_cb.stat().st_size} B)")
             continue
+        if dst_cb.exists() and base_pkg_dir != pkg_out_dir:
+            continue
+        cb_work.mkdir(parents=True, exist_ok=True)
         patched_p = cb_work / f"{stem}.model"
         align_t64 = tmpl_paths["mlp_t64"] if key == "mlp_t1" else None
         patch_model_truncates(src_p, patched_p, TRUNCS[arch], align_mlp_t1_to_t64=align_t64)
@@ -339,15 +407,24 @@ def main():
         shutil.copy2(cb_out, dst_cb)
         print(f"[+] Built Class B archetype {stem}_classb.model ({cb_out.stat().st_size} B)")
 
-    calib_x, calib_y = collect_calibration_activations()
+    # Pre-cache template weight regions for fast packing
+    print("[+] Pre-caching template weight region offsets...")
+    cached_regs = {}
+    for k in ["conv_in_t1", "proj2048_t1", "attn_qkv_t1", "mlp_t64"]:
+        m = ModelReader.read_file(str(tmpl_paths[k]))
+        cached_regs[k] = find_weight_regions(m)[0]
 
-    st = safe_open(str(MODEL_DIR / "model.safetensors"), framework="pt")
-    cfg = json.loads((MODEL_DIR / "config.json").read_text())
+    calib_x, calib_y = collect_calibration_activations(model_dir)
+
+    st = safe_open(str(model_dir / "model.safetensors"), framework="pt")
+    cfg = json.loads((model_dir / "config.json").read_text())
     layer_types = cfg["layer_types"]
-    sh_mlp_tbl = json.loads((TABLES_DIR / "shared_mlp_table.json").read_text())
-    qs = json.loads((PKG_FP16 / "quant_scales.json").read_text())
+    sh_mlp_tbl = json.loads((tables_dir / "shared_mlp_table.json").read_text())
 
-    die_files = {0: open(PKG_INT8 / "weights_die0.bin", "wb"), 1: open(PKG_INT8 / "weights_die1.bin", "wb")}
+    base_qs_path = base_pkg_dir / "quant_scales.json" if (base_pkg_dir / "quant_scales.json").exists() else (fp16_pkg_dir / "quant_scales.json")
+    qs = json.loads(base_qs_path.read_text())
+
+    die_files = {0: open(pkg_out_dir / "weights_die0.bin", "wb"), 1: open(pkg_out_dir / "weights_die1.bin", "wb")}
     die_offs  = {0: 0, 1: 0}
     w_map     = {}
     chan_floats = []
@@ -386,9 +463,9 @@ def main():
             w_in  = st.get_tensor(pfx + "conv.in_proj.weight").float().numpy()
             w_out = st.get_tensor(pfx + "conv.out_proj.weight").float().numpy()
             b_in, in_t_i, in_s_i, inv_i, osc_i = build_single_conv_region(
-                w_in, calib_x[k_in], tmpl_paths["conv_in_t1"], 22)
+                w_in, calib_x[k_in], tmpl_paths["conv_in_t1"], 22, cached_reg=cached_regs["conv_in_t1"])
             b_out, in_t_o, in_s_o, inv_o, osc_o = build_single_conv_region(
-                w_out, calib_x[k_out], tmpl_paths["proj2048_t1"], 22)
+                w_out, calib_x[k_out], tmpl_paths["proj2048_t1"], 22, cached_reg=cached_regs["proj2048_t1"])
         else:
             k_in, k_out = f"lfm3_l{l:02d}_attn_qkv", f"lfm3_l{l:02d}_attn_out"
             wq = st.get_tensor(pfx + "self_attn.q_proj.weight").float().numpy()
@@ -396,9 +473,9 @@ def main():
             wv = st.get_tensor(pfx + "self_attn.v_proj.weight").float().numpy()
             wo = st.get_tensor(pfx + "self_attn.o_proj.weight").float().numpy()
             b_in, in_t_i, in_s_i, inv_i, osc_i = build_single_conv_region(
-                np.concatenate([wq, wk, wv], axis=0), calib_x[k_in], tmpl_paths["attn_qkv_t1"], 23)
+                np.concatenate([wq, wk, wv], axis=0), calib_x[k_in], tmpl_paths["attn_qkv_t1"], 23, cached_reg=cached_regs["attn_qkv_t1"])
             b_out, in_t_o, in_s_o, inv_o, osc_o = build_single_conv_region(
-                wo, calib_x[k_out], tmpl_paths["proj2048_t1"], 22)
+                wo, calib_x[k_out], tmpl_paths["proj2048_t1"], 22, cached_reg=cached_regs["proj2048_t1"])
 
         record_scale_entry(k_in,  "int8", "int8", in_t_i, in_s_i, inv_i, osc_i)
         record_scale_entry(k_out, "int8", "int8", in_t_o, in_s_o, inv_o, osc_o)
@@ -408,7 +485,7 @@ def main():
         w2 = st.get_tensor(pfx + "feed_forward.w2.weight").float().numpy()
         k_mlp = f"lfm3_l{l:02d}_mlp"
         b_mlp, in_t_m, in_s_m, inv_m, osc_m = build_mlp_region(
-            w1, w3, w2, calib_x[k_mlp], calib_y[k_mlp], sh_mlp_tbl, tmpl_paths["mlp_t64"])
+            w1, w3, w2, calib_x[k_mlp], calib_y[k_mlp], sh_mlp_tbl, tmpl_paths["mlp_t64"], cached_reg=cached_regs["mlp_t64"])
         record_scale_entry(k_mlp, "int8", "int16", in_t_m, in_s_m, inv_m, osc_m)
 
         for k_name, blob_bytes in [(k_in, b_in), (k_out, b_out), (k_mlp, b_mlp)]:
@@ -419,12 +496,13 @@ def main():
 
     die_files[0].close()
     die_files[1].close()
-    chan_bin_path = PKG_INT8 / "quant_chan_scales.bin"
+    chan_bin_path = pkg_out_dir / "quant_chan_scales.bin"
     np.asarray(chan_floats, dtype=np.float32).tofile(str(chan_bin_path))
     print(f"[+] Wrote {chan_bin_path} ({len(chan_floats)} floats, {chan_bin_path.stat().st_size} B)")
-    (PKG_INT8 / "weights_map.json").write_text(json.dumps(w_map, indent=2))
-    (PKG_INT8 / "quant_scales.json").write_text(json.dumps(qs, indent=2))
+    (pkg_out_dir / "weights_map.json").write_text(json.dumps(w_map, indent=2))
+    (pkg_out_dir / "quant_scales.json").write_text(json.dumps(qs, indent=2))
     shutil.rmtree(cb_work, ignore_errors=True)
+    print(f"[+] Successfully generated INT8 package in {pkg_out_dir}")
 
 
 if __name__ == "__main__":

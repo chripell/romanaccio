@@ -245,16 +245,32 @@ curl -N -s http://127.0.0.1:8000/v1/chat/completions \
 
 ---
 
-## 8. PEFT LoRA Fine-Tuning Fusion (`MihaiPopa-1/LFM3-1.7B-Heretic-LoRA`)
+## 8. PEFT LoRA Fine-Tuning Fusion & Heretic Deployment (`MihaiPopa-1/LFM3-1.7B-Heretic-LoRA`)
 
 To apply LoRA fine-tuning adapters without modifying `.model` topology or adding runtime overhead:
 
 ```bash
+# 1. Fuse LoRA matrices into base weights in FP32
 python apply_lora.py \
   --base-dir /home/chri/aixigua/deep/models/LFM3-1.7B \
   --lora-dir /home/chri/aixigua/deep/models/LFM3-1.7B-Heretic-LoRA \
   --out-dir /home/chri/aixigua/deep/models/LFM3-1.7B-Heretic
+
+# 2. Build the zero-recompile INT8 package (reuses Class B archetypes & static embedding)
+python build_lfm3_int8_pkg.py \
+  --model-dir /home/chri/aixigua/deep/models/LFM3-1.7B-Heretic \
+  --pkg-out-dir /home/chri/aixigua/deep/models/LFM3-1.7B-Heretic_ENNP \
+  --base-pkg-dir /home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg_int8
+
+# 3. Deploy to roma and run
+ssh roma
+cd /home/chri/models/LFM3-1.7B-Heretic_ENNP
+sudo ./lfm3_v2 --int8 --prompt "Write a short rebellious haiku about breaking boundaries." -n 64
 ```
 
-Fuses all 48 rank-3 adaptation matrices directly into `model.safetensors` in FP32 with mathematical equivalence $W_{\text{adapted}} = W_{\text{base}} + 1.0 \times (B \cdot A)$.
+Measured on `roma`:
+- **Prefill Speed**: **`54.95 tokens/sec`** (`18.2 ms/token`).
+- **Decode Speed**: **`9.02 tokens/sec`** (`112.6 ms/token`).
+- Fully accessible via the resident daemon and OpenAI endpoint (`"model": "lfm3-1.7b-heretic"`).
+
 
