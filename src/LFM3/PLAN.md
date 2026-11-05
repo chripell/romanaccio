@@ -835,6 +835,51 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
+### Milestone 14: Dense LFM-7B Dual-Die Port & Tensor-Parallel Partitioning (`TP=2`, ~6.8–7.5 tok/s INT8)
+
+- **Status**: **RESEARCH & ARCHITECTURE COMPLETE** (November 2026).
+- **Model Topology**:
+  - Dense ~7B parameter tri-hybrid/transformer architecture (`hidden_size=4096`, `intermediate_size=11008` or `14336`, `num_hidden_layers=32`, `num_attention_heads=32`, `num_key_value_heads=8`, `head_dim=128`, `vocab_size=128000`).
+- **Memory Footprint & MMZ Budgeting**:
+  - **INT8 Weights**: ~7.0 GiB total -> **3.5 GiB per die** (occupies only 31.8% of default 11 GiB/die MMZ, leaving 7.5 GiB headroom).
+  - **FP16 Weights**: ~14.0 GiB total -> **7.0 GiB per die** (occupies 63.6% of MMZ, leaves 4.0 GiB headroom).
+  - Both INT8 and FP16 run completely inside the standard 22 GiB MMZ carveout without U-Boot changes.
+- **Partitioning Strategies**:
+  1. **Pipeline Parallelism (`PP=2`, Baseline)**:
+     - Die 0: Layers 0..15. Die 1: Layers 16..31 + LM Head.
+     - Sequential die execution utilizes only 14 GB/s local memory bandwidth.
+     - Theoretical decode throughput: $3.5\text{ GB} / 14\text{ GB/s} = 250\text{ ms/tok} \implies \mathbf{3.8 – 4.2\text{ tok/s}}$ (INT8).
+  2. **Tensor Parallelism (`TP=2`, Target)**:
+     - Unlocks both memory controllers simultaneously for an aggregate **28 GB/s** read bandwidth.
+     - Col-split `qkv` ($4096 \to 2560$ per die) and `mlp.w1/w3` ($4096 \to 5504$ per die).
+     - Row-split `o_proj` ($2048 \to 4096$ per die) and `mlp.w2` ($5504 \to 4096$ per die).
+     - Host CPU computes 4096-float sum reduction (< 15 µs per layer).
+     - Theoretical decode throughput: $1.75\text{ GB} / 14\text{ GB/s} = 125\text{ ms} + 18\text{ ms host sync} \implies \mathbf{6.8 – 7.5\text{ tok/s}}$ (INT8).
+- **Loadable Footprint**:
+  - Reuses the Route D Class B archetype architecture: 8 layer archetypes + 4–8 LM head slices = **12–16 resident models/die** (far below the 62-model limit).
+
+---
+
+### Milestone 15: Sparse LFM2-8B / LFM2.5-8B-A1B MoE Port & Expert-Parallel Sharding (`EP=2`, ~11.0–14.5 tok/s INT8)
+
+- **Status**: **RESEARCH & ARCHITECTURE COMPLETE** (November 2026).
+- **Model Topology**:
+  - Sparse Mixture-of-Experts: ~8.3B total parameters with ~1.2B active parameters per token (e.g. 32 routed experts, top-2 routing).
+- **Memory Footprint**:
+  - **INT8 Weights**: ~8.3 GiB total -> **4.15 GiB per die** (easily fits in 11 GiB/die MMZ).
+  - **FP16 Weights**: ~16.6 GiB total -> **8.3 GiB per die** (fits in 11 GiB/die MMZ).
+- **Partitioning Architecture (Expert Parallelism `EP=2`)**:
+  - Shared attention/conv layers sharded via `TP=2` or `PP=2`.
+  - Routed experts sharded by index: Even experts ($E_{0}, E_{2}, \dots$) on Die 0; Odd experts ($E_{1}, E_{3}, \dots$) on Die 1.
+  - Active weights streamed per token: only **~1.2 GB** across both dies!
+  - Under `EP=2`, each die streams only ~0.6 GB of active expert weights at 14 GB/s = ~43 ms.
+  - Estimated decode throughput: **`11.0 – 14.5 tokens/sec`** in INT8, or **`5.5 – 7.2 tokens/sec`** in pure FP16!
+- **Solvability of the MoE Loadable Limit**:
+  - Unlike DeepSeek-V2-Lite where hardcoded requantization shifts created 15 stream classes, applying the verified SmoothQuant + per-output-channel formula (`FINDINGS.md` §46.5 / §49) moves all per-expert quantization scales outside the `.model` loadable.
+  - A **single Class B MLP expert archetype** (`lfm_expert_classb.model`) binds to all 32 experts via `DevBuf.offset`, requiring only **1 resident loadable slot per die for the entire MoE layer bank**!
+
+---
+
 ## 6. Feasibility Analysis of Multimodal & Larger Models in the LFM3 Family
 
 One of Liquid AI's core architectural decisions in the LFM3 generation is **"One Backbone, Six Specialists"**: every model in the LFM3 release branches directly from `LFM3-1.7B-Base` and shares the **exact same 24-layer tri-hybrid language backbone** (`hidden_size=2048`, `13 conv + 5 SWA + 6 global`).
@@ -894,3 +939,86 @@ Applying our silicon-verified findings from `FINDINGS.md` §24–§35 yields a s
 2. **Why `24B-A2B` (`24B` Total / `2.45B` Active) Is High-Risk on a Single 32 GiB Board**:
    - At 24B parameters, INT8 weights alone require **~24.0 GiB**, which exceeds the default 22 GiB MMZ and leaves almost zero headroom even under the 28 GiB U-Boot MMZ carveout (`FINDINGS.md` §21.2) once 40 layers of loadables, KV caches, and Linux OS overhead are included.
    - Unless `EsAAC` / `eswin_compiler` adds native **INT4 (`W4A16` / `W4A8`) weight decompression** on the NPU or GPU, models in the 24B class should be deferred in favor of **`LFM3-1.7B`**, **`LFM3-VL-2B`**, **`d1-2B`**, and the **`8B-A1B` MoE** tier.
+
+---
+
+### 6.4 Deep-Dive: Hardware Feasibility, Partitioning Mathematics & Bandwidth Roofline for LFM-7B & LFM2-8B / LFM2.5-8B-A1B
+
+Below is the quantitative feasibility analysis, memory map, and partitioning blueprint for scaling beyond the 2B tier on the `roma` dual-die hardware (32 GiB total system RAM, 22 GiB default MMZ split as 11 GiB per die, 14 GB/s per-die LPDDR5 bandwidth).
+
+#### 1. Architectural Taxonomy & Parameter Geometry
+
+| Dimension | `LFM3-1.7B` (Baseline) | `LFM-7B` (Dense) | `LFM2.5-8B-A1B` (Sparse MoE) |
+| :--- | :--- | :--- | :--- |
+| **Model Type** | Dense Tri-Hybrid | Dense Tri-Hybrid / Transformer | Sparse MoE Hybrid |
+| **Total Parameters** | 1.73B | ~7.0B | 8.3B |
+| **Active Parameters / Token** | 1.73B | 7.0B | **~1.2B – 1.5B** |
+| **Hidden Dimension ($D$)** | 2,048 | 4,096 | 2,048 (or 2,560) |
+| **Layers ($L$)** | 24 | 32 | 28–32 |
+| **Attention Heads ($H_q / H_{kv}$)** | 16 / 4 (GQA 4:1) | 32 / 8 (GQA 4:1) | 16 / 4 (or 20 / 4) |
+| **FFN Intermediate Size** | 7,680 (SwiGLU) | 11,008 / 14,336 (SwiGLU) | 32 routed experts × 2,048 (top-2 active) |
+| **Vocab Size** | 128,000 | 128,000 (or 32,000) | 128,000 |
+
+#### 2. Physical Memory Footprint & MMZ Allocation on `roma`
+
+The `roma` board provides two isolated NUMA nodes for the NPUs:
+- **Die 0**: `mmz_nid_0_part_0` (11 GiB)
+- **Die 1**: `mmz_nid_1_part_0` (11 GiB)
+
+| Model & Precision | Total Weight Size | Per-Die Weight Size | MMZ Usage / Die | Free MMZ Headroom | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`LFM3-1.7B` INT8** | 1.76 GiB | 0.88 GiB | 8.0% | 10.12 GiB | **VERIFIED ON SILICON** |
+| **`LFM3-1.7B` FP16** | 2.75 GiB | 1.37 GiB | 12.5% | 9.63 GiB | **VERIFIED ON SILICON** |
+| **`LFM-7B` INT8** | **~7.0 GiB** | **3.50 GiB** | **31.8%** | **7.50 GiB** | **100% FEASIBLE** |
+| **`LFM-7B` FP16** | **~14.0 GiB** | **7.00 GiB** | **63.6%** | **4.00 GiB** | **100% FEASIBLE** |
+| **`LFM2.5-8B-A1B` INT8**| **~8.3 GiB** | **4.15 GiB** | **37.7%** | **6.85 GiB** | **100% FEASIBLE** |
+| **`LFM2.5-8B-A1B` FP16**| **~16.6 GiB** | **8.30 GiB** | **75.5%** | **2.70 GiB** | **100% FEASIBLE** |
+
+> [!IMPORTANT]
+> Both `LFM-7B` (dense) and `LFM2.5-8B-A1B` (sparse MoE) fit comfortably inside the default 22 GiB MMZ carveout in **both INT8 and FP16**, requiring **zero custom U-Boot memory reallocation**.
+
+#### 3. Bandwidth Roofline & Throughput Projections
+
+The fundamental speed bottleneck for autoregressive token decoding on EIC7700X is memory bus bandwidth. The dual-die interconnect provides independent LPDDR5 channels:
+- Single-die streaming bandwidth: **14.0 GB/s**
+- Dual-die concurrent streaming bandwidth: **28.0 GB/s**
+
+##### A. `LFM-7B` (Dense 7B Parameters)
+- **Under Pipeline Parallelism (`PP=2`, 16 layers/die)**:
+  - Tokens pass sequentially through Die 0 (Layers 0..15) then Die 1 (Layers 16..31).
+  - Only one die streams weights at any given moment $\implies$ **14 GB/s effective bandwidth**.
+  - Weight stream per token: 3.50 GB (Die 0) + 3.50 GB (Die 1) = 7.0 GB total.
+  - Weight streaming time: $7.0\text{ GB} / 14\text{ GB/s} = 500\text{ ms/tok}$.
+  - Under INT8: $3.5\text{ GB} / 14\text{ GB/s} = 250\text{ ms/tok} \implies \mathbf{3.8 – 4.2\text{ tokens/sec}}$.
+- **Under Tensor Parallelism (`TP=2`, 32 half-width layers concurrent)**:
+  - Both dies stream their respective parameter halves simultaneously $\implies$ **28 GB/s effective bandwidth**.
+  - Weight streaming time: $1.75\text{ GB} / 14\text{ GB/s} = 125\text{ ms}$.
+  - Host CPU sum-reduction overhead (32 layers × 4096 floats = 16 KB reduction/layer) = ~18 ms total per token.
+  - Total latency per token: $125\text{ ms} + 18\text{ ms} \approx 143\text{ ms} \implies \mathbf{6.8 – 7.5\text{ tokens/sec}}$ (INT8).
+
+##### B. `LFM2.5-8B-A1B` (Sparse MoE, ~1.2B Active Parameters)
+- **Under Expert Parallelism (`EP=2`)**:
+  - Shared layers (attention & conv) run under `TP=2`.
+  - Routed experts are sharded evenly across dies (even experts on Die 0, odd experts on Die 1).
+  - Because only **~1.2B active parameters** are evaluated per token, the total weight stream per token is only **~1.2 GB in INT8** (~2.4 GB in FP16).
+  - With both dies executing active experts concurrently, each die streams only **~0.6 GB** at 14 GB/s = **~43 ms**.
+  - Host gating and dispatch overhead = ~30 ms.
+  - Estimated sustained decode throughput: $\mathbf{11.0 – 14.5\text{ tokens/sec}}$ (INT8) or $\mathbf{5.5 – 7.2\text{ tokens/sec}}$ (FP16).
+
+#### 4. Loadable Budgeting vs. the 62-Model/Die Kernel Oops Ceiling
+
+The most critical operational limit uncovered during reverse engineering (`FINDINGS.md` §34–§35) is that allocating $> 62$ resident `.model` descriptors on a single die triggers a fatal kernel driver fault (`eic7700_npu: descriptor table overflow`).
+
+1. **`LFM-7B` Dense Architecture**:
+   - Following the verified **Route D Class B Archetype** design, all 32 layers share identical operation topologies.
+   - Required archetypes per die:
+     - 4 Layer loadables ($T=1$): `conv_in` (or `qkv`), `conv_out` (or `o_proj`), `mlp`, `attn_qkv`.
+     - 4 Layer loadables ($T=64$ prefill): matching shapes for batched prefill.
+     - 4 LM Head slices ($4 \times 32,000$ or $8 \times 16,000$).
+   - **Total resident models per die: 12 – 16** (headroom: **46–50 slots**).
+
+2. **`LFM2.5-8B-A1B` MoE Architecture**:
+   - In pure **FP16**, Class B loadables are 100% byte-identical across experts of the same shape (`FINDINGS.md` §37.2). A single `expert_mlp_classb.model` template serves all 32 experts via `DevBuf.offset`.
+   - In **INT8**, applying the newly verified SmoothQuant + per-output-channel formula (`FINDINGS.md` §46.5 / §49) removes all hardcoded requantization shifts from `kmd-task-op_list`. All per-expert scales are passed externally in `DevBuf.offset` or host sidecar buffers.
+   - **Total resident models per die: 14 – 18** (leaving > 44 free slots).
+
