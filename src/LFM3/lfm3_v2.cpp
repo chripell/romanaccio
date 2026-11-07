@@ -47,7 +47,9 @@
 #include <vector>
 #include <omp.h>
 #include <sched.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -132,6 +134,114 @@ static void pin_openmp_threads_numa() {
         sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
     }
 }
+
+// Strict NUMA-bound + 2 MiB HugePage per-layer KV buffer:
+// For each layer l in [0, num_layers), binds the first half (KV heads 0,1) to NUMA Node 0 (Die 0)
+// and the second half (KV heads 2,3) to NUMA Node 1 (Die 1), enables MADV_HUGEPAGE so 2 MiB pages
+// sit in the P550 32-entry L1 DTLB, and faults each half on its local die's CPU cores.
+static inline void bind_memory_to_numa_node(void *addr, size_t len, int node) {
+#if defined(__linux__) && defined(SYS_mbind)
+    const size_t page_sz = 4096;
+    uintptr_t u = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t aligned_beg = (u + page_sz - 1) & ~(page_sz - 1);
+    uintptr_t aligned_end = (u + len) & ~(page_sz - 1);
+    if (aligned_end <= aligned_beg) return;
+    unsigned long nodemask = (1UL << (node & 1));
+    // MPOL_BIND = 2, MPOL_MF_STRICT | MPOL_MF_MOVE = 3
+    long rc = syscall(SYS_mbind, reinterpret_cast<void*>(aligned_beg), aligned_end - aligned_beg,
+                      2, &nodemask, sizeof(nodemask) * 8, 3);
+    if (rc != 0) {
+        syscall(SYS_mbind, reinterpret_cast<void*>(aligned_beg), aligned_end - aligned_beg,
+                2, &nodemask, sizeof(nodemask) * 8, 0);
+    }
+#else
+    (void)addr; (void)len; (void)node;
+#endif
+}
+
+template <typename T>
+class NumaKvBuffer {
+public:
+    NumaKvBuffer() = default;
+    ~NumaKvBuffer() { release(); }
+
+    NumaKvBuffer(const NumaKvBuffer&) = delete;
+    NumaKvBuffer& operator=(const NumaKvBuffer&) = delete;
+
+    void allocate(size_t num_layers, size_t elems_per_layer) {
+        release();
+        m_num_layers = num_layers;
+        m_elems_per_layer = elems_per_layer;
+        m_size = num_layers * elems_per_layer;
+        size_t raw_bytes = m_size * sizeof(T);
+        // Align allocation to 2 MiB boundary when >= 2 MiB to maximize 2 MiB THP coverage
+        size_t align = (raw_bytes >= (2 * 1024 * 1024)) ? (2 * 1024 * 1024) : 4096;
+        m_alloc_bytes = (raw_bytes + align - 1) & ~(align - 1);
+
+        void *p = mmap(nullptr, m_alloc_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            std::perror("NumaKvBuffer mmap");
+            std::abort();
+        }
+        m_ptr = static_cast<T*>(p);
+#if defined(MADV_HUGEPAGE)
+        if (m_alloc_bytes >= (2 * 1024 * 1024)) {
+            madvise(m_ptr, m_alloc_bytes, MADV_HUGEPAGE);
+        }
+#endif
+        size_t half_elems = elems_per_layer / 2;
+        size_t half_bytes = half_elems * sizeof(T);
+        for (size_t l = 0; l < num_layers; ++l) {
+            T *layer_base = m_ptr + l * elems_per_layer;
+            bind_memory_to_numa_node(layer_base,              half_bytes, 0); // KV heads 0,1 -> Die 0
+            bind_memory_to_numa_node(layer_base + half_elems, half_bytes, 1); // KV heads 2,3 -> Die 1
+        }
+        clear();
+    }
+
+    void clear() {
+        if (!m_ptr || m_size == 0) return;
+        const size_t half_elems = m_elems_per_layer / 2;
+        #pragma omp parallel num_threads(8)
+        {
+            int tid = omp_get_thread_num();
+            int die = (tid < 4) ? 0 : 1;
+            int local_tid = tid & 3;
+            size_t chunk = half_elems / 4;
+            size_t beg = local_tid * chunk;
+            size_t end = (local_tid == 3) ? half_elems : (beg + chunk);
+            for (size_t l = 0; l < m_num_layers; ++l) {
+                T *half_base = m_ptr + l * m_elems_per_layer + static_cast<size_t>(die) * half_elems;
+                std::memset(half_base + beg, 0, (end - beg) * sizeof(T));
+            }
+        }
+    }
+
+    T* data() noexcept { return m_ptr; }
+    const T* data() const noexcept { return m_ptr; }
+    size_t size() const noexcept { return m_size; }
+    T* begin() noexcept { return m_ptr; }
+    T* end() noexcept { return m_ptr + m_size; }
+    T& operator[](size_t i) noexcept { return m_ptr[i]; }
+    const T& operator[](size_t i) const noexcept { return m_ptr[i]; }
+
+private:
+    void release() {
+        if (m_ptr) {
+            munmap(m_ptr, m_alloc_bytes);
+            m_ptr = nullptr;
+            m_size = 0;
+            m_alloc_bytes = 0;
+        }
+    }
+
+    T     *m_ptr = nullptr;
+    size_t m_size = 0;
+    size_t m_alloc_bytes = 0;
+    size_t m_num_layers = 0;
+    size_t m_elems_per_layer = 0;
+};
 
 static inline int32_t round_clamp_f32(float x_scaled, float limit) {
     float c = std::min(std::max(x_scaled, -limit), limit);
@@ -926,11 +1036,13 @@ public:
     bool init(const std::string &pkg_dir, int max_ctx = 4096) {
         auto t_init0 = std::chrono::steady_clock::now();
         m_pkg_dir = pkg_dir;
-        m_max_ctx = max_ctx;
+        // Round m_max_ctx up to a multiple of 2048 so every per-die half-layer (2 * m_max_ctx slots)
+        // is an exact multiple of 4 KiB OS pages (and 2 MiB HugePages for FP32 KV caches).
+        m_max_ctx = std::max(2048, (max_ctx + 2047) & ~2047);
 
         std::printf("=================================================================\n");
         std::printf(" LFM3-1.7B Tri-Hybrid Dual-Die Engine (Route D Class B)\n");
-        std::printf(" Package directory: %s (max_ctx=%d)\n", pkg_dir.c_str(), max_ctx);
+        std::printf(" Package directory: %s (max_ctx=%d)\n", pkg_dir.c_str(), m_max_ctx);
         std::printf("=================================================================\n\n");
 
         // 1. Load cpu_weights.bin & cpu_weights.json
@@ -973,35 +1085,10 @@ public:
                 : 0.0f;
         }
 
-        // 6. Allocate host state buffers (13 ShortConv rings, 5 SWA caches, 6 Global caches)
+        // 6. Start Dual-Die WorkerPool & Load Models/Buffers on Die 0 and Die 1 first
+        //    (evicting the 1.53 GiB weight blobs from VFS page cache via POSIX_FADV_DONTNEED
+        //    so Node 0 has full free RAM before NUMA-pinned host KV caches are allocated).
         pin_openmp_threads_numa();
-        m_conv_state.assign(13 * kHidden * 6, 0.0f);
-        m_swa_k.assign(5 * kSwaCap * kKvHeads * kHeadDim, 0.0f);
-        m_swa_v.assign(5 * kSwaCap * kKvHeads * kHeadDim, 0.0f);
-        m_glob_k.assign(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim, 0.0f);
-        m_glob_v.assign(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim, 0.0f);
-        m_glob_k_u8.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
-        m_glob_v_u8.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
-        m_glob_k_sc.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads);
-        m_glob_v_sc.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads);
-        m_glob_k_sum.resize(6 * static_cast<size_t>(m_max_ctx) * kKvHeads);
-        m_scores_ws.assign(8 * 16 * static_cast<size_t>( std::max(m_max_ctx, 32768) ), 0.0f);
-        m_logits.assign(kVocab, 0.0f);
-
-        // Pre-allocate forward_chunk scratch buffers once for kChunk=64 tokens to eliminate
-        // 10 heap allocations/zero-fills per decode step.
-        m_buf_h.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_u.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_bcx.assign(static_cast<size_t>(kChunk) * 6144, 0.0f);
-        m_buf_qkv.assign(static_cast<size_t>(kChunk) * 3072, 0.0f);
-        m_buf_y.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_op_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_h_mid.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_v.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_mlp_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
-        m_buf_gates.assign(static_cast<size_t>(kChunk) * kQHeads, 0.0f);
-
-        // 7. Start Dual-Die WorkerPool & Load Models/Buffers on Die 0 and Die 1
         if (!m_pool.start(2)) {
             std::printf("FAIL: WorkerPool::start(2) failed (run with sudo on roma)\n");
             return false;
@@ -1033,6 +1120,10 @@ public:
                 return false;
             }
             size_t nr = std::fread(m_w_blob[d]->data(), 1, w_sz, wf);
+#if defined(__linux__)
+            int w_fd = fileno(wf);
+            if (w_fd >= 0) posix_fadvise(w_fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
             std::fclose(wf);
             if (nr != w_sz) {
                 std::printf("FAIL: short read on %s (%zu/%zu)\n", w_file.c_str(), nr, w_sz);
@@ -1206,6 +1297,34 @@ public:
             }
         }
 
+        // 7. Allocate NUMA-bound host state buffers (KV heads 0,1 strictly bound to Node 0 / Die 0
+        //    with 2 MiB HugePages; KV heads 2,3 strictly bound to Node 1 / Die 1 with 2 MiB HugePages)
+        pin_openmp_threads_numa();
+        m_conv_state.assign(13 * kHidden * 6, 0.0f);
+        m_swa_k.allocate(5, static_cast<size_t>(kSwaCap) * kKvHeads * kHeadDim);
+        m_swa_v.allocate(5, static_cast<size_t>(kSwaCap) * kKvHeads * kHeadDim);
+        m_glob_k.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
+        m_glob_v.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
+        m_glob_k_u8.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
+        m_glob_v_u8.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
+        m_glob_k_sc.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads);
+        m_glob_v_sc.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads);
+        m_glob_k_sum.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads);
+        m_logits.assign(kVocab, 0.0f);
+
+        // Pre-allocate forward_chunk scratch buffers once for kChunk=64 tokens to eliminate
+        // 10 heap allocations/zero-fills per decode step.
+        m_buf_h.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_u.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_bcx.assign(static_cast<size_t>(kChunk) * 6144, 0.0f);
+        m_buf_qkv.assign(static_cast<size_t>(kChunk) * 3072, 0.0f);
+        m_buf_y.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_op_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_h_mid.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_v.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_mlp_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_gates.assign(static_cast<size_t>(kChunk) * kQHeads, 0.0f);
+
         auto t_init1 = std::chrono::steady_clock::now();
         std::printf("[+] Engine initialized in %.2f s.\n\n",
                     std::chrono::duration<double>(t_init1 - t_init0).count());
@@ -1223,15 +1342,15 @@ public:
      */
     void reset_state() {
         std::fill(m_conv_state.begin(), m_conv_state.end(), 0.0f);
-        std::fill(m_swa_k.begin(), m_swa_k.end(), 0.0f);
-        std::fill(m_swa_v.begin(), m_swa_v.end(), 0.0f);
-        std::fill(m_glob_k.begin(), m_glob_k.end(), 0.0f);
-        std::fill(m_glob_v.begin(), m_glob_v.end(), 0.0f);
-        std::fill(m_glob_k_u8.begin(), m_glob_k_u8.end(), 0);
-        std::fill(m_glob_v_u8.begin(), m_glob_v_u8.end(), 0);
-        std::fill(m_glob_k_sc.begin(), m_glob_k_sc.end(), 0.0f);
-        std::fill(m_glob_v_sc.begin(), m_glob_v_sc.end(), 0.0f);
-        std::fill(m_glob_k_sum.begin(), m_glob_k_sum.end(), 0);
+        m_swa_k.clear();
+        m_swa_v.clear();
+        m_glob_k.clear();
+        m_glob_v.clear();
+        m_glob_k_u8.clear();
+        m_glob_v_u8.clear();
+        m_glob_k_sc.clear();
+        m_glob_v_sc.clear();
+        m_glob_k_sum.clear();
         std::fill(m_logits.begin(), m_logits.end(), 0.0f);
         for (uint16_t d = 0; d < 2; ++d) {
             for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
@@ -1574,8 +1693,10 @@ public:
                         }
                         size_t head_slot_idx = static_cast<size_t>(kh) * s_cap + slot;
                         size_t head_slot_off = head_slot_idx * kHeadDim;
-                        std::memcpy(k_cache + head_slot_off, k_h, kHeadDim * sizeof(float));
-                        std::memcpy(v_cache + head_slot_off, v_h, kHeadDim * sizeof(float));
+                        if (is_swa || (m_pos + T_valid) < 256) {
+                            std::memcpy(k_cache + head_slot_off, k_h, kHeadDim * sizeof(float));
+                            std::memcpy(v_cache + head_slot_off, v_h, kHeadDim * sizeof(float));
+                        }
                         if (!is_swa) {
                             uint16_t dummy_v_sum = 0;
                             quantize_kv_u8(k_h, k_u8_layer + head_slot_off, k_sc_layer[head_slot_idx], k_sum_layer[head_slot_idx]);
@@ -1585,9 +1706,14 @@ public:
                 }
 
                 // Execute GQA Attention + multiply by head gate g_h
-                if (!is_swa && T_valid == 1 && (m_pos + 1) >= 256) {
-                    run_gqa_attention_int8_swar(qkv, k_u8_layer, v_u8_layer, k_sc_layer, v_sc_layer,
-                                                k_sum_layer, gates, y, m_pos + 1, s_cap);
+                if (!is_swa && (m_pos + T_valid) >= 256) {
+                    if (T_valid == 1) {
+                        run_gqa_attention_int8_swar(qkv, k_u8_layer, v_u8_layer, k_sc_layer, v_sc_layer,
+                                                    k_sum_layer, gates, y, m_pos + 1, s_cap);
+                    } else {
+                        run_gqa_attention_int8_swar_prefill(qkv, k_u8_layer, v_u8_layer, k_sc_layer, v_sc_layer,
+                                                            k_sum_layer, gates, y, T_valid, m_pos, s_cap);
+                    }
                 } else {
                     run_gqa_attention(qkv, k_cache, v_cache, gates, y,
                                       T_valid, m_pos, is_swa, s_cap);
@@ -2290,6 +2416,262 @@ private:
         }
     }
 
+    // NUMA-Pinned Head-Major INT8 Global GQA Prefill Kernel (T_valid > 1) using 64-Bit 2-Lane SWAR
+    // and L2-Tiled FlashAttention-2 Online Softmax.
+    // Streams 1-byte k_u8 and v_u8 once per 32-key tile from local Die LPDDR5 across all query blocks
+    // owned by the thread, cutting KV memory bandwidth by 32x and compute instructions by 2x.
+    void run_gqa_attention_int8_swar_prefill(const float *qkv_chunk, const uint8_t *k_u8, const uint8_t *v_u8,
+                                             const float *k_sc, const float *v_sc, const uint16_t *k_sum,
+                                             const float *gates, float *attn_out_chunk,
+                                             int T, int pos_base, int s_cap) {
+        #pragma omp parallel num_threads(8)
+        {
+            const int tid     = omp_get_thread_num();
+            const int kv_h    = tid >> 1; // 0,1 on Die 0 (Cores 0..3); 2,3 on Die 1 (Cores 4..7)
+            const int sub_tid = tid & 1;  // 0 -> even 4-token blocks (0,8..56); 1 -> odd 4-token blocks (4,12..60)
+            const int qh_base = kv_h * 4;
+
+            size_t head_base = static_cast<size_t>(kv_h) * s_cap;
+            const uint8_t  *kh_u8  = k_u8  + head_base * kHeadDim;
+            const uint8_t  *vh_u8  = v_u8  + head_base * kHeadDim;
+            const float    *kh_sc  = k_sc  + head_base;
+            const float    *vh_sc  = v_sc  + head_base;
+            const uint16_t *kh_sum = k_sum + head_base;
+
+            constexpr int kMaxBlocks = 8;
+            alignas(64) uint64_t q_swar[kMaxBlocks][kHeadDim][8];
+            alignas(64) float    q_scale[kMaxBlocks][16];
+            alignas(64) int32_t  q_bias[kMaxBlocks][16];
+            alignas(64) float    o_all[kMaxBlocks][kHeadDim][16];
+            alignas(64) float    run_m[kMaxBlocks][16];
+            alignas(64) float    run_l[kMaxBlocks][16];
+            int t_base_arr[kMaxBlocks];
+            int dt_cnt_arr[kMaxBlocks];
+            int p_end_arr[kMaxBlocks][4];
+            int n_blocks = 0;
+            int p_max_all = 0;
+
+            for (int t_base = sub_tid * 4; t_base < T && n_blocks < kMaxBlocks; t_base += 8) {
+                int b = n_blocks++;
+                t_base_arr[b] = t_base;
+                int dt_cnt = std::min(4, T - t_base);
+                dt_cnt_arr[b] = dt_cnt;
+                std::memset(o_all[b], 0, sizeof(o_all[b]));
+
+                uint8_t qu_tmp[16][kHeadDim];
+                std::memset(qu_tmp, 128, sizeof(qu_tmp));
+
+                for (int dt = 0; dt < 4; ++dt) {
+                    if (dt < dt_cnt) {
+                        int t = t_base + dt;
+                        int pe = pos_base + t + 1;
+                        p_end_arr[b][dt] = pe;
+                        if (pe > p_max_all) p_max_all = pe;
+                        for (int g = 0; g < 4; ++g) {
+                            int idx = dt * 4 + g;
+                            const float *q_src = qkv_chunk + static_cast<size_t>(t) * 3072 + (qh_base + g) * kHeadDim;
+                            uint16_t qsum = 0;
+                            quantize_kv_u8(q_src, qu_tmp[idx], q_scale[b][idx], qsum);
+                            q_bias[b][idx]  = 2097152 - 128 * static_cast<int32_t>(qsum);
+                            q_scale[b][idx] *= 0.0883883476f;
+                            run_m[b][idx] = -1e30f;
+                            run_l[b][idx] = 0.0f;
+                        }
+                    } else {
+                        p_end_arr[b][dt] = 0;
+                        for (int g = 0; g < 4; ++g) {
+                            int idx = dt * 4 + g;
+                            q_scale[b][idx] = 0.0f;
+                            q_bias[b][idx]  = 0;
+                            run_m[b][idx]   = -1e30f;
+                            run_l[b][idx]   = 0.0f;
+                        }
+                    }
+                }
+                for (int d = 0; d < kHeadDim; ++d) {
+                    for (int p = 0; p < 8; ++p) {
+                        q_swar[b][d][p] = static_cast<uint64_t>(qu_tmp[2 * p][d]) |
+                                          (static_cast<uint64_t>(qu_tmp[2 * p + 1][d]) << 32);
+                    }
+                }
+            }
+
+            constexpr int kTile = 32;
+            alignas(64) float sc_tile[kTile][16];
+            alignas(64) uint64_t pw_swar[kTile][8];
+
+            for (int s_base = 0; s_base < p_max_all; s_base += kTile) {
+                const int s_end    = std::min(p_max_all, s_base + kTile);
+                const int tile_len = s_end - s_base;
+
+                for (int b = 0; b < n_blocks; ++b) {
+                    const int dt_cnt = dt_cnt_arr[b];
+                    const int b_pmax = p_end_arr[b][dt_cnt - 1];
+                    if (s_base >= b_pmax) continue;
+
+                    const int n_q = dt_cnt * 4;
+                    const bool full_valid = (dt_cnt == 4) && (s_end <= p_end_arr[b][0]);
+                    float tile_m[16];
+                    for (int idx = 0; idx < 16; ++idx) tile_m[idx] = -1e30f;
+
+                    const float   *qs = q_scale[b];
+                    const int32_t *qb = q_bias[b];
+
+                    // Pass 1: 16-query 64-bit 2-lane SWAR Q * K^T over 32-key tile
+                    for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                        const int s_idx = s_base + s_rel;
+                        const uint8_t *k_vec = kh_u8 + static_cast<size_t>(s_idx) * kHeadDim;
+                        uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                        uint64_t a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            uint64_t kv = k_vec[d];
+                            const uint64_t *qr = q_swar[b][d];
+                            a0 += qr[0] * kv; a1 += qr[1] * kv;
+                            a2 += qr[2] * kv; a3 += qr[3] * kv;
+                            a4 += qr[4] * kv; a5 += qr[5] * kv;
+                            a6 += qr[6] * kv; a7 += qr[7] * kv;
+                        }
+                        uint64_t a_arr[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+                        int32_t ks = 128 * static_cast<int32_t>(kh_sum[s_idx]);
+                        float ksc  = kh_sc[s_idx];
+
+                        if (full_valid) {
+                            for (int p = 0; p < 8; ++p) {
+                                int i0 = 2 * p, i1 = 2 * p + 1;
+                                float s0 = static_cast<float>(static_cast<int32_t>(a_arr[p] & 0xFFFFFFFFu) - ks + qb[i0]) * (qs[i0] * ksc);
+                                float s1 = static_cast<float>(static_cast<int32_t>(a_arr[p] >> 32)         - ks + qb[i1]) * (qs[i1] * ksc);
+                                sc_tile[s_rel][i0] = s0; if (s0 > tile_m[i0]) tile_m[i0] = s0;
+                                sc_tile[s_rel][i1] = s1; if (s1 > tile_m[i1]) tile_m[i1] = s1;
+                            }
+                        } else {
+                            for (int p = 0; p < 8; ++p) {
+                                int i0 = 2 * p, i1 = 2 * p + 1;
+                                int dt0 = i0 >> 2, dt1 = i1 >> 2;
+                                if (i0 < n_q && s_idx < p_end_arr[b][dt0]) {
+                                    float s0 = static_cast<float>(static_cast<int32_t>(a_arr[p] & 0xFFFFFFFFu) - ks + qb[i0]) * (qs[i0] * ksc);
+                                    sc_tile[s_rel][i0] = s0; if (s0 > tile_m[i0]) tile_m[i0] = s0;
+                                } else {
+                                    sc_tile[s_rel][i0] = -1e30f;
+                                }
+                                if (i1 < n_q && s_idx < p_end_arr[b][dt1]) {
+                                    float s1 = static_cast<float>(static_cast<int32_t>(a_arr[p] >> 32)         - ks + qb[i1]) * (qs[i1] * ksc);
+                                    sc_tile[s_rel][i1] = s1; if (s1 > tile_m[i1]) tile_m[i1] = s1;
+                                } else {
+                                    sc_tile[s_rel][i1] = -1e30f;
+                                }
+                            }
+                        }
+                    }
+
+                    // Online Softmax update + track tile max weighted V scale
+                    float p_max[16];
+                    float p_max_sum = 0.0f;
+                    for (int idx = 0; idx < 16; ++idx) {
+                        p_max[idx] = 0.0f;
+                        if (idx >= n_q || tile_m[idx] <= -1e20f) {
+                            for (int s_rel = 0; s_rel < tile_len; ++s_rel) sc_tile[s_rel][idx] = 0.0f;
+                            continue;
+                        }
+                        float old_m = run_m[b][idx];
+                        float new_m = std::max(old_m, tile_m[idx]);
+                        float rescale = (old_m > -1e20f) ? fast_expf_neg(old_m - new_m) : 0.0f;
+                        if (rescale != 1.0f) {
+                            for (int d = 0; d < kHeadDim; ++d) o_all[b][d][idx] *= rescale;
+                        }
+                        float tile_sum = 0.0f;
+                        float pm = 0.0f;
+                        for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                            float sc = sc_tile[s_rel][idx];
+                            if (sc > -1e20f) {
+                                float w = fast_expf_neg(sc - new_m);
+                                tile_sum += w;
+                                float wv = w * vh_sc[s_base + s_rel];
+                                sc_tile[s_rel][idx] = wv;
+                                if (wv > pm) pm = wv;
+                            } else {
+                                sc_tile[s_rel][idx] = 0.0f;
+                            }
+                        }
+                        p_max[idx] = pm;
+                        p_max_sum += pm;
+                        run_l[b][idx] = run_l[b][idx] * rescale + tile_sum;
+                        run_m[b][idx] = new_m;
+                    }
+
+                    if (p_max_sum <= 1e-12f) continue;
+
+                    // Quantize tile's (w * v_sc) into 11-bit unsigned integers [0, 2047] for 64-bit SWAR P * V
+                    float p_inv[16], p_deq[16];
+                    int32_t pw_sum[16];
+                    for (int idx = 0; idx < 16; ++idx) {
+                        p_inv[idx]  = (p_max[idx] > 1e-12f) ? (2047.0f / p_max[idx]) : 0.0f;
+                        p_deq[idx]  = (p_max[idx] > 1e-12f) ? (p_max[idx] / 2047.0f) : 0.0f;
+                        pw_sum[idx] = 0;
+                    }
+
+                    for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                        for (int p = 0; p < 8; ++p) {
+                            int i0 = 2 * p, i1 = 2 * p + 1;
+                            uint32_t pw0 = static_cast<uint32_t>(sc_tile[s_rel][i0] * p_inv[i0] + 0.5f);
+                            uint32_t pw1 = static_cast<uint32_t>(sc_tile[s_rel][i1] * p_inv[i1] + 0.5f);
+                            pw_sum[i0] += static_cast<int32_t>(pw0);
+                            pw_sum[i1] += static_cast<int32_t>(pw1);
+                            pw_swar[s_rel][p] = static_cast<uint64_t>(pw0) | (static_cast<uint64_t>(pw1) << 32);
+                        }
+                    }
+
+                    // Pass 2: 16-query 64-bit 2-lane SWAR P * V accumulation
+                    alignas(64) uint64_t o_swar[kHeadDim][8];
+                    std::memset(o_swar, 0, sizeof(o_swar));
+                    for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                        const uint64_t *pw = pw_swar[s_rel];
+                        uint64_t p0 = pw[0], p1 = pw[1], p2 = pw[2], p3 = pw[3];
+                        uint64_t p4 = pw[4], p5 = pw[5], p6 = pw[6], p7 = pw[7];
+                        if ((p0 | p1 | p2 | p3 | p4 | p5 | p6 | p7) == 0) continue;
+                        const uint8_t *v_vec = vh_u8 + static_cast<size_t>(s_base + s_rel) * kHeadDim;
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            uint64_t vu = v_vec[d];
+                            uint64_t *orow = o_swar[d];
+                            orow[0] += p0 * vu; orow[1] += p1 * vu;
+                            orow[2] += p2 * vu; orow[3] += p3 * vu;
+                            orow[4] += p4 * vu; orow[5] += p5 * vu;
+                            orow[6] += p6 * vu; orow[7] += p7 * vu;
+                        }
+                    }
+
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        const uint64_t *orow = o_swar[d];
+                        float *odst = o_all[b][d];
+                        for (int p = 0; p < 8; ++p) {
+                            int i0 = 2 * p, i1 = 2 * p + 1;
+                            uint64_t w64 = orow[p];
+                            odst[i0] += static_cast<float>(static_cast<int32_t>(w64 & 0xFFFFFFFFu) - 128 * pw_sum[i0]) * p_deq[i0];
+                            odst[i1] += static_cast<float>(static_cast<int32_t>(w64 >> 32)         - 128 * pw_sum[i1]) * p_deq[i1];
+                        }
+                    }
+                }
+            }
+
+            // Normalize by run_l and apply per-head sigmoid gate
+            for (int b = 0; b < n_blocks; ++b) {
+                int t_base = t_base_arr[b];
+                int dt_cnt = dt_cnt_arr[b];
+                for (int dt = 0; dt < dt_cnt; ++dt) {
+                    int t = t_base + dt;
+                    for (int g = 0; g < 4; ++g) {
+                        int idx = dt * 4 + g;
+                        float gate_val = gates[static_cast<size_t>(t) * kQHeads + (qh_base + g)];
+                        float inv_sum  = gate_val / (run_l[b][idx] + 1e-12f);
+                        float *o_dst = attn_out_chunk + static_cast<size_t>(t) * kHidden + (qh_base + g) * kHeadDim;
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            o_dst[d] = o_all[b][d][idx] * inv_sum;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     void run_gqa_attention(const float *qkv_chunk, const float *k_cache, const float *v_cache,
                            const float *gates, float *attn_out_chunk,
                            int T, int pos_base, bool is_swa, int s_cap) {
@@ -2471,115 +2853,189 @@ private:
             return;
         }
 
-        // Batched T=64 prefill path: L1D-packed 16-way register-blocked microkernel
-        #pragma omp parallel for collapse(2) schedule(dynamic, 1)
-        for (int kv_h = 0; kv_h < kKvHeads; ++kv_h) {
-            for (int t_base = 0; t_base < T; t_base += 4) {
-                int tid = omp_get_thread_num();
-                float *scores = m_scores_ws.data() + static_cast<size_t>(tid) * (16 * m_max_ctx);
-                const float *k_head = k_cache + static_cast<size_t>(kv_h) * s_cap * kHeadDim;
-                const float *v_head = v_cache + static_cast<size_t>(kv_h) * s_cap * kHeadDim;
-                alignas(64) float q_local[128][16];
-                alignas(64) float o_local[128][16];
-                std::memset(o_local, 0, sizeof(o_local));
+        // Batched T=64 prefill path: NUMA-pinned (tid 0..3 -> kv_h 0,1 on Die 0; tid 4..7 -> kv_h 2,3 on Die 1)
+        // L2-tiled Online Softmax (FlashAttention-2) microkernel.
+        // Streams k_head and v_head in 64-key tiles (32 KiB K + 32 KiB V, 100% L2-resident) across all
+        // query blocks owned by the thread, cutting DRAM KV bandwidth by 8x and eliminating cross-die traffic.
+        #pragma omp parallel num_threads(8)
+        {
+            const int tid     = omp_get_thread_num();
+            const int kv_h    = tid >> 1; // 0,1 on Die 0 (Cores 0..3); 2,3 on Die 1 (Cores 4..7)
+            const int sub_tid = tid & 1;  // 0 -> even 4-token blocks (0,8..56); 1 -> odd 4-token blocks (4,12..60)
+            const int qh_base = kv_h * 4;
+            const float *k_head = k_cache + static_cast<size_t>(kv_h) * s_cap * kHeadDim;
+            const float *v_head = v_cache + static_cast<size_t>(kv_h) * s_cap * kHeadDim;
 
-                int qh_base = kv_h * 4;
-                float max_s[16];
-                int p_beg_arr[4], p_end_arr[4];
-                const int dt_cnt = std::min(4, T - t_base);
+            constexpr int kMaxBlocks = 8;
+            alignas(64) float q_all[kMaxBlocks][kHeadDim][16];
+            alignas(64) float o_all[kMaxBlocks][kHeadDim][16];
+            alignas(64) float run_m[kMaxBlocks][16];
+            alignas(64) float run_l[kMaxBlocks][16];
+            int t_base_arr[kMaxBlocks];
+            int dt_cnt_arr[kMaxBlocks];
+            int p_beg_arr[kMaxBlocks][4];
+            int p_end_arr[kMaxBlocks][4];
+            int n_blocks = 0;
+            int p_min_all = 0x7fffffff;
+            int p_max_all = 0;
+
+            for (int t_base = sub_tid * 4; t_base < T && n_blocks < kMaxBlocks; t_base += 8) {
+                int b = n_blocks++;
+                t_base_arr[b] = t_base;
+                int dt_cnt = std::min(4, T - t_base);
+                dt_cnt_arr[b] = dt_cnt;
+                std::memset(o_all[b], 0, sizeof(o_all[b]));
+
                 for (int dt = 0; dt < 4; ++dt) {
                     if (dt < dt_cnt) {
                         int t = t_base + dt;
                         int abs_pos = pos_base + t;
-                        p_beg_arr[dt] = is_swa ? std::max(0, abs_pos - kSwaWin + 1) : 0;
-                        p_end_arr[dt] = abs_pos + 1;
+                        int pb = is_swa ? std::max(0, abs_pos - kSwaWin + 1) : 0;
+                        int pe = abs_pos + 1;
+                        p_beg_arr[b][dt] = pb;
+                        p_end_arr[b][dt] = pe;
+                        if (pb < p_min_all) p_min_all = pb;
+                        if (pe > p_max_all) p_max_all = pe;
                         for (int g = 0; g < 4; ++g) {
                             int idx = dt * 4 + g;
                             const float *q_src = qkv_chunk + static_cast<size_t>(t) * 3072 + (qh_base + g) * kHeadDim;
-                            for (int d = 0; d < kHeadDim; ++d) q_local[d][idx] = q_src[d];
-                            max_s[idx] = -1e30f;
+                            for (int d = 0; d < kHeadDim; ++d) q_all[b][d][idx] = q_src[d];
+                            run_m[b][idx] = -1e30f;
+                            run_l[b][idx] = 0.0f;
                         }
                     } else {
-                        p_beg_arr[dt] = 0;
-                        p_end_arr[dt] = 0;
+                        p_beg_arr[b][dt] = 0;
+                        p_end_arr[b][dt] = 0;
                         for (int g = 0; g < 4; ++g) {
                             int idx = dt * 4 + g;
-                            for (int d = 0; d < kHeadDim; ++d) q_local[d][idx] = 0.0f;
-                            max_s[idx] = 0.0f;
+                            for (int d = 0; d < kHeadDim; ++d) q_all[b][d][idx] = 0.0f;
+                            run_m[b][idx] = -1e30f;
+                            run_l[b][idx] = 0.0f;
                         }
                     }
                 }
-                const int p_min  = p_beg_arr[0];
-                const int p_max  = p_end_arr[dt_cnt - 1];
-                const int n_span = p_max - p_min;
+            }
 
-                for (int s_rel = 0; s_rel < n_span; ++s_rel) {
-                    const int p = p_min + s_rel;
-                    const int slot = is_swa ? (p % kSwaCap) : p;
-                    const float *k_vec = k_head + static_cast<size_t>(slot) * kHeadDim;
-                    float acc[16] = {0.0f};
-                    for (int d = 0; d < kHeadDim; ++d) {
-                        float kv = k_vec[d];
-                        const float *qr = q_local[d];
-                        #pragma omp simd
-                        for (int idx = 0; idx < 16; ++idx) acc[idx] += qr[idx] * kv;
+            constexpr int kKeyTile = 64;
+            alignas(64) float sc_tile[kKeyTile][16];
+
+            for (int s_tile_beg = p_min_all; s_tile_beg < p_max_all; s_tile_beg += kKeyTile) {
+                const int s_tile_end = std::min(p_max_all, s_tile_beg + kKeyTile);
+                const int tile_len   = s_tile_end - s_tile_beg;
+
+                for (int b = 0; b < n_blocks; ++b) {
+                    const int dt_cnt = dt_cnt_arr[b];
+                    const int b_pmin = p_beg_arr[b][0];
+                    const int b_pmax = p_end_arr[b][dt_cnt - 1];
+                    if (s_tile_end <= b_pmin || s_tile_beg >= b_pmax) continue;
+
+                    const int n_q = dt_cnt * 4;
+                    const bool full_valid = (dt_cnt == 4) &&
+                                            (s_tile_beg >= p_beg_arr[b][3]) &&
+                                            (s_tile_end <= p_end_arr[b][0]);
+                    float tile_m[16];
+                    for (int idx = 0; idx < 16; ++idx) tile_m[idx] = -1e30f;
+
+                    // 1. Q * K^T over 64-key tile
+                    if (full_valid && !is_swa) {
+                        for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                            const float *k_vec = k_head + static_cast<size_t>(s_tile_beg + s_rel) * kHeadDim;
+                            float acc[16] = {0.0f};
+                            for (int d = 0; d < kHeadDim; ++d) {
+                                float kv = k_vec[d];
+                                const float *qr = q_all[b][d];
+                                #pragma omp simd
+                                for (int idx = 0; idx < 16; ++idx) acc[idx] += qr[idx] * kv;
+                            }
+                            for (int idx = 0; idx < 16; ++idx) {
+                                float sc = acc[idx] * 0.0883883476f;
+                                sc_tile[s_rel][idx] = sc;
+                                if (sc > tile_m[idx]) tile_m[idx] = sc;
+                            }
+                        }
+                    } else {
+                        for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                            const int p = s_tile_beg + s_rel;
+                            const int slot = is_swa ? (p % kSwaCap) : p;
+                            const float *k_vec = k_head + static_cast<size_t>(slot) * kHeadDim;
+                            float acc[16] = {0.0f};
+                            for (int d = 0; d < kHeadDim; ++d) {
+                                float kv = k_vec[d];
+                                const float *qr = q_all[b][d];
+                                #pragma omp simd
+                                for (int idx = 0; idx < 16; ++idx) acc[idx] += qr[idx] * kv;
+                            }
+                            for (int idx = 0; idx < n_q; ++idx) {
+                                int dt = idx >> 2;
+                                if (p >= p_beg_arr[b][dt] && p < p_end_arr[b][dt]) {
+                                    float sc = acc[idx] * 0.0883883476f;
+                                    sc_tile[s_rel][idx] = sc;
+                                    if (sc > tile_m[idx]) tile_m[idx] = sc;
+                                } else {
+                                    sc_tile[s_rel][idx] = -1e30f;
+                                }
+                            }
+                            for (int idx = n_q; idx < 16; ++idx) sc_tile[s_rel][idx] = 0.0f;
+                        }
                     }
-                    for (int idx = 0; idx < dt_cnt * 4; ++idx) {
-                        int dt = idx >> 2;
-                        if (p >= p_beg_arr[dt] && p < p_end_arr[dt]) {
-                            float sc = acc[idx] * 0.0883883476f;
-                            scores[idx * m_max_ctx + s_rel] = sc;
-                            if (sc > max_s[idx]) max_s[idx] = sc;
+
+                    // 2. Online Softmax update on L2-resident o_all[b][128][16]
+                    for (int idx = 0; idx < n_q; ++idx) {
+                        if (tile_m[idx] <= -1e20f) {
+                            for (int s_rel = 0; s_rel < tile_len; ++s_rel) sc_tile[s_rel][idx] = 0.0f;
+                            continue;
+                        }
+                        float old_m = run_m[b][idx];
+                        float new_m = std::max(old_m, tile_m[idx]);
+                        float rescale = (old_m > -1e20f) ? fast_expf_neg(old_m - new_m) : 0.0f;
+                        if (rescale != 1.0f) {
+                            for (int d = 0; d < kHeadDim; ++d) o_all[b][d][idx] *= rescale;
+                        }
+                        float tile_sum = 0.0f;
+                        for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                            float sc = sc_tile[s_rel][idx];
+                            float w = (sc > -1e20f) ? fast_expf_neg(sc - new_m) : 0.0f;
+                            sc_tile[s_rel][idx] = w;
+                            tile_sum += w;
+                        }
+                        run_l[b][idx] = run_l[b][idx] * rescale + tile_sum;
+                        run_m[b][idx] = new_m;
+                    }
+
+                    // 3. P * V accumulation over 64-key tile
+                    for (int s_rel = 0; s_rel < tile_len; ++s_rel) {
+                        const float *p_wt = sc_tile[s_rel];
+                        float p_sum = 0.0f;
+                        for (int idx = 0; idx < n_q; ++idx) p_sum += p_wt[idx];
+                        if (p_sum <= 1e-8f) continue;
+
+                        const int p = s_tile_beg + s_rel;
+                        const int slot = is_swa ? (p % kSwaCap) : p;
+                        const float *v_vec = v_head + static_cast<size_t>(slot) * kHeadDim;
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            float vv = v_vec[d];
+                            float *orow = o_all[b][d];
+                            #pragma omp simd
+                            for (int idx = 0; idx < 16; ++idx) orow[idx] += p_wt[idx] * vv;
                         }
                     }
                 }
+            }
 
-                for (int idx = 0; idx < dt_cnt * 4; ++idx) {
-                    int dt = idx >> 2;
-                    int g = idx & 3;
-                    float *row_sc = scores + idx * m_max_ctx;
-                    float ms = max_s[idx];
-                    float sum_exp = 0.0f;
-                    int s_beg = p_beg_arr[dt] - p_min;
-                    int s_end = p_end_arr[dt] - p_min;
-                    for (int s_rel = s_beg; s_rel < s_end; ++s_rel) {
-                        float w = fast_expf_neg(row_sc[s_rel] - ms);
-                        row_sc[s_rel] = w;
-                        sum_exp += w;
-                    }
-                    float gate_val = gates[static_cast<size_t>(t_base + dt) * kQHeads + (qh_base + g)];
-                    float inv_sum = gate_val / (sum_exp + 1e-12f);
-                    for (int s_rel = s_beg; s_rel < s_end; ++s_rel) row_sc[s_rel] *= inv_sum;
-                }
-
-                for (int s_rel = 0; s_rel < n_span; ++s_rel) {
-                    const int p = p_min + s_rel;
-                    const int slot = is_swa ? (p % kSwaCap) : p;
-                    const float *v_vec = v_head + static_cast<size_t>(slot) * kHeadDim;
-                    alignas(64) float p_wt[16];
-                    float p_sum = 0.0f;
-                    for (int idx = 0; idx < 16; ++idx) {
-                        int dt = idx >> 2;
-                        float val = (dt < dt_cnt && p >= p_beg_arr[dt] && p < p_end_arr[dt])
-                            ? scores[idx * m_max_ctx + s_rel] : 0.0f;
-                        p_wt[idx] = val;
-                        p_sum += val;
-                    }
-                    if (p_sum <= 1e-8f) continue;
-                    for (int d = 0; d < kHeadDim; ++d) {
-                        float vv = v_vec[d];
-                        float *orow = o_local[d];
-                        #pragma omp simd
-                        for (int idx = 0; idx < 16; ++idx) orow[idx] += p_wt[idx] * vv;
-                    }
-                }
-
+            // 4. Normalize by run_l and apply per-head sigmoid gate
+            for (int b = 0; b < n_blocks; ++b) {
+                int t_base = t_base_arr[b];
+                int dt_cnt = dt_cnt_arr[b];
                 for (int dt = 0; dt < dt_cnt; ++dt) {
                     int t = t_base + dt;
                     for (int g = 0; g < 4; ++g) {
                         int idx = dt * 4 + g;
+                        float gate_val = gates[static_cast<size_t>(t) * kQHeads + (qh_base + g)];
+                        float inv_sum  = gate_val / (run_l[b][idx] + 1e-12f);
                         float *o_dst = attn_out_chunk + static_cast<size_t>(t) * kHidden + (qh_base + g) * kHeadDim;
-                        for (int d = 0; d < kHeadDim; ++d) o_dst[d] = o_local[d][idx];
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            o_dst[d] = o_all[b][d][idx] * inv_sum;
+                        }
                     }
                 }
             }
@@ -2859,15 +3315,15 @@ private:
     float m_glob_inv_freq[64];
 
     std::vector<float> m_conv_state;
-    std::vector<float> m_swa_k;
-    std::vector<float> m_swa_v;
-    std::vector<float> m_glob_k;
-    std::vector<float> m_glob_v;
-    std::vector<uint8_t>  m_glob_k_u8;
-    std::vector<uint8_t>  m_glob_v_u8;
-    std::vector<float>    m_glob_k_sc;
-    std::vector<float>    m_glob_v_sc;
-    std::vector<uint16_t> m_glob_k_sum;
+    NumaKvBuffer<float>    m_swa_k;
+    NumaKvBuffer<float>    m_swa_v;
+    NumaKvBuffer<float>    m_glob_k;
+    NumaKvBuffer<float>    m_glob_v;
+    NumaKvBuffer<uint8_t>  m_glob_k_u8;
+    NumaKvBuffer<uint8_t>  m_glob_v_u8;
+    NumaKvBuffer<float>    m_glob_k_sc;
+    NumaKvBuffer<float>    m_glob_v_sc;
+    NumaKvBuffer<uint16_t> m_glob_k_sum;
     std::vector<float> m_scores_ws;
     std::vector<float> m_logits;
     std::vector<float> m_buf_h, m_buf_u, m_buf_bcx, m_buf_qkv, m_buf_y,

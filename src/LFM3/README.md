@@ -429,18 +429,18 @@ cd /home/chri/models/LFM3-1.7B_ENNP
 sudo ./lfm3_v2 --int8 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
 ```
 
-### 9.3 Live Progress & Output Metrics
+### 9.3 Live Progress & Measured Output Metrics
 
 During execution:
 - **Live Prefill Progress**: When running prompts over 128 tokens, `lfm3_v2` dynamically prints chunked progress updates:
   ```text
-  [Prefill progress: 24576/31762 tokens (77.4%) | 71.2 tok/s]
+  [Prefill progress: 768/3781 tokens (20.3%) | 74.4 tok/s]
   ```
 - **Performance Report**: Upon completing generation, the engine displays the exact prefill and decode metrics:
   ```text
-  [Prefill: 31762 tok in 446720.0 ms (71.10 tok/s, 14.1 ms/tok) | Decode: 412 tok at 9.02 tok/s (110.8 ms/tok)]
+  [Prefill: 3781 tok in 59168.8 ms (63.90 tok/s, 15.6 ms/tok) | Decode: 128 tok at 7.84 tok/s (128.6 ms/tok)]
   ```
-  - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs.
-  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (~9.0 tok/s on INT8).
+  - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs while the 8 P550 CPU cores execute L2-tiled, NUMA-pinned (`mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE` 2 MiB HugePages) batched INT8 64-bit SWAR attention (`63.90 tok/s` sustained over 3,781 tokens, peaking at `74.4 tok/s`).
+  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (`~8.85–9.02 tok/s` at short context, `7.84 tok/s` at `~4,000` tokens context).
 
 

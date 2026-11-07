@@ -12,88 +12,130 @@ Key topics covered:
 
 ---
 
-## 2. Hardware Memory Architecture Overview
+## 2. Hardware Memory Architecture & NoC Bandwidth Ceilings
 
-The EIC7702 SoC on the FML13V03 mainboard integrates two identical dies (Die 0 and Die 1) interconnected via a high-speed proprietary Die-to-Die (D2D) bus:
+The EIC7702X SoC on the FML13V03 mainboard integrates two identical EIC7700X dies (Die 0 and Die 1) interconnected via a coherent TileLink/AXI Die-to-Die (D2D) Chiplink bus:
 
 ```
-┌──────────────────────────────────────── Die 0 ────────────────────────────────────────┐
-│  [Cores 0-3 @ 1.4 GHz] ── [4 MB L3 Cache] ── [LPDDR5 Controller 0 (128-bit, 16 GiB)]  │
-│  [NPU 0 (19.95 TOPS)]  ── [4 MB SPRAM 0]  ── Base: 0x00_8000_0000                     │
-│  [DSP 0-3 @ 1.0 GHz]   ── [HAE 0]         ── MMZ Carveout: mmz_nid_0_part_0           │
-└───────────────────────────────────────────┬───────────────────────────────────────────┘
-                                            │ D2D Interconnect Bus
-                                            │ (Cap: ~22 GB/s bidirectional)
-┌───────────────────────────────────────────┴───────────────────────────────────────────┐
-│  [Cores 4-7 @ 1.4 GHz] ── [4 MB L3 Cache] ── [LPDDR5 Controller 1 (128-bit, 16 GiB)]  │
-│  [NPU 1 (19.95 TOPS)]  ── [4 MB SPRAM 1]  ── Base: 0x20_0000_0000                     │
-│  [DSP 4-7 @ 1.0 GHz]   ── [HAE 1]         ── MMZ Carveout: mmz_nid_1_part_0           │
-└──────────────────────────────────────── Die 1 ────────────────────────────────────────┘
+┌────────────────────────────────────────────── Die 0 ──────────────────────────────────────────────┐
+│  [Cores 0-3 @ 1.8 GHz] ── [4 MB L3] ──(mcput_snoc_mp: 256-bit @ 800 MHz = 25.6 GB/s max)──┐       │
+│                                                                                           ▼       │
+│  [NPU 0 (19.95 TOPS)]  ── [4 MB LLC] ──(llc_noc p0 @ 1.188 GHz)──► [LPDDR5 Ctrl 0+1 (64-bit)]    │
+│  [DSP 0-3 @ 1.0 GHz]   ── [HAE 0]    ──(mnoc/rnoc p3/p4)─────────► [6400 MT/s = 51.2 GB/s/die]   │
+│                                                                     Base: 0x00_8000_0000 (16 GiB) │
+│                                                                     MMZ:  0x01_C000_0000 (11 GiB) │
+└─────────────────────────────────────────────────┬─────────────────────────────────────────────────┘
+                                                  │ D2D Interconnect Bus
+                                                  │ (Cap: ~17 GB/s pin / ~11.4 GB/s nominal)
+┌─────────────────────────────────────────────────┴─────────────────────────────────────────────────┐
+│  [Cores 4-7 @ 1.8 GHz] ── [4 MB L3] ──(mcput_snoc_mp: 256-bit @ 800 MHz = 25.6 GB/s max)──┐       │
+│                                                                                           ▼       │
+│  [NPU 1 (19.95 TOPS)]  ── [4 MB LLC] ──(llc_noc p0 @ 1.188 GHz)──► [LPDDR5 Ctrl 0+1 (64-bit)]    │
+│  [DSP 4-7 @ 1.0 GHz]   ── [HAE 1]    ──(mnoc/rnoc p3/p4)─────────► [6400 MT/s = 51.2 GB/s/die]   │
+│                                                                     Base: 0x20_0000_0000 (16 GiB) │
+│                                                                     MMZ:  0x21_4000_0000 (11 GiB) │
+└────────────────────────────────────────────── Die 1 ──────────────────────────────────────────────┘
 ```
 
-### Key Hardware Characteristics:
-- **Total Physical Memory**: 32 GiB LPDDR5 divided equally:
-  - **Die 0 / Node 0**: 16 GiB physical address space spanning `0x00_8000_0000` to `0x04_8000_0000`.
-  - **Die 1 / Node 1**: 16 GiB physical address space spanning `0x20_0000_0000` to `0x24_0000_0000`.
-- **NUMA Topography**:
-  - NUMA Node 0: Cores 0, 1, 2, 3 (Die 0).
-  - NUMA Node 1: Cores 4, 5, 6, 7 (Die 1).
-- **Die-to-Die (D2D) Bus**: Connects the two dies. Local memory accesses hit the local LPDDR5 controller directly; cross-die accesses must traverse the D2D interconnect, incurring higher latency and bus contention.
+### 2.1. Theoretical LPDDR5 Peak vs. CPU L3 Outer Port Ceiling (Why 4 CPU Cores Cannot Saturate 51.2 GB/s)
+
+From the boot log (`DDR type:LPDDR5_D2D_X16;Size:16GB,Data Rate:6400MT/s`) and **EIC7700X TRM Part 1 (§1.3 p. 73, §3.2 p. 136, §3.4.1.16 p. 286, §3.7 p. 391–392)**:
+
+1. **Raw LPDDR5 Peak Bandwidth**:
+   - Each die has two 32-bit LPDDR5 controllers (`ddrc0` at `0x52300000` and `ddrc1` at `0x52380000`, each operating two 16-bit channels) = **64-bit bus per die @ 6400 MT/s**:
+     $$\text{Peak LPDDR5 Bandwidth per Die} = \frac{64\text{ bits}}{8} \times 6400\text{ MT/s} = \mathbf{51.2\text{ GB/s per die}} \quad (\mathbf{102.4\text{ GB/s dual-die}})$$
+2. **Why the 4-Core CPU Cluster (MCPU) Caps Below ~23 GB/s per Die**:
+   - Each DDR controller (`ddrt0`, `ddrt1`) exposes 5 AXI ports (`p0..p4`) clocked at `clk_ddr_aclk = 800 MHz`.
+   - **Port `p0` (`lnoc_ddrt0_p0` & `lnoc_ddrt1_p0`)** is a dedicated 1.188 GHz highway (`llc_noc`) wired **exclusively to the NPU LLC**, allowing the NPU + E31 DSP complex to stream weights at ~45+ GB/s per die.
+   - By contrast, all 4 SiFive P550 cores (`1.8 GHz`) share a 4-bank 4 MiB L3 cache whose outer interface is a **single 256-bit (32-byte) TileLink-C port (`mcput_snoc_mp`)** feeding into `sys_noc` (`800 MHz`):
+     $$\text{MCPU L3 Outer Port Ceiling} = 32\text{ Bytes} \times 800\text{ MHz} = \mathbf{25.6\text{ GB/s per die}} \quad (\mathbf{51.2\text{ GB/s dual-die}})$$
+   - By hardware design, the 4-core CPU cluster is bottlenecked by its single 256-bit `mcput_snoc_mp` port (`~22.6–23.2 GB/s` measured Read, or **90.5% of the 25.6 GB/s port ceiling**), ensuring the CPU can never starve the NPU (`llc_noc`) or multimedia engines (`mnoc`) of the remaining ~28+ GB/s per die of LPDDR5 bandwidth.
+3. **P550 L2 TLB 4 KiB Limitation vs. L1 DTLB 2 MiB HugePages (TRM §3.4.1.5 p. 192)**:
+   - The P550's 512-entry unified L2 TLB **only supports 4 KiB pages** ($512 \times 4\text{ KiB} = \mathbf{2\text{ MiB}}$ coverage per core).
+   - **2 MiB Mega Pages (HugePages)** are cached exclusively in the **32-entry L1 DTLB** ($32 \times 2\text{ MiB} = \mathbf{64\text{ MiB}}$ coverage).
+   - Because `/sys/kernel/mm/transparent_hugepage/enabled` defaults to `[madvise]` on `roma`, large buffers allocated without `madvise(..., MADV_HUGEPAGE)` (and `/dev/es_mem` MMZ buffers mapped via 4 KiB `remap_pfn_range` PTEs) suffer an L2 TLB miss every 4 KiB, triggering 4-level Sv48 page-table walks in DRAM. Enabling `MADV_HUGEPAGE` cuts local memory latency from **205 ns $\to$ 180 ns** and increases 8-core Read bandwidth from **40.5 GB/s $\to$ 43.5 GB/s**.
+4. **Write-Allocate / Read-For-Ownership (RFO) on RV64GC Write-Back Caches**:
+   - Because P550 implements `RV64GC` (without `Zicboz` cache-block zeroing), storing to a cache line in `Write`, `Copy`, or `Triad` first issues a 64-byte **Read-For-Ownership (RFO)** from DRAM before writing back the dirty line.
+   - Consequently, actual physical DRAM pin traffic (`Pin*`) is **$2\times$ nominal for `Write`** ($16\text{ B/elem}$), **$1.5\times$ nominal for `Copy`** ($24\text{ B/elem}$), and **$\frac{4}{3}\times$ nominal for `Triad`** ($32\text{ B/elem}$).
 
 ---
 
-## 3. Physical Silicon NUMA Benchmark Results
+## 3. Physical Silicon NUMA Benchmark Results (v2 Audit)
 
-A dedicated benchmark suite (`numa_bench.cpp`) was compiled with `-O3 -fopenmp` using `libnuma-dev` (`numa_alloc_onnode`) and executed directly on the physical `roma` hardware (Linux 6.6.92-eic7x, 8x RISC-V cores @ 1.4 GHz). 
+The upgraded benchmark suite (`numa_bench.cpp` v2, compiled with `-O3 -march=rv64gc -fopenmp`) verifies physical page-frame numbers (`PFN`) via `/proc/self/pagemap` and `ES_SYS_RetrieveMemNodeByFd`, uses an 8-way unrolled per-thread reduction for `Read` (fixing the v1 serial `fadd.d` latency bottleneck), and fixes the v1 8-core OpenMP loop partitioning bug.
 
-All tests operated on **256 MiB streaming buffers**, far exceeding the 4 MiB on-chip L3 cache to guarantee true LPDDR5 DRAM access.
+All tests operate on **256 MiB per array** (**768 MiB working set per die** for `Triad`), far exceeding the 4 MiB L3 cache.
 
-### 3.1. Single-Core Local vs Remote Performance
+### 3.1. Physical Page-Frame (`PFN`) Locality Audit (`/proc/self/pagemap`)
 
-| Benchmark Case | Latency (ns) | Read (GB/s) | Write (GB/s) | Copy (GB/s) | Triad (GB/s) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Core 0 $\to$ Node 0 (Local)** | **206.57 ns** | **3.52** | **7.86** | **9.45** | **6.26** |
-| **Core 0 $\to$ Node 1 (Remote)** | **665.91 ns** | 1.81 | 1.02 | 1.73 | 1.76 |
-| **Core 4 $\to$ Node 1 (Local)** | **207.75 ns** | **3.43** | **7.27** | **9.25** | **6.94** |
-| **Core 4 $\to$ Node 0 (Remote)** | **674.36 ns** | 1.76 | 1.01 | 1.68 | 1.69 |
+Per **TRM Table 3-39 (p. 220)**, physical addresses `0x00_8000_0000..0x04_7FFF_FFFF` are hardwired in silicon to Die 0 LPDDR5, and `0x20_0000_0000..0x23_FFFF_FFFF` are hardwired to Die 1 LPDDR5:
 
-#### Analysis:
-1. **The Remote Latency Penalty**:
-   - Local pointer-chasing latency is **~207 ns**.
-   - Cross-die remote latency is **~670 ns** — a **$3.25\times$ latency penalty**.
-2. **The Remote Bandwidth Penalty**:
-   - Remote writes degrade by **$7.7\times$** (7.86 GB/s $\to$ 1.02 GB/s) due to D2D write-buffer serialization and remote cache-coherency handshakes.
-   - Remote copy throughput degrades by **$5.5\times$** (9.45 GB/s $\to$ 1.73 GB/s).
-   - Remote streaming reads drop by **$1.95\times$** (3.52 GB/s $\to$ 1.81 GB/s).
-
-### 3.2. Multi-Core Die Saturation (4 Cores per Die)
-
-To evaluate memory controller saturation, 4 threads were pinned to all 4 cores of a die:
-
-| Benchmark Case | Read (GB/s) | Write (GB/s) | Copy (GB/s) | Triad (GB/s) |
+| Allocator Mode & Target Node | Die 0 Pages (%) | Die 1 Pages (%) | Verified Hardware Physical Address Span | Page Granularity |
 | :--- | :---: | :---: | :---: | :---: |
-| **Die 0 (Cores 0–3) $\to$ Node 0 (Local)** | **13.93** | **10.56** | **13.73** | **12.20** |
-| **Die 0 (Cores 0–3) $\to$ Node 1 (Remote)** | 5.88 | 4.03 | 5.85 | 5.65 |
-| **Die 1 (Cores 4–7) $\to$ Node 1 (Local)** | **13.75** | **9.63** | **14.00** | **11.19** |
-| **Die 1 (Cores 4–7) $\to$ Node 0 (Remote)** | 5.55 | 3.97 | 5.74 | 5.61 |
+| `Linux numa_alloc_onnode(Node 0)` | **100.0%** | 0.0% | `0x01_0542_0000 .. 0x01_AEFC_5000` | 4 KiB PTE |
+| `Linux numa_alloc_onnode(Node 1)` | 0.0% | **100.0%** | `0x20_3DB0_F000 .. 0x20_9EFF_5000` | 4 KiB PTE |
+| `Strict mmap + mbind(MPOL_BIND) + THP (Node 0)` | **100.0%** | 0.0% | `0x01_35A8_5000 .. 0x01_8046_9000` | **2 MiB PMD (HugePage)** |
+| `Strict mmap + mbind(MPOL_BIND) + THP (Node 1)` | 0.0% | **100.0%** | `0x20_3E40_0000 .. 0x20_9EFF_0000` | **2 MiB PMD (HugePage)** |
+| `MMZ Cached (mmz_nid_0_part_0)` | **100.0%** | 0.0% | `0x01_C000_0000 .. 0x01_D000_0000` | 4 KiB `VM_PFNMAP` |
+| `MMZ Cached (mmz_nid_1_part_0)` | 0.0% | **100.0%** | `0x21_4000_0000 .. 0x21_5000_0000` | 4 KiB `VM_PFNMAP` |
+
+### 3.2. Single-Core Local vs. Remote Performance (`Strict mmap + mbind + 2 MiB HugePage` vs. `MMZ 4K`)
+
+| Benchmark Case | Latency (2M THP) | Latency (4K MMZ) | Read (GB/s) | Write (GB/s) | Copy (GB/s) | Triad (GB/s) | PinTriad (GB/s) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Core 0 $\to$ Die 0 (Local)** | **180.42 ns** | 204.48 ns | **11.33** | **7.95** | **11.09** | **6.46** | **8.61** |
+| **Core 0 $\to$ Die 1 (Remote)** | **651.25 ns** | 670.59 ns | 1.79 | 1.02 | 1.79 | 1.79 | 2.38 |
+| **Core 4 $\to$ Die 1 (Local)** | **184.54 ns** | 205.65 ns | **11.14** | **7.60** | **10.91** | **6.34** | **8.45** |
+| **Core 4 $\to$ Die 0 (Remote)** | **662.48 ns** | 679.77 ns | 1.76 | 1.01 | 1.74 | 1.74 | 2.32 |
 
 #### Analysis:
-- A single die reaches its memory controller ceiling at **~14.0 GB/s Read** and **~10.5 GB/s Write**.
-- 4 remote cores saturating the D2D bus achieve only **~5.8 GB/s Read** and **~4.0 GB/s Write** — less than half the local throughput.
+1. **Single-Core Bandwidth**: A single P550 core at 1.8 GHz achieves **11.33 GB/s pure Read** and **11.09 GB/s nominal Copy** (**16.64 GB/s physical pin traffic** with RFO), utilizing **65% of the entire die's 25.6 GB/s L3 outer port** from one core alone.
+2. **2 MiB HugePage Latency Benefit**: Eliminating 4 KiB L2 TLB misses reduces random pointer-chasing latency across a 128 MiB working set by **~24 ns** (**180.4 ns** vs. **204.5 ns**).
+3. **Cross-Die Penalty**: Remote cross-die access increases latency by **$3.6\times$** (`180 ns` $\to$ `651 ns`) and reduces single-core Read/Copy bandwidth by **$6.3\times$** (`11.33 GB/s` $\to$ `1.79 GB/s`) and Write bandwidth by **$7.8\times$** (`7.95 GB/s` $\to$ `1.02 GB/s`).
 
-### 3.3. Full-System 8-Core Concurrent Bandwidth & D2D Interconnect Cap
+### 3.3. Multi-Core Die Saturation (4 Cores per Die — Allocator Comparison)
 
-To test aggregate throughput and D2D interconnect saturation, all 8 cores were exercised concurrently:
+| Configuration (4 Threads Pinned to Die) | Read (GB/s) | Write (GB/s) | Copy (GB/s) | Triad (GB/s) | PinCopy (GB/s) | PinTriad (GB/s) | % of 25.6 GB/s L3 Port |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Die 0 $\to$ Node 0 (`Strict 2M HugePage`)** | **22.56** | 10.05 | **14.16** | **13.02** | **21.24** | **17.36** | **88.1%** |
+| **Die 1 $\to$ Node 1 (`Strict 2M HugePage`)** | **23.17** | 10.63 | **14.07** | **12.52** | **21.10** | **16.70** | **90.5%** |
+| **Die 0 $\to$ Node 0 (`Linux 4K numa_alloc`)** | 21.87 | 10.19 | 14.05 | 13.32 | 21.07 | 17.76 | 85.4% |
+| **Die 0 $\to$ Die 0 (`MMZ Cached 4K PTE`)** | 20.88 | **11.71** | 12.78 | 10.10 | 19.16 | 13.47 | 81.6% |
+| **Die 1 $\to$ Die 1 (`MMZ Cached 4K PTE`)** | 20.56 | 11.13 | 12.50 | 10.63 | 18.74 | 14.17 | 80.3% |
+| **Die 0 $\to$ Node 1 (`Remote 2M HugePage`)** | 5.93 | 4.05 | 5.99 | 5.69 | 8.98 | 7.59 | 23.2% |
+| **Die 1 $\to$ Node 0 (`Remote 2M HugePage`)** | 5.84 | 4.00 | 5.88 | 5.61 | 8.82 | 7.48 | 22.8% |
 
-| Concurrent Workload | Configuration | Aggregate Triad Bandwidth |
-| :--- | :--- | :---: |
-| **Concurrent Independent Local** | Die 0 $\to$ Node 0 (4 cores) **+** Die 1 $\to$ Node 1 (4 cores) | **47.93 GB/s** |
-| **Concurrent Cross-Die Interconnect** | Die 0 $\to$ Node 1 (4 cores) **+** Die 1 $\to$ Node 0 (4 cores) | **21.85 GB/s** |
+#### Analysis:
+- **Saturation of the 25.6 GB/s MCPU L3 Outer Port (`mcput_snoc_mp`)**:
+  - 4 cores on a single die reach **22.56–23.17 GB/s Read** and **21.10–21.24 GB/s PinCopy**, saturating **88%–90.5%** of the MCPU L3 outer port's theoretical 25.6 GB/s ceiling (`32 B @ 800 MHz`).
+  - Notice that both pure `Read` (`22.56 GB/s`, no RFO) and `PinCopy` (`21.24 GB/s`, 2 reads + 1 writeback = 24 B/elem) hit the **exact same ~21–23 GB/s hardware wall**, confirming that the bottleneck is the single 256-bit `mcput_snoc_mp` port between L3 and `sys_noc`.
 
-#### Crucial Architectural Takeaways:
-1. **Total System Memory Bandwidth is 48 GB/s**: When both dies access their respective local memory channels concurrently, the system delivers an aggregate **47.93 GB/s** of memory bandwidth.
-2. **D2D Interconnect Ceiling is ~22 GB/s**: When cross-die traffic is forced simultaneously in both directions, the D2D bus caps bidirectional aggregate throughput at **21.85 GB/s**.
-3. **Software Implication**: Processes orchestrating Die 0 (NPU 0) must pin CPU threads to Cores 0–3 and allocate memory on NUMA Node 0. Processes orchestrating Die 1 (NPU 1) must pin to Cores 4–7 and allocate on NUMA Node 1. Crossing NUMA nodes cuts bandwidth in half and triples latency.
+### 3.4. Full-System 8-Core Concurrent Bandwidth & D2D Interconnect Cap
+
+With all 8 cores active simultaneously (Cores 0–3 processing a full 768 MiB working set on Die 0 while Cores 4–7 process an independent 768 MiB working set on Die 1):
+
+| Concurrent 8-Core Workload | Read (GB/s) | Copy (GB/s) | PinCopy (GB/s) | Triad (GB/s) | PinTriad (GB/s) | % of 51.2 GB/s Dual-L3 Port |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Concurrent Local (`Strict 2M HugePage`)** | **43.50 GB/s** | **25.76 GB/s** | **38.64 GB/s** | **24.01 GB/s** | **32.01 GB/s** | **85.0%** |
+| **Concurrent Local (`MMZ Cached 4K PTE`)** | **40.51 GB/s** | 23.02 GB/s | 34.53 GB/s | 21.68 GB/s | 28.91 GB/s | 79.1% |
+| **Concurrent Cross-Die (`Die0->1 + Die1->0`)** | 11.41 GB/s | 11.37 GB/s | 17.06 GB/s | 10.94 GB/s | 14.59 GB/s | 22.3% |
+
+### 3.5. Linux Allocator Node-Locality Hazards on `roma` & How to Guarantee Zero Cross-Die Traffic
+
+Inspecting `numactl --hardware` on `roma` during model execution reveals a critical operational hazard:
+```text
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 | node 0 size: 4789 MB | node 0 free:   65 MB  <-- Node 0 exhausted by page cache!
+node 1 cpus: 4 5 6 7 | node 1 size: 4805 MB | node 1 free: 3680 MB
+```
+1. **Why `malloc` / `std::vector` Silently Spills Across Dies**:
+   - Because each die reserves 11 GiB for MMZ, Linux only manages ~4.8 GiB per node. The kernel, systemd services, and VFS file page cache (from reading `.model` / `.bin` files on Node 0) consume almost all of Node 0's free memory (`node 0 free: 65 MB`).
+   - Standard heap allocations (`std::vector`, `malloc`) faulted on the main thread (or non-strict allocations when Node 0 is under page-cache pressure) either land on a single node (forcing the other die's 4 threads to read across the 651 ns D2D link at $3.8\times$ lower bandwidth) or trigger kernel fallback (`Fallback order for Node 0: 0 1`) onto Node 1.
+   - Furthermore, `/proc/sys/kernel/numa_balancing` is enabled (`1`) by default, causing the kernel to periodically unmap PTEs and migrate pages across nodes when accessed by threads on both dies.
+2. **How to Guarantee 100% Node-Locality for Large CPU Buffers (KV Caches, Scratch Workspaces)**:
+   - **Rule 1 (Evict Unneeded Weight File Page Cache)**: After `fread()`-ing multi-hundred-MB weight blobs (`weights_die0.bin`, `weights_die1.bin`) into MMZ `DmaBuffer`s, call `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` before closing the file descriptor so the 1.5+ GiB duplicate VFS page cache does not exhaust Node 0 RAM.
+   - **Rule 2 (Strict Per-Die `mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE`)**: Allocate per-die CPU buffers (e.g., GQA KV cache heads `kv_h = 0, 1` on Node 0 for Cores 0–3, and `kv_h = 2, 3` on Node 1 for Cores 4–7) using anonymous `mmap`, bind each half strictly to its owning node with `mbind(..., MPOL_BIND, &nodemask, maxnode, MPOL_MF_STRICT | MPOL_MF_MOVE)`, and call `madvise(..., MADV_HUGEPAGE)` so the CPU accesses node-local **2 MiB HugePages** at the full **43.5 GB/s** dual-die bandwidth.
+   - **Rule 3 (Strict Static Thread-to-Die Ownership)**: Never use `schedule(dynamic)` across KV heads located on different dies. Always map threads `tid = 0..3` (Cores 0–3, Die 0) exclusively to `kv_h = 0, 1` (Node 0 memory) and threads `tid = 4..7` (Cores 4–7, Die 1) exclusively to `kv_h = 2, 3` (Node 1 memory).
 
 ---
 
@@ -246,13 +288,26 @@ $$\text{Tokens / Second} \le \frac{\text{Memory Read Bandwidth (GB/s)}}{\text{Ac
 
 ---
 
-## 7. Conclusions & Recommended Execution Rules
+## 7. Conclusions, Recommended Execution Rules & Real-World `lfm3_v2` Verification
 
 1. **Memory Allocation**:
    - For workloads targeting 7B–14B models, reconfigure U-Boot to **Config A (27 GiB NPU MMZ, 5 GiB Linux)**. This provides 13.5 GiB per die, sufficient for 14B INT8 models or 7B models with 32K context windows.
 2. **Buffer Access Policy**:
-   - CPU reads from MMZ must **never use `NoCache` mode** (10 MB/s bottleneck). Always allocate with `ES_MEM_ALLOC_ATTR_E::Cached` when CPU readback is needed.
-3. **NUMA Thread Binding**:
-   - Die 0 runtime workers must be strictly bound to CPU cores 0–3 with `numa_alloc_onnode(..., 0)`.
-   - Die 1 runtime workers must be strictly bound to CPU cores 4–7 with `numa_alloc_onnode(..., 1)`.
-   - Never allow cross-die memory allocation, which degrades bandwidth by up to $7.7\times$ and triples access latency.
+   - CPU reads from MMZ must **never use `NoCache` mode** (`10.2 MB/s` bottleneck). Always allocate with `ES_MEM_ALLOC_ATTR_E::Cached` when CPU readback is needed.
+3. **Strict Per-Die NUMA Binding with 2 MiB HugePages (`mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE`)**:
+   - Standard `std::vector` / `malloc` uses `MPOL_DEFAULT` (First-Touch), which silently spills Node 0 pages onto Node 1 whenever Node 0's Linux zone fills up with VFS file page cache (`weights_die0.bin` + `weights_die1.bin` consume `1.75 GiB` in VFS cache if not evicted).
+   - Always call `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` immediately after streaming model weight files into NPU MMZ carveouts. On `roma`, this restored Node 0 free Linux RAM from **`65 MB` to `2,933 MB`**.
+   - For large CPU-side KV caches (`NumaKvBuffer<T>` in `lfm3_v2.cpp`), allocate anonymous virtual memory with `mmap`, apply `madvise(..., MADV_HUGEPAGE)` (so the P550 32-entry L1 DTLB covers 64 MiB per core and bypasses the 4 KiB-only 1024-entry L2 TLB), and strictly bind KV head slices `kh = 0, 1` to **Node 0** (accessed by cores 0–3) and `kh = 2, 3` to **Node 1** (accessed by cores 4–7) via `mbind(..., MPOL_BIND, ..., MPOL_MF_STRICT | MPOL_MF_MOVE)`.
+
+### 7.1. Measured Impact on `lfm3_v2` (LFM3-1.7B Dual-Die Hybrid Engine on `roma`)
+
+| Metric | Before (`std::vector` + VFS Page Cache Spill) | After (`NumaKvBuffer<T>` 2M THP + `POSIX_FADV_DONTNEED` + INT8 SWAR Prefill) | Delta / Improvement |
+| :--- | :---: | :---: | :---: |
+| **Node 0 Free Linux RAM (during run)** | `65 MB` (98% exhausted, spilling to Die 1) | **`2,933 MB`** (`100%` local Node 0/1 allocation) | **`+2,868 MB` freed** |
+| **`--bench-attn` 512 ctx (6 Global Layers)** | `1.39 ms/tok` | **`1.25 ms/tok`** | **`-10.1%` latency** |
+| **`--bench-attn` 4096 ctx (6 Global Layers)** | `7.36 ms/tok` | **`7.30 ms/tok`** | **`-0.8%` latency** |
+| **`--bench-attn` 32768 ctx (6 Global Layers)** | `66.16 ms/tok` (`59.1 GB/s`) | **`65.11 ms/tok` (`60.1 GB/s` eff.)** | **`-1.6%` latency** |
+| **4K C-Code Prefill (`bench_c_code_4k.c`, 3,781 tok)** | `86,204.2 ms` (`43.86 tok/s`, `22.8 ms/tok`) | **`59,168.8 ms` (`63.90 tok/s`, `15.6 ms/tok`, peak `74.4 tok/s`)** | **`+45.7%` (`1.46×` faster, `-27.0 s`)** |
+| **Autoregressive Decode (short context)** | `8.81 tok/s` (`113.5 ms/tok`) | **`8.85 tok/s` (`113.0 ms/tok`)** | **`+0.5%`** |
+| **Autoregressive Decode (at 3,909 tok context)** | `7.79 tok/s` (`128.4 ms/tok`) | **`7.84 tok/s` (`128.6 ms/tok`)** | **`+0.6%`** |
+| **Golden Gate Cosine (`min-layer` / `128K logits`)** | `0.98892771` / `0.99594256` (4/4 exact) | **`0.98892771` / `0.99594256` (4/4 exact)** | **Bit-for-bit identical** |
