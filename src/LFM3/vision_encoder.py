@@ -142,6 +142,15 @@ class Lfm3VisionEncoder:
         return features
 
 def main():
+    if len(sys.argv) >= 2:
+        image_path = sys.argv[1]
+        out_bin = sys.argv[2] if len(sys.argv) >= 3 else "visual_embeddings.bin"
+        encoder = Lfm3VisionEncoder()
+        features = encoder.encode_image(image_path)
+        features.tofile(out_bin)
+        print(f"[+] Encoded {image_path} -> {out_bin} ({features.shape[0]} visual tokens, {features.nbytes} bytes)")
+        return
+
     encoder = Lfm3VisionEncoder()
     # Test on a dummy image
     img = Image.new("RGB", (320, 240), color="green")

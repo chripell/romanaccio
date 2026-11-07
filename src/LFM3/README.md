@@ -188,19 +188,37 @@ Endpoints available:
 
 ## 6. Zero-Decode Typed Decisions (`d1-2B`)
 
-Liquid AI's `d1-2B` model answers questions directly from the logits at designated answer slots from a **single forward prefill pass**. Nothing is decoded autoregressively, ensuring zero schema violations and sub-1000ms latency.
+Liquid AI's `d1-2B` model answers questions directly from candidate logits at designated answer slots from a **single forward prefill pass**. Nothing is decoded autoregressively, ensuring zero schema violations, deterministic outputs, and sub-1000ms decision latency.
 
-Run typed decisions via CLI:
+`d1_runner.py` is a client application that constructs the structured ChatML prompt, maps candidate answers to target vocabulary tokens, sends the prefill request to the resident NPU engine daemon over TCP, and scales logits using the official piecewise-linear calibration tables (`calibration.json`).
+
+### 6.1 Step 1: Start the Resident Engine Daemon on `roma`
+
+Because `d1_runner.py` offloads the forward prefill pass to the dual-die NPU, `lfm3_v2` must be running as a resident daemon on the board:
 
 ```bash
+ssh roma
+cd /home/chri/models/LFM3-1.7B_ENNP
+sudo ./lfm3_v2 --int8 --daemon 8088
+```
+
+The engine keeps the quantized weights resident in dual-die MMZ and listens on port `8088` for single-pass logit requests.
+
+### 6.2 Step 2: Execute Typed Decisions via `d1_runner.py`
+
+From your host environment (or directly on the board), execute decision queries against the daemon:
+
+```bash
+cd /home/chri/aixigua/romanaccio/src/LFM3
+
 # Binary yes/no question (noul)
-python d1_runner.py \
+/home/chri/aixigua/venv/bin/python d1_runner.py \
   --state "Customer ordered a Dell XPS 15 laptop on November 3rd with tracking number 987654321." \
   --question "Did the customer purchase electronic hardware?" \
   --type noul --host roma --port 8088
 
-# Multi-choice question (choice)
-python d1_runner.py \
+# Multi-choice categorization (choice)
+/home/chri/aixigua/venv/bin/python d1_runner.py \
   --state "I need to return this sweater because it is too small and get my money back." \
   --question "What is the customer's intent?" \
   --type choice \
@@ -208,22 +226,97 @@ python d1_runner.py \
   --host roma --port 8088
 ```
 
+### 6.3 Step 3 (Optional): Query via OpenAI-Compatible REST API
+
+When the REST server is running (see [Section 5.2](#52-start-the-openai-api-server-on-host-or-board)), decisions can also be submitted over HTTP:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/decisions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "d1-2b",
+    "state": "Customer ordered a Dell XPS 15 laptop on November 3rd with tracking number 987654321.",
+    "question": "Did the customer purchase electronic hardware?",
+    "type": "noul"
+  }'
+```
+
 ---
 
 ## 7. Multimodal Vision Understanding (`LFM3-VL-2B`)
 
-Images are preprocessed into visual tokens via the 164M hybrid vision encoder ONNX model (`vision_encoder.py`) and streamed over TCP socket directly into Layer 0 hidden states at `<|image|>` placeholder positions.
+Liquid AI's `LFM3-VL-2B` pairs a 164M hybrid vision encoder (8 Conv2D + 6 bidirectional attention layers) with the 24-layer LFM3 backbone. Input images are preprocessed and encoded into `[N, 2048]` visual embeddings (e.g., 64 visual tokens for standard 256x256 patches) and injected directly into Layer 0 hidden states at `<|image|>` placeholder positions.
 
-### 7.1 Interactive REPL with `/image`
+You can run multimodal vision either via the **interactive REPL** on `roma` or automatically via the **OpenAI REST API**.
 
-In `lfm3_v2` interactive mode:
-```text
-User> /image /path/to/extracted_embeddings.bin
-[Loaded 64 visual tokens from /path/to/extracted_embeddings.bin]
-User> Describe what you see in this image.
+---
+
+### Workflow A: Standalone Interactive REPL on `roma` with `/image`
+
+In this workflow, you encode images to a `.bin` visual embedding file on your host, transfer it to `roma`, and chat interactively.
+
+#### A.1 Extract Visual Embeddings on the Host
+Use `vision_encoder.py` (which runs the ONNX vision encoder) to convert an image into binary float32 embeddings:
+
+```bash
+cd /home/chri/aixigua/romanaccio/src/LFM3
+
+# Generate 64 visual tokens (512 KiB) from any PNG or JPEG
+/home/chri/aixigua/venv/bin/python vision_encoder.py /path/to/my_image.png /tmp/image_embeds.bin
+
+# Copy the binary embeddings to the board
+scp /tmp/image_embeds.bin roma:/tmp/
 ```
 
-### 7.2 Multimodal OpenAI API Request
+#### A.2 Start `lfm3_v2` in Interactive Mode on `roma`
+Launch the engine on `roma` without the `--prompt` or `--daemon` flags:
+
+```bash
+ssh roma
+cd /home/chri/models/LFM3-1.7B_ENNP
+sudo ./lfm3_v2 --int8
+```
+
+#### A.3 Load the Image and Chat
+At the interactive prompt, use `/image` to attach the embeddings, then ask your question:
+
+```text
+=================================================================
+ LFM3-1.7B Interactive Dual-Die Chat REPL
+ (type '/exit' to quit, '/nothink' to toggle thinking, '/image <path>' to load image)
+=================================================================
+
+User> /image /tmp/image_embeds.bin
+[Loaded 64 visual tokens from /tmp/image_embeds.bin]
+User> Describe what you see in this image in detail.
+Assistant> <think>
+...
+</think>
+The image depicts a ...
+```
+
+---
+
+### Workflow B: Automated Multimodal Service via OpenAI REST API
+
+This is the recommended workflow for web apps, clients, and automated testing. You do **not** need to manually convert images to `.bin`; the REST server handles image fetching, ONNX encoding, and streaming automatically.
+
+#### B.1 Start the Resident Engine Daemon on `roma`
+```bash
+ssh roma
+cd /home/chri/models/LFM3-1.7B_ENNP
+sudo ./lfm3_v2 --int8 --daemon 8088
+```
+
+#### B.2 Start the OpenAI REST Server on the Host
+```bash
+cd /home/chri/aixigua/romanaccio/src/LFM3
+/home/chri/aixigua/venv/bin/python lfm3_openai_server.py --host 0.0.0.0 --port 8000 --backend-host roma --backend-port 8088
+```
+*(The server automatically loads `Lfm3VisionEncoder` on startup).*
+
+#### B.3 Send Multimodal Chat Completion Requests
+Use standard OpenAI multimodal payload syntax with local filepaths, base64 data URIs, or HTTP URLs:
 
 ```bash
 curl -N -s http://127.0.0.1:8000/v1/chat/completions \
@@ -235,7 +328,7 @@ curl -N -s http://127.0.0.1:8000/v1/chat/completions \
         "role": "user",
         "content": [
           {"type": "text", "text": "Describe the geometry and color of this image in one sentence."},
-          {"type": "image_url", "image_url": {"url": "/path/to/image.png"}}
+          {"type": "image_url", "image_url": {"url": "/path/to/my_image.png"}}
         ]
       }
     ],
