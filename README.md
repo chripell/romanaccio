@@ -10,8 +10,8 @@ It provides standalone runtimes, bug fixes for vendor software, comprehensive re
 
 ```
 romanaccio/
-├── README.md                         # Main repository guide and model download instructions
-├── FINDINGS.md                       # Master summary of reverse engineering discoveries
+├── README.md                         # Main repository architecture and component index
+├── FINDINGS.md                       # Master summary of reverse engineering discoveries (§1–§49)
 ├── findings/                         # Detailed standalone technical reports
 │   ├── NPU_OPERATIONS.md             # Hardware engine & 372 DSP kernels catalog, GPU profile
 │   ├── MODEL_FORMAT.md               # Reverse-engineered .model (NVDA FlatBuffers) specification
@@ -20,6 +20,8 @@ romanaccio/
 │   ├── RUNTIME_API.md                # Userspace NPU runtime API specification & multi-die caveats
 │   └── CPU_NPU_PROTOCOL.md           # Kernel ioctl catalog (eic7700_npu.ko) & SMMU DMA mapping
 └── src/
+    ├── LFM3/                         # Liquid AI LFM3 tri-hybrid dual-die engine, LoRA, d1-2B & vision
+    ├── DeepSeek-V2-Lite/             # DeepSeek-V2-Lite MoE dual-die partitioning & expert loadables
     ├── eswin_compiler/               # Open EsAAC compiler equivalent (PLAN.md)
     ├── eswin_simulator/              # Open EsSimulator functional simulator equivalent (PLAN.md)
     ├── eswin_runtime/                # Open C11/C++ NPU runtime, CLI chat REPL & Python bindings
@@ -40,7 +42,19 @@ romanaccio/
 
 ## 2. Components Overview
 
-### 2.1 Open ESWIN Runtime (`src/eswin_runtime/`)
+### 2.1 Liquid AI LFM3 Tri-Hybrid Engine & Multimodal Suite (`src/LFM3/`)
+Full hardware-accelerated dual-die C++17 runtime (`lfm3_v2`) for Liquid AI's LFM3 tri-hybrid architecture (gated ShortConv, Sliding Window Attention, and Global Attention):
+- **Silicon Performance**: Verified **`9.02 tok/s` sustained decode** (`112.6 ms/tok`) and **`55.5–72.1 tok/s` batched INT8 prefill** on the dual-die EIC7700X (`PP=2`, layers 0–11 on Die 0, 12–23 on Die 1).
+- **Route D Class B Breakthrough**: Reuses 8 shared archetype loadables + 8 LM head slices = **only 12 resident models/die** (far below the 62-model kernel Oops ceiling, zero per-turn swapping).
+- **Zero-Recompile INT8 Quantization**: Direct NVDLA float64 tiler + SmoothQuant channel balancing (`in_inv_smooth[c]`) + per-output-channel `CvtPrecision_QuantM` scaling (`out_step_chan[c]`), eliminating denominator-anchor sink collapse with zero `.model` recompiles.
+- **Multimodal & Decision Ecosystem**:
+  - `LFM3-1.7B-Heretic`: Uncensored fine-tuned LoRA merged in FP32 and deployed in INT8.
+  - `d1-2B`: Single-forward-pass zero-decode decision foundation engine (711–865 ms latency).
+  - `LFM3-VL-2B`: 164M hybrid vision encoder + Layer 0 visual embedding injection via `/image` CLI.
+  - Resident daemon on `roma:8088` and OpenAI-compatible REST server (`src/LFM3/lfm3_openai_server.py`) on `host:8000` with streaming SSE.
+- **Documentation & Instructions**: See [`src/LFM3/README.md`](src/LFM3/README.md) for full compilation, packaging, and execution instructions.
+
+### 2.2 Open ESWIN Runtime (`src/eswin_runtime/`)
 A production-ready C11 and Python userspace runtime library (`libes_runtime.so`):
 - **Contiguous DMA Allocator**: Zero-copy MMZ physical memory manager (`/dev/es_mem`) with automatic SMMU address mapping and CPU data cache maintenance.
 - **WorkerPool NUMA Isolation**: Spawns isolated worker daemons for Die 0 (cores 0–3) and Die 1 (cores 4–7), eliminating single-process driver lock stalls (`0xa00f6046`) and kernel teardown Oops.
@@ -48,24 +62,27 @@ A production-ready C11 and Python userspace runtime library (`libes_runtime.so`)
 - **Embedded Tokenizer & Sampler**: Ported from `llama.cpp` supporting Hugging Face Byte-Level BPE, TikToken, and ChatML with Issue #47 anti-looping protections (sliding-window repetition penalty, consecutive duplicate suppression, cyclic loop detection).
 - **TransformerSession & KV-Cache**: Circular multi-layer KV-cache and dual-die LM Head reduction engine.
 - **CLI Chat REPL & Python SDK**: Interactive streaming terminal chat CLI (`eswin-chat`) and Pythonic ctypes bindings (`eswin_runtime`).
+- **Documentation & Instructions**: See [`src/eswin_runtime/README.md`](src/eswin_runtime/README.md).
 
-### 2.2 Applications (v2 Powered by Open Runtime)
+### 2.3 SmolLM-135M Runtimes (`src/smollm/`, `src/smollm_v2/`)
 - **SmolLM-v2 Chat Engine (`src/smollm_v2/`)**:
-  Modular C++17 and Python interactive chat engine for [SmolLM-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM-135M) built on `libes_runtime.so`. Offloads the 49K-token vocabulary LM Head across both NPU dies simultaneously (~0.9 ms latency).
+  Modular C++17 and Python interactive chat engine for [SmolLM-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM-135M) built on `libes_runtime.so`. Offloads the 49K-token vocabulary LM Head across both NPU dies simultaneously (~0.9 ms latency). See [`src/smollm_v2/README.md`](src/smollm_v2/README.md).
+- **SmolLM-v1 Prototype (`src/smollm/`)**:
+  First-generation standalone C++17 chat engine with dual-die LM head offload. See [`src/smollm/README.md`](src/smollm/README.md).
+
+### 2.4 Qwen2 / DeepSeek Issue #47 Resolution (`src/qwen2_fix/`, `src/qwen2_v2/`)
 - **Qwen2-v2 Chat Engine (`src/qwen2_v2/`)**:
-  Modular C++17 and Python interactive chat engine for Qwen2-0.5B, 1.5B, and DeepSeek-R1-Distill-Qwen models. Integrates native anti-looping samplers that permanently resolve [Framework Issue #47](https://github.com/DC-DeepComputing/Framework/issues/47).
+  Modular C++17 and Python interactive chat engine for Qwen2-0.5B, 1.5B, and DeepSeek-R1-Distill-Qwen models. Integrates native anti-looping samplers that permanently resolve [Framework Issue #47](https://github.com/DC-DeepComputing/Framework/issues/47). See [`src/qwen2_v2/README.md`](src/qwen2_v2/README.md).
+- **Qwen2-Fix Standalone Patch (`src/qwen2_fix/`)**:
+  Standalone C++17 patch and interactive chat REPL resolving repetition traps, SIGSEGV faults, and multi-die deadlocks. See [`src/qwen2_fix/README.md`](src/qwen2_fix/README.md).
 
-### 2.3 Legacy Prototype Baselines (Preserved)
-- `src/smollm/`: First-generation standalone C++17 prototype.
-- `src/qwen2_fix/`: First-generation standalone C++17 patch.
-
-### 2.4 Re-Implementation Architecture Plans
+### 2.5 Re-Implementation Architecture Plans
 - **Open Compiler (`src/eswin_compiler/PLAN.md`)**:
   Incremental plan for an open-source `EsAAC` alternative. Features a hybrid frontend (ONNX for vision; native `safetensors` + `config.json` for LLMs), 4D tensor IR, NVDLA hardware engine lowering, and DSP offloading.
 - **Open Simulator (`src/eswin_simulator/PLAN.md`)**:
   Incremental plan for a 64-bit cross-platform `EsSimulator` equivalent for bit-accurate numerical verification against PyTorch and ONNX golden data.
 
-### 2.5 Modern Neural Network Acceleration Plans
+### 2.6 Modern Neural Network Acceleration Plans
 - **Gemma-4-12B-it INT8 (`src/gemma-4-12B-it-Uncensored-Aquarion-INT8/PLAN.md`)**:
   Comprehensive feasibility assessment and dual-die pipelined execution plan for the 12-Billion parameter Gemma-4 model. Partitions 48 transformer layers (24 per die) and the 262k LM head across 22 GiB of MMZ VRAM with hybrid sliding-window attention management.
 - **YOLO11 Real-Time Vision (`src/yolov11/PLAN.md`)**:
@@ -83,58 +100,11 @@ A production-ready C11 and Python userspace runtime library (`libes_runtime.so`)
 
 ---
 
-## 3. Large Binary Files & Model Download Instructions
+> [!TIP]
+> **Model-Specific Build & Execution Guides**:
+> Detailed instructions on downloading weights, compiling loadables, and running live inference on hardware are maintained in each model's dedicated directory:
+> - **LFM3 Family (`LFM3-1.7B`, `Heretic`, `d1-2B`, `LFM3-VL-2B`)**: [`src/LFM3/README.md`](src/LFM3/README.md)
+> - **SmolLM-135M**: [`src/smollm/README.md`](src/smollm/README.md) and [`src/smollm_v2/README.md`](src/smollm_v2/README.md)
+> - **Qwen2 / DeepSeek**: [`src/qwen2_fix/README.md`](src/qwen2_fix/README.md) and [`src/qwen2_v2/README.md`](src/qwen2_v2/README.md)
+> - **Open ESWIN Runtime (`libes_runtime.so`)**: [`src/eswin_runtime/README.md`](src/eswin_runtime/README.md)
 
-To keep the git repository lightweight and compatible with GitHub hosting, large binary files (raw model weights `*.bin`, compiled NPU loadables `*.model`, and ONNX graphs) are **not stored directly in git**.
-
-### 3.1 SmolLM-135M Model Data
-The SmolLM-135M runtime requires the following model files under `src/smollm/models/`:
-- `smollm_135m.bin` (514 MB): Raw FP32 weights for all 30 transformer layers.
-- `tokenizer.bin` (517 KB): Clean UTF-8 BPE token vocabulary.
-- `smollm_lm_head_d0_npu_b1.model` (28 MB): Die 0 NPU offline loadable (tokens 0..24575).
-- `smollm_lm_head_d1_npu_b1.model` (28 MB): Die 1 NPU offline loadable (tokens 24576..49151).
-
-#### How to Obtain / Generate Model Files:
-1. **Download Upstream Model**:
-   Download the original SmolLM-135M model from Hugging Face:
-   - Base weights: [HuggingFaceTB/SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M)
-   - Or ONNX model: [HuggingFaceTB/SmolLM-135M ONNX](https://huggingface.co/HuggingFaceTB/SmolLM-135M)
-2. **Export Binary Weights**:
-   Place the ONNX model (e.g. `SmolLM-135M.onnx`) in your working directory and run:
-   ```bash
-   cd src/smollm
-   python3 export_smollm.py
-   ```
-   This automatically generates `models/smollm_135m.bin` and `models/tokenizer.bin`.
-3. **Compile Dual-Die LM Head NPU Models**:
-   Compile the partitioned LM Head ONNX slices for Die 0 and Die 1 using `EsAAC`:
-   ```bash
-   # In your ESWIN compilation environment (or container):
-   EsAAC --model=smollm_lm_head_d0.onnx --gen-fp16-model=yes --target-device=EIC7700X
-   EsAAC --model=smollm_lm_head_d1.onnx --gen-fp16-model=yes --target-device=EIC7700X
-   ```
-   Place the resulting `.model` files into `src/smollm/models/`.
-
-### 3.2 Qwen2-0.5B and DeepSeek-7B Models
-For testing `src/qwen2_fix/`, download the pre-quantized vendor NPU packages or place the vendor models into:
-- `/opt/eswin/data/npu/` (on the target board)
-- `~/models/Qwen2-0.5B_ENNP/` or `~/models/deepseek-r1-distill-qwen-7b_ENNP/`
-The runtime flags in `es_qwen2_demo` accept custom model paths via `--model-dir`.
-
----
-
-## 4. Building the Projects
-
-### SmolLM-135M C++ Engine
-```bash
-cd src/smollm
-make
-./smollm_chat
-```
-
-### Qwen2 / DeepSeek Fix
-```bash
-cd src/qwen2_fix
-./build.sh
-./build/es_qwen2 --system "You are a helpful coding assistant."
-```

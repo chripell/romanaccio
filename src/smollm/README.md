@@ -137,5 +137,12 @@ Due to GitHub file size limits, large binary weights (`*.bin`) and compiled NPU 
    This reads your downloaded ONNX model (e.g. `SmolLM-135M.onnx`) and produces:
    - `models/smollm_135m.bin` (514 MB)
    - `models/tokenizer.bin` (517 KB)
-3. For NPU LM Head offloading, compile the dual-die models using `EsAAC` as described in [SMOLLM_GUIDE.md](SMOLLM_GUIDE.md).
+3. **Compile Dual-Die LM Head NPU Models**:
+   Compile the partitioned LM Head ONNX slices for Die 0 and Die 1 using `EsAAC`:
+   ```bash
+   # In your ESWIN compilation environment (or container):
+   EsAAC --model=smollm_lm_head_d0.onnx --gen-fp16-model=yes --target-device=EIC7700X
+   EsAAC --model=smollm_lm_head_d1.onnx --gen-fp16-model=yes --target-device=EIC7700X
+   ```
+   Place the resulting `smollm_lm_head_d0_npu_b1.model` and `smollm_lm_head_d1_npu_b1.model` into `models/`. See [SMOLLM_GUIDE.md](SMOLLM_GUIDE.md) for full walkthrough.
 

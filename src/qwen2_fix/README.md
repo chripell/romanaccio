@@ -193,3 +193,17 @@ Throughput: 14.8 tokens/s
 [+] Goodbye!
 ```
 
+---
+
+## 4. Obtaining Models & Weights
+
+To run `es_qwen2`, obtain the vendor model weights or place pre-quantized packages onto the board:
+- Standard vendor path: `/opt/eswin/data/npu/`
+- User model directory: `~/models/Qwen2-0.5B_ENNP/` or `~/models/deepseek-r1-distill-qwen-7b_ENNP/`
+
+The runtime accepts custom model configuration paths via `-c / --config`:
+```bash
+sudo ./build/es_qwen2 -c path/to/config.json --system "You are a helpful coding assistant."
+```
+
+
