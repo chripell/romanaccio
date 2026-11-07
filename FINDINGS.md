@@ -2824,9 +2824,53 @@ Extended the package builder with CLI configuration options:
 | **4K C-Code Prefill (`3,781` tok)** | `63.90 tok/s` (`59.17 s`, `74.4` peak) | `67.76 tok/s` (`55.80 s`, `72.9` peak) | **`73.92 tok/s` (`51.15 s`, `83.9` peak)** | **`+15.7%` (`-8.02 s` on 4K prompt)** |
 | **4K-Context Decode (`128` tok)** | `7.96 tok/s` (`125.6 ms/tok`) | `8.93 tok/s` (`112.9 ms/tok`) | **`9.18 tok/s` (`109.8 ms/tok`)** | **`+15.3%` at 4K context** |
 
+---
 
+## 51. Milestone 9 — `T=8` Batch Verification & Prompt-Lookup Speculative Decoding (`--speculative-pld`, `23.85 tok/s`)
 
+### 51.1 Zero-Weight-Duplication `T=8` Class B Archetype Templates (`16 / 62` Resident Loadables/Die)
 
+1. **`T=8` (`W=8`) NVDLA Surface Layout & Weight Sharing**:
+   - Exported and compiled 5 `W=8` (`[1, C, 1, 8]`) Class B templates via [`src/LFM3/export_lfm3_t8.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/export_lfm3_t8.py):
+     - `conv_in_t8_npu_b1.model` (`[1, 2048, 1, 8] -> [1, 6144, 1, 8]`)
+     - `proj2048_t8_npu_b1.model` (`[1, 2048, 1, 8] -> [1, 2048, 1, 8]`)
+     - `attn_qkv_t8_npu_b1.model` (`[1, 2048, 1, 8] -> [1, 3072, 1, 8]`)
+     - `mlp_t8_npu_b1.model` (`[1, 2048, 1, 8] -> 7680 -> [1, 2048, 1, 8]`, `PP=2`)
+     - `mlp_tp2_t8_npu_b1.model` (`[1, 2048, 1, 8] -> 3840 -> [1, 2048, 1, 8]`, `TP=2`)
+   - Inspecting the compiled `.model` memory lists confirmed that at `W=8`, all `CvtPrecision_QuantM` (`128 B`) and `K2` weight surfaces have identical offsets and strides to `T=1` and `T=64`.
+   - Automated `lfm3_{conv_in,proj2048,attn_qkv,mlp}_t8_classb.model` generation in both [`src/LFM3/build_lfm3_int8_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_int8_pkg.py) and [`src/LFM3/build_lfm3_tp2_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_tp2_pkg.py), binding directly to the existing `weights_die0.bin` and `weights_die1.bin` MMZ blobs with **0 bytes of additional weight storage**.
+   - When `--speculative-pld` is omitted, `lfm3_v2` loads **12 models/die** (preserving 100% baseline behavior); when `--speculative-pld` / `--pld` is passed, `lfm3_v2` loads **16 models/die** (`16 < 55` safety gate; kernel ceiling `62`).
 
+### 51.2 Rollback-Safe State Checkpointing & Lazy Early-Exit LM Head
 
+1. **`ShortConv` Per-Candidate State Ring Snapshots & KV Rewind**:
+   - During a `T=8` verification pass of $B \in [2, 8]$ candidate tokens (`cand[0 .. B-1]`, where `cand[0]` is the guaranteed last-sampled token and `cand[1 .. B-1]` are up to $K \le 7$ speculative draft tokens), `forward_verify_t8()` executes all 24 layers in a single `T=8` batch (`~105 ms` total NPU+CPU latency, nearly identical to a single `T=1` pass because weight streaming from LPDDR5 happens once for all $B$ tokens).
+   - Across the 13 `ShortConv` layers, the 6-tap state ring (`13 × 2048 × 6` floats = `614.4 KiB`) is snapshotted into `m_conv_state_snaps[t]` after each token $t \in [0, B-1]$.
+   - For `SWA` (`kSwaCap = 320` ring) and `Global` (`m_max_ctx`) attention caches, candidate KV entries are written at `m_verify_base_pos + t`; rewinding on rejection is an $O(1)$ integer update `m_pos = m_verify_base_pos + accepted_last_idx + 1`.
+2. **Lazy Early-Exit Dual-Die LM Head (`compute_logits_for_hidden`)**:
+   - Because the 128,000-vocab Dual-Die LM Head uses `T=1` loadables (`~7.0 ms` per evaluated token), `forward_verify_t8()` sets `compute_logits = false` and leaves the final hidden states `m_buf_h[0 .. B-1]` resident.
+   - The verification loop calls `compute_logits_for_hidden(j)` one token at a time and terminates at the first rejected draft token `cand[j+1] != pred_id`, immediately calling `commit_verify_t8(j)` and storing `pred_id` as the pre-sampled bonus token for the next step (zero wasted LM Head calls on rejected suffix tokens).
+
+### 51.3 Exact BPE Rank-Order Pre-Tokenization (`encode_lfm3_text`) & Real-Time `SCHED_FIFO` Preemption
+
+1. **Root Cause of Prompt Tokenization Mismatch on Code Identifiers & Indentation**:
+   - The baseline greedy longest-prefix tokenizer in `Tokenizer::encode()` matched across word/digit and indentation boundaries, turning `" uint64_t"` into the unreachable dead vocab token `' uint64'` + `'_t'`, `" pkt->"` into `' pk'` (`91696`) + `'t'`, and 4-space indentation `"    uint32_t"` into `'    '` + `'uint'` (whereas HuggingFace `AutoTokenizer` and the model's generated stream produce `'   '` + `' uint'` + `'32'` + `'_t'` and `'   '` + `' p'` + `'kt'`).
+   - Furthermore, feeding `prompt_ids` into `sampler.accept(id)` penalized the last 64 prompt tokens by `repeat_penalty = 1.1f`, causing the sampler to reject prompt identifiers drafted by PLD.
+   - Implementing `encode_lfm3_text()` in [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp) with GPT-2/Llama-3/LFM3 regex pre-tokenization + min-ID BPE pair merging reproduces HuggingFace `AutoTokenizer` **100% bit-identically**, and restricting `sampler.accept()` to generated tokens makes `--speculative-pld` match prompt code spans cleanly.
+2. **`SCHED_FIFO` Worker Preemption, `GOMP_SPINCOUNT=5000`, and NUMA-Local `T=8` Unpacking**:
+   - Elevating `eswin_npu_worker` threads and `m_tp_thread` to `SCHED_FIFO` (`sched_priority = 1`) with `GOMP_SPINCOUNT=5000` (`~35 µs`) prevents `libgomp` post-barrier spin loops on `Cores 1..7` from delaying NPU IPC wakeups when `m_pos >= 255` (`T=1` decode improved from `88.2 ms/tok` to **`85.15 ms/tok` = `11.74 tok/s`** on Golden Oracle and from `100.2 ms/tok` to **`90.8 ms/tok` = `11.07 tok/s`** at `m_pos >= 255`).
+   - Unpacking `T <= 8` outputs inside `run_dual_die()` concurrently on `Core 0` (`out_buf_d0` in `mmz_nid_0_part_0`) and `Core 7` (`out_buf_d1` in `mmz_nid_1_part_0`) eliminates cross-die Chiplink reads during `TP=2` `T=8` verification, boosting `--tp2 --speculative-pld` from `19.67 tok/s` to **`23.85 tok/s` (`42.2 ms/tok`)**.
+
+### 51.4 Silicon Benchmark Results on `roma` (`--speculative-pld`)
+
+| Workload (`--no-think --temp 0`) | Mode | Prefill Speed | Decode Speed (`ms/tok`) | PLD Acceptance (`accepted / drafted`) | Speedup vs. `T=1` |
+|---|---|---|---|---|---|
+| **Golden Oracle (`16` tok)** | `--tp2` (`T=1`) | `83.22 ms/tok` (`6` tok) | **`11.74 tok/s` (`85.15 ms/tok`)** | — (`12` models/die) | Baseline |
+| **`PacketHeader` (Prose + C, `170` tok)** | `--tp2` (`T=1`) | `83.23 tok/s` (`184` tok) | `10.92 tok/s` (`92.1 ms/tok`) | — (`12` models/die) | `1.00x` |
+| **`PacketHeader` (Prose + C, `170` tok)** | `--pp2 --speculative-pld` | `79.72 tok/s` (`185` tok) | **`15.89 tok/s` (`63.3 ms/tok`)** | **`96 / 143` (`67.1%`, `21` steps)** | **`1.55x` vs `PP=2` `T=1`** |
+| **`PacketHeader` (Prose + C, `170` tok)** | `--tp2 --speculative-pld` | `85.16 tok/s` (`185` tok) | **`16.65 tok/s` (`60.4 ms/tok`)** | **`99 / 152` (`65.1%`, `22` steps)** | **`1.52x` vs `TP=2` `T=1`** |
+| **`RingPacket` (C Refactor, `180` tok)** | `--pp2` (`T=1`) | `75.61 tok/s` (`311` tok) | `10.27 tok/s` (`97.9 ms/tok`) | — (`12` models/die) | `1.00x` |
+| **`RingPacket` (C Refactor, `180` tok)** | `--tp2` (`T=1`) | `81.78 tok/s` (`311` tok) | `11.02 tok/s` (`91.2 ms/tok`) | — (`12` models/die) | `1.07x` |
+| **`RingPacket` (C Refactor, `180` tok)** | `--pp2 --speculative-pld` | `78.06 tok/s` (`311` tok) | **`20.24 tok/s` (`49.7 ms/tok`)** | **`137 / 178` (`77.0%`, `26` steps)** | **`1.97x` vs `PP=2` `T=1`** |
+| **`RingPacket` (C Refactor, `180` tok)** | `--tp2 --speculative-pld` | `80.37 tok/s` (`311` tok) | **`23.85 tok/s` (`42.2 ms/tok`)** | **`145 / 172` (`84.3%`, `25` steps)** | **`2.16x` vs `TP=2` `T=1` (`2.32x` vs `PP=2`)** |
 

@@ -226,6 +226,8 @@ def main():
         "mlp_t1":  templates_dir / "mlp_tp2_t1_npu_b1.model",
         "mlp_t64": templates_dir / "mlp_tp2_t64_npu_b1.model",
     }
+    if (templates_dir / "mlp_tp2_t8_npu_b1.model").exists():
+        tmpl_paths["mlp_t8"] = templates_dir / "mlp_tp2_t8_npu_b1.model"
 
     cb_work = PROBE_DIR / "cb_work_tp2"
     cb_work.mkdir(parents=True, exist_ok=True)

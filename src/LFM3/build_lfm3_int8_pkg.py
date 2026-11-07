@@ -387,19 +387,27 @@ def main():
         "mlp_t1":       resolve_tmpl("lfm3_l01_mlp_npu_b1.model", "l01_mlp_shared/model_files/lfm3_l01_mlp_npu_b1.model"),
         "mlp_t64":      resolve_tmpl("lfm3_l00_mlp_t64_npu_b1.model", "l00_mlp_t64_shared/model_files/lfm3_l00_mlp_t64_npu_b1.model"),
     }
+    for t8_key, t8_file in [
+        ("conv_in_t8",  "conv_in_t8_npu_b1.model"),
+        ("proj2048_t8", "proj2048_t8_npu_b1.model"),
+        ("attn_qkv_t8", "attn_qkv_t8_npu_b1.model"),
+        ("mlp_t8",      "mlp_t8_npu_b1.model"),
+    ]:
+        if (templates_dir / t8_file).exists():
+            tmpl_paths[t8_key] = templates_dir / t8_file
 
     cb_work = PROBE_DIR / "cb_work"
     for key, src_p in tmpl_paths.items():
         arch = key.rsplit("_", 1)[0]
         stem = f"lfm3_{key}"
         dst_cb = pkg_out_dir / "models" / f"{stem}_classb.model"
-        if dst_cb.exists() and key not in ("mlp_t1", "mlp_t64"):
+        if dst_cb.exists() and key not in ("mlp_t1", "mlp_t8", "mlp_t64"):
             continue
         if dst_cb.exists() and base_pkg_dir != pkg_out_dir:
             continue
         cb_work.mkdir(parents=True, exist_ok=True)
         patched_p = cb_work / f"{stem}.model"
-        align_t64 = tmpl_paths["mlp_t64"] if key == "mlp_t1" else None
+        align_t64 = tmpl_paths["mlp_t64"] if key in ("mlp_t1", "mlp_t8") else None
         patch_model_truncates(src_p, patched_p, TRUNCS[arch], align_mlp_t1_to_t64=align_t64)
         subprocess.run([VENV_PY, str(COMPILER_PY), "-m", str(patched_p), "-o", str(cb_work), "--convert-weights"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

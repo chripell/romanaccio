@@ -731,27 +731,35 @@ as "low judgement". Assign by what can go wrong silently:
 
 ---
 
-### Milestone 9 (High-Leverage Algorithmic Speedup): `T=8` Batch Verification & Prompt-Lookup / Draft Speculative Decoding (`15–22+ Effective tok/s`)
+### Milestone 9 (High-Leverage Algorithmic Speedup): `T=8` Batch Verification & Prompt-Lookup Speculative Decoding (`16.7–23.9 Effective tok/s`) [COMPLETED & LIVE VERIFIED ON SILICON]
 
-- **Goal**: Break the single-token memory-bandwidth wall (`1.47 GB` streamed per generated token) by verifying $K = 4..8$ candidate tokens in a single NPU pass using a lightweight `T=8` (`W=8`) Class B template set.
-- **Why Speculative Verification Is Uniquely Effective on EIC7700X**:
-  - In `FINDINGS.md` §47.2, evaluating 32 tokens through all 24 layers took `1,075 ms` (`33.6 ms/token`), versus `117.1 ms` for a single `T=1` token — meaning a `T=8` verification pass costs only **`~1.15x–1.25x` the latency of a single `T=1` decode step** while verifying up to 8 tokens at once.
-  - For LFM3's primary workload (agentic tool calling, JSON arguments, code, and structured extraction), **prompt-lookup drafting (PLD)** (matching 2–4 token n-grams from the prompt/context with zero extra model weights) typically achieves **40–65% acceptance (`2.2–3.2` accepted tokens per step)** with zero accuracy loss (mathematically lossless greedy/sampling equivalence).
-- **Files to Create / Modify**:
-  - `src/LFM3/export_lfm3_t8.py` (compile 4 `T=8` Class B layer templates: `lfm3_{conv_in,attn_qkv,proj2048,mlp}_t8_classb.model`)
-  - `src/LFM3/lfm3_v2.cpp` (add `forward_verify_t8()` + prompt-lookup n-gram drafter `--speculative-pld`)
-- **Step-by-Step Instructions**:
-  1. **Compile 4 `T=8` Class B Templates (`+4` Loadables/Die $\to$ `16 / 62` Resident Models/Die)**:
-     - Export and compile `W=8` (`[1, C, 1, 8]`) Class B templates. Check whether `EsAAC` triggers SDP planar transpose at `W=8` (`c=64, w=8` is only `16 B` wide per channel, below the 64-byte row threshold) or keeps `QuantM` at `128 B` (`64` entries), allowing `T=8` to bind directly to the existing `weights_die0.bin` / `weights_die1.bin` without layout changes.
-  2. **Implement Rollback-Safe State Checkpointing for `ShortConv`, `SWA`, and `Global` KV Caches**:
-     - During a `T=8` verification pass of $K+1$ tokens at positions `pos .. pos+K`:
-       - For `SWA` and `Global` attention layers, writing $K+1$ KV slots and rewinding `pos_` to `pos + n_accepted` on rejection is a zero-copy index update (`pos_ = pos + n_accepted`).
-       - For `ShortConv` layers (`13 × 2048 × 6` floats = `600 KiB` total across the entire model), save a `600 KiB` snapshot (`memcpy` takes `< 80 us`) before `forward_verify_t8()` and update it to the last accepted token's 6-token window.
-  3. **Batch LM Head Evaluation on Accepted + Bonus Tokens**:
-     - Run the 8 INT8 LM head slices across the $K+1$ candidate hidden states, accept the longest matching prefix $m \in [1, K+1]$, and emit $m$ bit-exact greedy tokens in one step.
-- **Acceptance Gate**:
-  - Generated token sequence with `--speculative-pld` is **100% bit-identical** to standard `T=1` greedy decode.
-  - On agentic tool-calling / JSON / code prompts, sustained effective generation throughput reaches **`15.0 – 22.0+ tokens/sec`** under `PP=2` (or **`22.0 – 30.0+ tokens/sec`** combined with Milestone 7 `TP=2`).
+- **Status**: **COMPLETE & LIVE VERIFIED ON SILICON** (November 2026).
+- **Goal**: Break the single-token memory-bandwidth wall (`1.47 GB` streamed per generated token) by verifying up to $K = 7$ draft tokens ($B \le 8$ candidate tokens total) in a single 24-layer NPU pass using a lightweight `T=8` (`W=8`) Class B template set, gated behind the optional CLI flag `--speculative-pld` / `--pld` (and `--pld-k K`).
+- **Key Architectural & Hardware Discoveries**:
+  1. **Zero-Weight-Duplication `T=8` Class B Archetype Templates (`16 / 62` Resident Models/Die)**:
+     - Exported and compiled 5 `W=8` (`[1, C, 1, 8]`) Class B templates via [`src/LFM3/export_lfm3_t8.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/export_lfm3_t8.py) and automated `*_t8_classb.model` generation in both [`src/LFM3/build_lfm3_int8_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_int8_pkg.py) (`PP=2`) and [`src/LFM3/build_lfm3_tp2_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_tp2_pkg.py) (`TP=2`).
+     - Verified that `EsAAC` produces identical `QuantM` (`128 B = 64 x FP16`) and `K2` weight layouts for `T=8` as `T=1` and `T=64`, allowing the `T=8` loadables to bind directly to the existing `weights_die0.bin` and `weights_die1.bin` MMZ blobs with **0 bytes of additional weight memory**.
+     - Resident model count per die is **12** by default (`--speculative-pld` off) and **16** when `--speculative-pld` is enabled (`16 < 55` safety gate; kernel ceiling `62`).
+  2. **Rollback-Safe State Checkpointing & Lazy Early-Exit LM Head (`src/LFM3/lfm3_v2.cpp`)**:
+     - Implemented `forward_verify_t8()`, `compute_logits_for_hidden()`, and `commit_verify_t8()` in [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp).
+     - During a `T=8` pass of $B \in [2, 8]$ candidate tokens, each of the 13 `ShortConv` layers snapshots its 6-tap state ring (`13 × 2048 × 6` floats = `614 KiB` per candidate slot, `4.88 MiB` total for 8 slots) after each token $t \in [0, B-1]$.
+     - Instead of evaluating the 128K-vocab Dual-Die LM Head (`~7.0 ms/tok`) on all $B$ tokens up front, `compute_logits_for_hidden(j)` evaluates token $j$ lazily and terminates at the first rejected draft token $j$, rewinding `m_pos = m_verify_base_pos + j + 1` and restoring `m_conv_state` from `m_conv_state_snaps[j]` while emitting the bonus token `pred_id` at position $j$ with zero wasted LM Head executions.
+  3. **Exact BPE Rank-Order Pre-Tokenization (`encode_lfm3_text`) & NUMA-Local `T=8` Unpacking**:
+     - Implemented `encode_lfm3_text()` in [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp) with GPT-2/Llama-3/LFM3 regex pre-tokenization and min-ID BPE pair merging so prompt tokens match HuggingFace `AutoTokenizer` and the model's generated token stream bit-identically (eliminating dead-token merges like `' uint64'`/`' uint32'` and matching 4-space code indentation `'   ' + ' word'`).
+     - Elevated `eswin_npu_worker` daemon threads and `m_tp_thread` to `SCHED_FIFO` (`sched_priority = 1`) with `GOMP_SPINCOUNT=5000` (`~35 us`) and concurrent NUMA-local `T <= 8` output unpacking on `Core 0` (`out_buf_d0`) and `Core 7` (`out_buf_d1`).
+- **Measured Silicon Performance on `roma` (`FML13V03`)**:
+  - **Bit-Exactness**: Generated output with `--speculative-pld` at `--temp 0` is **100% bit-for-bit identical** to standard `T=1` greedy decode across both `--pp2` and `--tp2`.
+  - **C Struct & Function Refactoring (`RingPacket`, 311 prompt tok $\to$ 180 generated tok)**:
+    - `PP=2` Standard `T=1` (`--pp2`): `10.27 tok/s` (`97.9 ms/tok`) $\to$ `PP=2 + PLD` (`--pp2 --speculative-pld`): **`20.24 tok/s` (`49.7 ms/tok`, `1.97x` speedup, `77.0%` draft acceptance: `137/178` across 26 verify steps)**.
+    - `TP=2` Standard `T=1` (`--tp2`): `11.02 tok/s` (`91.2 ms/tok`) $\to$ `TP=2 + PLD` (`--tp2 --speculative-pld`): **`23.85 tok/s` (`42.2 ms/tok`, `2.16x` speedup over `TP=2` `T=1` and `2.32x` over `PP=2` `T=1`, `84.3%` draft acceptance: `145/172` across 25 verify steps)**.
+  - **Mixed Prose + C Code Generation (`PacketHeader`, 185 prompt tok $\to$ 170 generated tok)**:
+    - `TP=2` Standard `T=1` (`--tp2`): `10.92 tok/s` (`92.1 ms/tok`) $\to$ `TP=2 + PLD` (`--tp2 --speculative-pld`): **`16.65 tok/s` (`60.4 ms/tok`, `1.52x` speedup, `65.1%` draft acceptance: `99/152` across 22 verify steps)**.
+    - `PP=2 + PLD` (`--pp2 --speculative-pld`): **`15.89 tok/s` (`63.3 ms/tok`, `67.1%` draft acceptance: `96/143` across 21 verify steps)**.
+- **Files Created / Modified**:
+  - [`src/LFM3/export_lfm3_t8.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/export_lfm3_t8.py)
+  - [`src/LFM3/build_lfm3_int8_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_int8_pkg.py)
+  - [`src/LFM3/build_lfm3_tp2_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_tp2_pkg.py)
+  - [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp)
 
 ---
 

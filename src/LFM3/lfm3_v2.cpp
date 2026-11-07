@@ -611,6 +611,11 @@ struct DieModels {
     LoadedArchetype proj2048_t1{};
     LoadedArchetype attn_qkv_t1{};
     LoadedArchetype mlp_t1{};
+    // T=8 Class B archetypes (optional: loaded when --speculative-pld is enabled)
+    LoadedArchetype conv_in_t8{};
+    LoadedArchetype proj2048_t8{};
+    LoadedArchetype attn_qkv_t8{};
+    LoadedArchetype mlp_t8{};
     // T=64 Class B archetypes
     LoadedArchetype conv_in_t64{};
     LoadedArchetype proj2048_t64{};
@@ -982,7 +987,7 @@ static void unpack_npu_output_int8(const int8_t *src_nchw, float *dst_tc, int T,
         return;
     }
 
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) if(T > 8) schedule(static)
     for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
             const int dt_end = std::min(16, T_valid - t0);
@@ -1021,7 +1026,7 @@ static void unpack_npu_output_int16(const int16_t *src_nchw, float *dst_tc, int 
         return;
     }
 
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) if(T > 8) schedule(static)
     for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
             const int dt_end = std::min(16, T_valid - t0);
@@ -1158,7 +1163,7 @@ static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc,
         return;
     }
 
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) if(T > 8) schedule(static)
     for (int t0 = 0; t0 < T_valid; t0 += 16) {
         for (int c0 = 0; c0 < C_out; c0 += 16) {
             const int dt_end = std::min(16, T_valid - t0);
@@ -1264,31 +1269,24 @@ public:
             CPU_ZERO(&cpuset);
             CPU_SET(7, &cpuset); // Pin Die-1 dispatcher thread to Core 7 (NUMA Node 1 / Die 1)
             sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+            struct sched_param sp{};
+            sp.sched_priority = 1;
+            sched_setscheduler(0, SCHED_FIFO, &sp);
 
             uint64_t last_seq = 0;
             while (true) {
                 uint64_t cur = m_tp_seq.load(std::memory_order_acquire);
                 if (cur == last_seq) {
-                    if (!m_tp_prewake.load(std::memory_order_acquire)) {
-                        std::unique_lock<std::mutex> lk(m_tp_mtx);
-                        m_tp_sleeping.store(true, std::memory_order_release);
-                        m_tp_cv.wait(lk, [&]() {
-                            cur = m_tp_seq.load(std::memory_order_acquire);
-                            return cur != last_seq ||
-                                   m_tp_prewake.load(std::memory_order_acquire) ||
-                                   m_tp_stop.load(std::memory_order_relaxed);
-                        });
-                        m_tp_sleeping.store(false, std::memory_order_relaxed);
-                    }
-                    while ((cur = m_tp_seq.load(std::memory_order_acquire)) == last_seq &&
-                           !m_tp_stop.load(std::memory_order_relaxed)) {
-#if defined(__riscv)
-                        __asm__ volatile("nop");
-#endif
-                    }
+                    std::unique_lock<std::mutex> lk(m_tp_mtx);
+                    m_tp_sleeping.store(true, std::memory_order_release);
+                    m_tp_cv.wait(lk, [&]() {
+                        cur = m_tp_seq.load(std::memory_order_acquire);
+                        return cur != last_seq ||
+                               m_tp_stop.load(std::memory_order_relaxed);
+                    });
+                    m_tp_sleeping.store(false, std::memory_order_relaxed);
                 }
                 if (m_tp_stop.load(std::memory_order_relaxed)) break;
-                m_tp_prewake.store(false, std::memory_order_relaxed);
                 last_seq = cur;
                 if (m_tp_fn) (*m_tp_fn)();
                 m_tp_ack.store(last_seq, std::memory_order_release);
@@ -1297,14 +1295,7 @@ public:
     }
 
     void prewake_tp_worker() {
-        if (!m_tp_worker_running || m_num_dies < 2) return;
-        if (!m_tp_prewake.load(std::memory_order_relaxed)) {
-            m_tp_prewake.store(true, std::memory_order_release);
-            if (m_tp_sleeping.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> lk(m_tp_mtx);
-                m_tp_cv.notify_one();
-            }
-        }
+        // No-op when m_tp_thread uses SCHED_FIFO real-time preemption on Core 7
     }
 
     void stop_tp_worker() {
@@ -1438,6 +1429,38 @@ public:
             return false;
         }
         m_num_dies = m_pool.active_worker_count();
+        // Elevate NPU worker daemon child processes (and all their internal threads) to SCHED_FIFO
+        // priority 1 so IPC wakeups immediately preempt libgomp post-barrier spin loops on Cores 0..7.
+        {
+            pid_t self_pid = getpid();
+            struct sched_param sp{};
+            sp.sched_priority = 1;
+            std::error_code ec;
+            for (const auto &entry : std::filesystem::directory_iterator("/proc", ec)) {
+                std::string fn = entry.path().filename().string();
+                if (fn.empty() || !std::isdigit(static_cast<unsigned char>(fn[0]))) continue;
+                pid_t cpid = static_cast<pid_t>(std::atoi(fn.c_str()));
+                if (cpid <= 0 || cpid == self_pid) continue;
+                std::ifstream sf(entry.path() / "stat");
+                std::string sline;
+                if (!std::getline(sf, sline)) continue;
+                size_t rp = sline.rfind(')');
+                if (rp == std::string::npos || rp + 4 >= sline.size()) continue;
+                char state = 0;
+                pid_t ppid = 0;
+                if (std::sscanf(sline.c_str() + rp + 2, "%c %d", &state, &ppid) == 2 && ppid == self_pid) {
+                    sched_setscheduler(cpid, SCHED_FIFO, &sp);
+                    std::error_code tec;
+                    for (const auto &tentry : std::filesystem::directory_iterator(entry.path() / "task", tec)) {
+                        std::string tfn = tentry.path().filename().string();
+                        if (!tfn.empty() && std::isdigit(static_cast<unsigned char>(tfn[0]))) {
+                            pid_t tid = static_cast<pid_t>(std::atoi(tfn.c_str()));
+                            if (tid > 0) sched_setscheduler(tid, SCHED_FIFO, &sp);
+                        }
+                    }
+                }
+            }
+        }
         std::printf("[+] Started WorkerPool with %u isolated NPU die worker(s)\n", m_num_dies);
         start_tp_worker();
 
@@ -1544,6 +1567,15 @@ public:
                 return false;
             }
 
+            if (m_enable_pld) {
+                if (!load_m("models/lfm3_conv_in_t8_classb.model",  m_die_models[d].conv_in_t8) ||
+                    !load_m("models/lfm3_proj2048_t8_classb.model", m_die_models[d].proj2048_t8) ||
+                    !load_m("models/lfm3_attn_qkv_t8_classb.model", m_die_models[d].attn_qkv_t8) ||
+                    !load_m("models/lfm3_mlp_t8_classb.model",      m_die_models[d].mlp_t8)) {
+                    return false;
+                }
+            }
+
             for (int s = 0; s < 4; ++s) {
                 char buf[128];
                 std::snprintf(buf, sizeof(buf), "models/lfm3_lm_head_d%u_s%d.model", d, s);
@@ -1573,6 +1605,7 @@ public:
 
             size_t s_act1 = 4096;
             size_t s_out1 = is_quant_active() ? 8192 : 32768;
+            size_t s_act8 = 16384, s_out8 = 65536;
             size_t s_act64 = 262144, s_out64 = 786432;
             size_t s_lmout = (dm.lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? 16384 : 32768;
             // Geometry-sized surface buffers (32 KiB for T=1 outputs, 256/768 KiB for T=64) are
@@ -1593,6 +1626,13 @@ public:
                 for (const LoadedArchetype *a : {&dm.conv_in_t1, &dm.proj2048_t1, &dm.attn_qkv_t1,
                                                  &dm.mlp_t1})
                     s_out1 = std::max(s_out1, a->out_surface_bytes);
+                if (m_enable_pld) {
+                    for (const LoadedArchetype *a : {&dm.conv_in_t8, &dm.proj2048_t8,
+                                                     &dm.attn_qkv_t8, &dm.mlp_t8}) {
+                        s_act8 = std::max(s_act8, a->in_surface_bytes);
+                        s_out8 = std::max(s_out8, a->out_surface_bytes);
+                    }
+                }
                 for (const LoadedArchetype *a : {&dm.conv_in_t64, &dm.proj2048_t64,
                                                  &dm.attn_qkv_t64, &dm.mlp_t64}) {
                     s_act64 = std::max(s_act64, a->in_surface_bytes);
@@ -1606,6 +1646,12 @@ public:
             const size_t g = m_guard_bytes;
             m_act_t1[d]  = std::make_unique<DmaBuffer>(s_act1 + g,  CacheMode::Cached, zone);
             m_out_t1[d]  = std::make_unique<DmaBuffer>(s_out1 + g,  CacheMode::Cached, zone);
+            if (m_enable_pld) {
+                m_act_t8[d] = std::make_unique<DmaBuffer>(s_act8 + g, CacheMode::Cached, zone);
+                m_out_t8[d] = std::make_unique<DmaBuffer>(s_out8 + g, CacheMode::Cached, zone);
+                note_prod_cap(m_act_t8[d].get(), s_act8);
+                note_prod_cap(m_out_t8[d].get(), s_out8);
+            }
             m_act_t64[d] = std::make_unique<DmaBuffer>(s_act64 + g, CacheMode::Cached, zone);
             m_out_t64[d] = std::make_unique<DmaBuffer>(s_out64 + g, CacheMode::Cached, zone);
             for (int s = 0; s < 4; ++s)
@@ -1615,9 +1661,11 @@ public:
             note_prod_cap(m_out_t1[d].get(), s_out1);
             note_prod_cap(m_out_t64[d].get(), s_out64);
             for (int s = 0; s < 4; ++s) note_prod_cap(m_lm_out[d][s].get(), s_lmout);
-            for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+            for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t8[d].get(),
+                                 m_out_t8[d].get(), m_act_t64[d].get(),
                                  m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
                                  m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
+                if (!b) continue;
                 if (!b->is_valid()) {
                     std::printf("FAIL: DmaBuffer alloc on Die %u (%zu B)\n", d, b->size());
                     return false;
@@ -1634,9 +1682,11 @@ public:
             // submitting against an unprepared weight fd wedges the die worker (FINDINGS 33.4 /
             // 34.3), which is what happens if it is prepared separately and this list is edited.
             for (DmaBuffer *b : {m_w_blob[d].get(),
-                                 m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+                                 m_act_t1[d].get(), m_out_t1[d].get(), m_act_t8[d].get(),
+                                 m_out_t8[d].get(), m_act_t64[d].get(),
                                  m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
                                  m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
+                if (!b) continue;
                 if (!m_pool.prepare_buffer(phys_die, *b)) {
                     std::printf("FAIL: prepare_buffer on Die %u\n", phys_die);
                     return false;
@@ -1648,6 +1698,13 @@ public:
         //    with 2 MiB HugePages; KV heads 2,3 strictly bound to Node 1 / Die 1 with 2 MiB HugePages)
         pin_openmp_threads_numa();
         m_conv_state.assign(13 * kHidden * 6, 0.0f);
+        if (m_enable_pld) {
+            for (int t = 0; t < 8; ++t) {
+                m_conv_state_snaps[t].assign(13 * kHidden * 6, 0.0f);
+            }
+            std::printf("[+] Speculative Decoding (PLD T=8) enabled: max_k=%d, allocated 8 ShortConv state snapshots (%.2f MiB)\n",
+                        m_pld_max_k, (8.0 * 13 * kHidden * 6 * sizeof(float)) / (1024.0 * 1024.0));
+        }
         m_swa_k.allocate(5, static_cast<size_t>(kSwaCap) * kKvHeads * kHeadDim);
         m_swa_v.allocate(5, static_cast<size_t>(kSwaCap) * kKvHeads * kHeadDim);
         m_glob_k.allocate(6, static_cast<size_t>(m_max_ctx) * kKvHeads * kHeadDim);
@@ -1702,7 +1759,8 @@ public:
         m_glob_k_sum.clear();
         std::fill(m_logits.begin(), m_logits.end(), 0.0f);
         for (uint16_t d = 0; d < 2; ++d) {
-            for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t64[d].get(),
+            for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t8[d].get(),
+                                 m_out_t8[d].get(), m_act_t64[d].get(),
                                  m_out_t64[d].get(), m_lm_out[d][0].get(), m_lm_out[d][1].get(),
                                  m_lm_out[d][2].get(), m_lm_out[d][3].get()}) {
                 if (b && b->is_valid()) {
@@ -1715,15 +1773,16 @@ public:
     }
 
     // Execute T_valid tokens (1 <= T_valid <= 64) across all 24 layers; uses T_npu=1 for single-token
-    // decode and T_npu=64 for multi-token prefill (2 <= T_valid <= 64). If compute_logits is true,
-    // computes all 128,000 logits for the last valid token (T_valid - 1) in the batch.
+    // decode, T_npu=8 for speculative verification (use_t8_verify=true), and T_npu=64 for multi-token prefill.
+    // If compute_logits is true, computes all 128,000 logits for the last valid token (T_valid - 1) in the batch.
     bool forward_chunk(const int32_t *token_ids, int T_valid, bool compute_logits,
                        StageTimers &timers,
                        const float *visual_embeds = nullptr,
                        size_t *visual_idx_io = nullptr,
                        size_t max_visual_tokens = 0,
                        std::vector<float> *debug_layer_outs = nullptr,
-                       std::vector<float> *debug_emb_norm = nullptr) {
+                       std::vector<float> *debug_emb_norm = nullptr,
+                       bool use_t8_verify = false) {
         if (T_valid < 1 || T_valid > kChunk) {
             std::printf("FAIL: forward_chunk requires 1 <= T_valid <= %d (got %d)\n", kChunk, T_valid);
             return false;
@@ -1733,7 +1792,7 @@ public:
                         m_pos, T_valid, m_max_ctx);
             return false;
         }
-        const int T = (T_valid == 1) ? 1 : kChunk;
+        const int T = (T_valid == 1 && !use_t8_verify) ? 1 : (use_t8_verify ? 8 : kChunk);
 
         float *h       = m_buf_h.data();
         float *u       = m_buf_u.data();
@@ -1776,14 +1835,14 @@ public:
             const DieModels &dm    = m_die_models[logical_die];
             const DieModels &dm_d0 = m_die_models[0];
             const DieModels &dm_d1 = m_die_models[1];
-            DmaBuffer *act_buf    = (T == 1) ? m_act_t1[logical_die].get() : m_act_t64[logical_die].get();
-            DmaBuffer *out_buf    = (T == 1) ? m_out_t1[logical_die].get() : m_out_t64[logical_die].get();
+            DmaBuffer *act_buf    = (T == 1) ? m_act_t1[logical_die].get() : ((T == 8) ? m_act_t8[logical_die].get() : m_act_t64[logical_die].get());
+            DmaBuffer *out_buf    = (T == 1) ? m_out_t1[logical_die].get() : ((T == 8) ? m_out_t8[logical_die].get() : m_out_t64[logical_die].get());
             DmaBuffer *w_buf      = m_w_blob[logical_die].get();
-            DmaBuffer *act_buf_d0 = (T == 1) ? m_act_t1[0].get() : m_act_t64[0].get();
-            DmaBuffer *out_buf_d0 = (T == 1) ? m_out_t1[0].get() : m_out_t64[0].get();
+            DmaBuffer *act_buf_d0 = (T == 1) ? m_act_t1[0].get() : ((T == 8) ? m_act_t8[0].get() : m_act_t64[0].get());
+            DmaBuffer *out_buf_d0 = (T == 1) ? m_out_t1[0].get() : ((T == 8) ? m_out_t8[0].get() : m_out_t64[0].get());
             DmaBuffer *w_buf_d0   = m_w_blob[0].get();
-            DmaBuffer *act_buf_d1 = (T == 1) ? m_act_t1[1].get() : m_act_t64[1].get();
-            DmaBuffer *out_buf_d1 = (T == 1) ? m_out_t1[1].get() : m_out_t64[1].get();
+            DmaBuffer *act_buf_d1 = (T == 1) ? m_act_t1[1].get() : ((T == 8) ? m_act_t8[1].get() : m_act_t64[1].get());
+            DmaBuffer *out_buf_d1 = (T == 1) ? m_out_t1[1].get() : ((T == 8) ? m_out_t8[1].get() : m_out_t64[1].get());
             DmaBuffer *w_buf_d1   = m_w_blob[1].get();
 
             // First region per archetype on this die, for --weights-layer0.
@@ -1918,7 +1977,7 @@ public:
                              DmaBufferSlice{w_buf_d0, w_slice.first, w_slice.second}},
                             {DmaBufferSlice{out_buf_d0, 0, out_b0}}, &drv0_ns);
                         if (ok0) out_buf_d0->flush_cache();
-                        if (ok0 && T_valid == 1) {
+                        if (ok0 && T <= 8) {
                             unpack_npu_output(out_buf_d0, dst_d0, T, C_out_per_die, sc_d0, dyn_ratios, T_valid, dst_stride);
                         }
                     },
@@ -1931,7 +1990,7 @@ public:
                              DmaBufferSlice{w_buf_d1, w_off_d1, w_slice.second}},
                             {DmaBufferSlice{out_buf_d1, 0, out_b1}}, &drv1_ns);
                         if (ok1) out_buf_d1->flush_cache();
-                        if (ok1 && T_valid == 1) {
+                        if (ok1 && T <= 8) {
                             unpack_npu_output(out_buf_d1, dst_d1, T, C_out_per_die, sc_d1, dyn_ratios, T_valid, dst_stride);
                         }
                     }
@@ -1944,7 +2003,7 @@ public:
                 timers.add_arch(arch_idx, master_ms, drv_ms, 2.0 * static_cast<double>(w_slice.second));
                 if (!ok0 || !ok1) return false;
 
-                if (T_valid > 1) {
+                if (T > 8) {
                     auto tu0 = std::chrono::steady_clock::now();
                     unpack_npu_output(out_buf_d0, dst_d0, T, C_out_per_die, sc_d0, dyn_ratios, T_valid, dst_stride);
                     unpack_npu_output(out_buf_d1, dst_d1, T, C_out_per_die, sc_d1, dyn_ratios, T_valid, dst_stride);
@@ -1978,10 +2037,10 @@ public:
 
             if (kLayerSchedule[l] == Lfm3LayerType::Conv) {
                 // --- Primitive 2: Gated ShortConv Layer ---
-                const LoadedArchetype &m_in     = (T == 1) ? dm.conv_in_t1     : dm.conv_in_t64;
-                const LoadedArchetype &m_in_d1  = (T == 1) ? dm_d1.conv_in_t1  : dm_d1.conv_in_t64;
-                const LoadedArchetype &m_out    = (T == 1) ? dm.proj2048_t1    : dm.proj2048_t64;
-                const LoadedArchetype &m_out_d1 = (T == 1) ? dm_d1.proj2048_t1 : dm_d1.proj2048_t64;
+                const LoadedArchetype &m_in     = (T == 1) ? dm.conv_in_t1     : ((T == 8) ? dm.conv_in_t8     : dm.conv_in_t64);
+                const LoadedArchetype &m_in_d1  = (T == 1) ? dm_d1.conv_in_t1  : ((T == 8) ? dm_d1.conv_in_t8  : dm_d1.conv_in_t64);
+                const LoadedArchetype &m_out    = (T == 1) ? dm.proj2048_t1    : ((T == 8) ? dm.proj2048_t8    : dm.proj2048_t64);
+                const LoadedArchetype &m_out_d1 = (T == 1) ? dm_d1.proj2048_t1 : ((T == 8) ? dm_d1.proj2048_t8 : dm_d1.proj2048_t64);
 
                 const auto conv_in_w = wsel(0, no.op_in_offset, no.op_in_size);
                 const size_t conv_in_w_d1 = wsel_d1(0, no.op_in_offset_d1);
@@ -2011,6 +2070,11 @@ public:
                         st[0] = st[1]; st[1] = st[2]; st[2] = st[3];
                         st[3] = st[4]; st[4] = st[5]; st[5] = xt;
                         y[c] = pC[c] * dw;
+                        if (use_t8_verify) {
+                            float *snap_st = m_conv_state_snaps[0].data() + (static_cast<size_t>(conv_idx) * kHidden + c) * 6;
+                            snap_st[0] = st[0]; snap_st[1] = st[1]; snap_st[2] = st[2];
+                            snap_st[3] = st[3]; snap_st[4] = st[4]; snap_st[5] = st[5];
+                        }
                     }
                 } else {
                     #pragma omp parallel for schedule(static)
@@ -2028,6 +2092,11 @@ public:
                             st[0] = st[1]; st[1] = st[2]; st[2] = st[3];
                             st[3] = st[4]; st[4] = st[5]; st[5] = xt;
                             y[static_cast<size_t>(t) * kHidden + c] = C * dw;
+                            if (use_t8_verify) {
+                                float *snap_st = m_conv_state_snaps[t].data() + (static_cast<size_t>(conv_idx) * kHidden + c) * 6;
+                                snap_st[0] = st[0]; snap_st[1] = st[1]; snap_st[2] = st[2];
+                                snap_st[3] = st[3]; snap_st[4] = st[4]; snap_st[5] = st[5];
+                            }
                         }
                     }
                 }
@@ -2049,10 +2118,10 @@ public:
             } else {
                 // --- Primitive 3: SWA or Global GQA Attention Layer ---
                 bool is_swa = (kLayerSchedule[l] == Lfm3LayerType::SlidingAttention);
-                const LoadedArchetype &m_qkv    = (T == 1) ? dm.attn_qkv_t1    : dm.attn_qkv_t64;
-                const LoadedArchetype &m_qkv_d1 = (T == 1) ? dm_d1.attn_qkv_t1 : dm_d1.attn_qkv_t64;
-                const LoadedArchetype &m_out    = (T == 1) ? dm.proj2048_t1    : dm.proj2048_t64;
-                const LoadedArchetype &m_out_d1 = (T == 1) ? dm_d1.proj2048_t1 : dm_d1.proj2048_t64;
+                const LoadedArchetype &m_qkv    = (T == 1) ? dm.attn_qkv_t1    : ((T == 8) ? dm.attn_qkv_t8    : dm.attn_qkv_t64);
+                const LoadedArchetype &m_qkv_d1 = (T == 1) ? dm_d1.attn_qkv_t1 : ((T == 8) ? dm_d1.attn_qkv_t8 : dm_d1.attn_qkv_t64);
+                const LoadedArchetype &m_out    = (T == 1) ? dm.proj2048_t1    : ((T == 8) ? dm.proj2048_t8    : dm.proj2048_t64);
+                const LoadedArchetype &m_out_d1 = (T == 1) ? dm_d1.proj2048_t1 : ((T == 8) ? dm_d1.proj2048_t8 : dm_d1.proj2048_t64);
                 double &attn_cpu_timer = is_swa ? timers.cpu_swa_ms : timers.cpu_glob_ms;
 
                 const auto qkv_w = wsel(2, no.op_in_offset, no.op_in_size);
@@ -2161,7 +2230,7 @@ public:
                         }
                         size_t head_slot_idx = static_cast<size_t>(kh) * s_cap + slot;
                         size_t head_slot_off = head_slot_idx * kHeadDim;
-                        if (is_swa || (m_pos + T_valid) < 256) {
+                        if (is_swa || m_pos < 256) {
                             std::memcpy(k_cache + head_slot_off, k_h, kHeadDim * sizeof(float));
                             std::memcpy(v_cache + head_slot_off, v_h, kHeadDim * sizeof(float));
                         }
@@ -2174,7 +2243,7 @@ public:
                 }
 
                 // Execute GQA Attention + multiply by head gate g_h
-                if (!is_swa && (m_pos + T_valid) >= 256) {
+                if (!is_swa && m_pos >= 256) {
                     if (T_valid == 1) {
                         run_gqa_attention_int8_swar(qkv, k_u8_layer, v_u8_layer, k_sc_layer, v_sc_layer,
                                                     k_sum_layer, gates, y, m_pos + 1, s_cap);
@@ -2239,9 +2308,9 @@ public:
 
             // 3. SwiGLU MLP on NPU
             const LoadedArchetype &m_mlp_0  = (no.mlp_tp == 2)
-                ? ((T == 1) ? dm_d0.mlp_t1 : dm_d0.mlp_t64)
-                : ((T == 1) ? dm.mlp_t1    : dm.mlp_t64);
-            const LoadedArchetype &m_mlp_d1 = (T == 1) ? dm_d1.mlp_t1 : dm_d1.mlp_t64;
+                ? ((T == 1) ? dm_d0.mlp_t1 : ((T == 8) ? dm_d0.mlp_t8 : dm_d0.mlp_t64))
+                : ((T == 1) ? dm.mlp_t1    : ((T == 8) ? dm.mlp_t8    : dm.mlp_t64));
+            const LoadedArchetype &m_mlp_d1 = (T == 1) ? dm_d1.mlp_t1 : ((T == 8) ? dm_d1.mlp_t8 : dm_d1.mlp_t64);
             const auto mlp_w = wsel(3, no.mlp_offset, no.mlp_size);
             const size_t mlp_w_d1 = wsel_d1(3, no.mlp_offset_d1);
             if (!submit_and_unpack(StageTimers::ARCH_MLP, no.mlp_tp, m_mlp_0, m_mlp_d1,
@@ -2280,10 +2349,14 @@ public:
         timers.tokens_run += T_valid;
 
         if (!compute_logits) return true;
-
-        // Final embedding_norm on the last token's hidden state [1, 2048]
-        auto tfn0 = std::chrono::steady_clock::now();
         const float *last_h = h + static_cast<size_t>(T_valid - 1) * kHidden;
+        return compute_logits_from_ptr(last_h, timers, debug_emb_norm);
+    }
+
+    bool compute_logits_from_ptr(const float *last_h, StageTimers &timers,
+                                 std::vector<float> *debug_emb_norm = nullptr) {
+        // Final embedding_norm on a single token's hidden state [1, 2048]
+        auto tfn0 = std::chrono::steady_clock::now();
         const SubgraphScaleInfo &lm_in_sc = m_die_models[0].lm_head_scale[0];
 
         if (!m_emb_norm_scaled.empty()) {
@@ -2442,6 +2515,42 @@ public:
 
     void set_parallel_mode(int tp_degree) {
         m_requested_tp_degree = tp_degree;
+    }
+
+    void set_speculative_pld(bool enable, int max_k = 7) {
+        m_enable_pld = enable;
+        m_pld_max_k = std::clamp(max_k, 1, 7);
+    }
+
+    bool is_speculative_pld() const { return m_enable_pld; }
+    int pld_max_k() const { return m_pld_max_k; }
+
+    // Milestone 9: Execute B candidate tokens (1 <= B <= 8) across all 24 layers on the T=8 Class B
+    // NPU graphs without running the LM head (compute_logits=false). Saves ShortConv state snapshots
+    // m_conv_state_snaps[0..B-1] and leaves Layer-23 hidden states h_0..h_{B-1} in m_buf_h.
+    bool forward_verify_t8(const int32_t *token_ids, int B, StageTimers &timers) {
+        if (B < 1 || B > 8) return false;
+        m_verify_base_pos = m_pos;
+        return forward_chunk(token_ids, B, false, timers, nullptr, nullptr, 0, nullptr, nullptr, true);
+    }
+
+    // Milestone 9: Compute 128,000 logits on Dual-Die NPU for candidate token `token_idx` (0 <= token_idx < B)
+    // from the most recent forward_verify_t8() call.
+    bool compute_logits_for_hidden(int token_idx, StageTimers &timers) {
+        const float *h_ptr = m_buf_h.data() + static_cast<size_t>(token_idx) * kHidden;
+        return compute_logits_from_ptr(h_ptr, timers, nullptr);
+    }
+
+    // Milestone 9: Commit candidate tokens [0..last_accepted_idx] and rewind KV position, ShortConv
+    // state, and timers.tokens_run for any rejected suffix tokens (last_accepted_idx + 1 .. B - 1).
+    void commit_verify_t8(int last_accepted_idx, StageTimers &timers) {
+        int B_run = m_pos - m_verify_base_pos;
+        int accepted_count = last_accepted_idx + 1;
+        if (accepted_count < B_run) {
+            m_pos = m_verify_base_pos + accepted_count;
+            m_conv_state = m_conv_state_snaps[last_accepted_idx];
+            timers.tokens_run -= (B_run - accepted_count);
+        }
     }
 
     /// Binds every layer of a die to one weight region per archetype. Timing experiment only:
@@ -3881,9 +3990,16 @@ private:
     std::unique_ptr<DmaBuffer> m_w_blob[2];
     std::unique_ptr<DmaBuffer> m_act_t1[2];
     std::unique_ptr<DmaBuffer> m_out_t1[2];
+    std::unique_ptr<DmaBuffer> m_act_t8[2];
+    std::unique_ptr<DmaBuffer> m_out_t8[2];
     std::unique_ptr<DmaBuffer> m_act_t64[2];
     std::unique_ptr<DmaBuffer> m_out_t64[2];
     std::unique_ptr<DmaBuffer> m_lm_out[2][4];
+
+    bool m_enable_pld = false;
+    int m_pld_max_k = 7;
+    int m_verify_base_pos = 0;
+    std::vector<float> m_conv_state_snaps[8];
 
     float m_swa_inv_freq[64];
     float m_glob_inv_freq[64];
@@ -3928,6 +4044,183 @@ static std::string format_lfm3_chat(const std::string &user_prompt,
     out += "<|im_start|>assistant\n";
     out += enable_thinking ? "<think>" : "<think></think>";
     return out;
+}
+
+// Pre-tokenize text according to LFM3 / Llama-3 / GPT-2 regex rules before greedy/BPE lookup:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// This prevents greedy matching from merging letters with digits (e.g. unreachable dead tokens
+// like ' uint64' or ' uint32') and ensures 4-space indentation splits into '   ' + ' word'
+// identically to the model's generated token stream.
+static std::vector<int32_t> encode_lfm3_text(const Tokenizer &tok, const std::string &text) {
+    static const char *const kSpecials[] = {
+        "<|startoftext|>", "<|im_start|>", "<|im_end|>",
+        "<|vision_start|>", "<|vision_end|>", "<|image|>",
+        "</think>", "<think>"
+    };
+    auto is_alpha_b = [](uint8_t b) { return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= 128); };
+    auto is_digit_b = [](uint8_t b) { return (b >= '0' && b <= '9'); };
+    auto is_space_b = [](uint8_t b) { return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'; };
+    auto is_nl_b    = [](uint8_t b) { return b == '\n' || b == '\r'; };
+
+    std::vector<int32_t> out;
+    out.reserve(text.size() / 3 + 16);
+    const size_t N = text.size();
+    size_t i = 0;
+
+    while (i < N) {
+        // 1. Match special tokens atomically
+        bool matched_sp = false;
+        for (const char *sp : kSpecials) {
+            size_t slen = std::strlen(sp);
+            if (i + slen <= N && std::memcmp(text.data() + i, sp, slen) == 0) {
+                int32_t id = tok.piece_to_id(std::string(sp, slen));
+                if (id >= 0) {
+                    out.push_back(id);
+                    i += slen;
+                    matched_sp = true;
+                    break;
+                }
+            }
+        }
+        if (matched_sp) continue;
+
+        // 2. Find end of normal chunk before next special token
+        size_t chunk_end = N;
+        for (const char *sp : kSpecials) {
+            size_t pos = text.find(sp, i);
+            if (pos != std::string::npos && pos < chunk_end) chunk_end = pos;
+        }
+
+        // 3. Segment [i .. chunk_end) into GPT-2 / Llama-3 pre-tokens and encode each span
+        size_t p = i;
+        while (p < chunk_end) {
+            uint8_t b = static_cast<uint8_t>(text[p]);
+            size_t q = p + 1;
+
+            if (b == '\'' && p + 1 < chunk_end) {
+                uint8_t c1 = static_cast<uint8_t>(text[p + 1]) | 32;
+                if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                    q = p + 2;
+                } else if (p + 2 < chunk_end) {
+                    uint8_t c2 = static_cast<uint8_t>(text[p + 2]) | 32;
+                    if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                        q = p + 3;
+                    }
+                }
+            }
+            if (q == p + 1) {
+                if (is_alpha_b(b)) {
+                    while (q < chunk_end && is_alpha_b(static_cast<uint8_t>(text[q]))) ++q;
+                } else if (!is_nl_b(b) && !is_digit_b(b) && p + 1 < chunk_end &&
+                           is_alpha_b(static_cast<uint8_t>(text[p + 1]))) {
+                    q = p + 2;
+                    while (q < chunk_end && is_alpha_b(static_cast<uint8_t>(text[q]))) ++q;
+                } else if (is_digit_b(b)) {
+                    while (q < chunk_end && (q - p) < 3 && is_digit_b(static_cast<uint8_t>(text[q]))) ++q;
+                } else if ((!is_space_b(b) && !is_alpha_b(b) && !is_digit_b(b)) ||
+                           (b == ' ' && p + 1 < chunk_end &&
+                            !is_space_b(static_cast<uint8_t>(text[p + 1])) &&
+                            !is_alpha_b(static_cast<uint8_t>(text[p + 1])) &&
+                            !is_digit_b(static_cast<uint8_t>(text[p + 1])))) {
+                    q = p + ((b == ' ') ? 2 : 1);
+                    while (q < chunk_end) {
+                        uint8_t u = static_cast<uint8_t>(text[q]);
+                        if (is_space_b(u) || is_alpha_b(u) || is_digit_b(u)) break;
+                        ++q;
+                    }
+                    while (q < chunk_end && is_nl_b(static_cast<uint8_t>(text[q]))) ++q;
+                } else if (is_space_b(b)) {
+                    size_t w = p;
+                    ssize_t last_nl = -1;
+                    while (w < chunk_end && is_space_b(static_cast<uint8_t>(text[w]))) {
+                        if (is_nl_b(static_cast<uint8_t>(text[w]))) last_nl = static_cast<ssize_t>(w);
+                        ++w;
+                    }
+                    if (last_nl >= static_cast<ssize_t>(p)) {
+                        q = static_cast<size_t>(last_nl) + 1;
+                    } else if (w < chunk_end && (w - p) > 1 && text[w - 1] == ' ' &&
+                               !is_space_b(static_cast<uint8_t>(text[w])) &&
+                               !is_digit_b(static_cast<uint8_t>(text[w]))) {
+                        q = w - 1;
+                    } else {
+                        q = w;
+                    }
+                }
+            }
+
+            // Encode pre-token span text[p .. q) via exact BPE rank-order merging (min token ID first)
+            std::vector<std::string> parts;
+            parts.reserve(q - p);
+            for (size_t s = p; s < q; ++s) {
+                parts.emplace_back(1, text[s]);
+            }
+            while (parts.size() > 1) {
+                int32_t best_id = 0x7fffffff;
+                size_t best_idx = parts.size();
+                for (size_t idx = 0; idx + 1 < parts.size(); ++idx) {
+                    int32_t cid = tok.piece_to_id(parts[idx] + parts[idx + 1]);
+                    if (cid >= 0 && cid < best_id) {
+                        best_id = cid;
+                        best_idx = idx;
+                    }
+                }
+                if (best_idx >= parts.size()) break;
+                parts[best_idx] += parts[best_idx + 1];
+                parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(best_idx + 1));
+            }
+            for (const auto &part : parts) {
+                int32_t id = tok.piece_to_id(part);
+                if (id >= 0) out.push_back(id);
+            }
+            p = q;
+        }
+        i = chunk_end;
+    }
+    return out;
+}
+
+// Milestone 9: Zero-Cost Prompt-Lookup Decoding (PLD) Drafter
+// Scans backwards through `history` (prompt + generated tokens so far) for the longest matching
+// suffix of length n in [max_ngram .. min_ngram] (default 6 down to 3, with 2-gram fallback when
+// at least 4 continuation tokens match) and proposes up to `max_k` subsequent tokens.
+static void draft_pld(const std::vector<int32_t> &history, int max_k,
+                      std::vector<int32_t> &draft_out,
+                      int min_ngram = 2, int max_ngram = 6) {
+    draft_out.clear();
+    const int H = static_cast<int>(history.size());
+    if (max_k <= 0 || H < min_ngram + 2) return;
+
+    auto is_prose_stopword = [](int32_t id) -> bool {
+        return id == 267 || id == 278 || id == 296 || id == 302 ||
+               id == 309 || id == 310 || id == 355 || id == 374 || id == 415;
+    };
+    const int n_hi = std::min(max_ngram, H - 2);
+    const int min_avail = std::min(2, max_k);
+    for (int n = n_hi; n >= min_ngram; --n) {
+        const int32_t *needle = history.data() + (H - n);
+        if (n == 2) {
+            if (is_prose_stopword(needle[0]) || is_prose_stopword(needle[1])) continue;
+            if (needle[0] < 360 && needle[1] < 360) continue;
+        }
+        int i_min = (n == 2) ? std::max(0, H - 512) : 0;
+        for (int i = H - n - min_avail; i >= i_min; --i) {
+            bool match = true;
+            for (int k = 0; k < n; ++k) {
+                if (history[i + k] != needle[k]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                int start = i + n;
+                int avail = std::min(max_k, H - start);
+                if (avail >= min_avail) {
+                    draft_out.assign(history.begin() + start, history.begin() + start + avail);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 static void run_daemon_server(Lfm3Engine &engine, int port) {
@@ -4046,8 +4339,7 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             formatted = format_lfm3_chat(prompt, "You are a helpful AI assistant.", !no_think);
         }
 
-        std::vector<int32_t> prompt_ids = engine.tokenizer().encode(formatted, false);
-        for (int32_t id : prompt_ids) sampler.accept(id);
+        std::vector<int32_t> prompt_ids = encode_lfm3_text(engine.tokenizer(), formatted);
 
         StageTimers prefill_t, decode_t;
         g_in_generation.store(true);
@@ -4089,19 +4381,14 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         }
 
         int step = 0;
-        for (; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
-            int32_t next_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
-            sampler.accept(next_id);
+        std::vector<int32_t> history = prompt_ids;
+        std::vector<int32_t> draft, cand;
+        bool has_pre_sampled = false;
+        int32_t pre_sampled_id = 0;
+        int pld_steps = 0, pld_drafted = 0, pld_accepted = 0;
 
-            if (next_id == 124900) break; // <|im_end|>
-            if (next_id == 124902) {      // </think>
-                if (step + 1 < max_new_tokens) {
-                    engine.forward_chunk(&next_id, 1, true, decode_t);
-                }
-                continue;
-            }
-
-            std::string piece = engine.tokenizer().decode_token(next_id);
+        auto send_tok_event = [&](int32_t tok_id) -> bool {
+            std::string piece = engine.tokenizer().decode_token(tok_id);
             std::ostringstream esc;
             for (char c : piece) {
                 if (c == '"') esc << "\\\"";
@@ -4111,16 +4398,89 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                 else if (c == '\t') esc << "\\t";
                 else esc << c;
             }
-
-            std::string tok_event = "{\"type\":\"token\",\"token_id\":" + std::to_string(next_id) +
+            std::string tok_event = "{\"type\":\"token\",\"token_id\":" + std::to_string(tok_id) +
                                     ",\"text\":\"" + esc.str() + "\"}\n";
 #if defined(MSG_NOSIGNAL)
-            if (send(client_fd, tok_event.data(), tok_event.size(), MSG_NOSIGNAL) < 0) break;
+            return send(client_fd, tok_event.data(), tok_event.size(), MSG_NOSIGNAL) >= 0;
 #else
-            if (send(client_fd, tok_event.data(), tok_event.size(), 0) < 0) break;
+            return send(client_fd, tok_event.data(), tok_event.size(), 0) >= 0;
 #endif
+        };
+
+        for (; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
+            int32_t next_id = has_pre_sampled
+                ? pre_sampled_id
+                : sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
+            has_pre_sampled = false;
+            sampler.accept(next_id);
+            history.push_back(next_id);
+
+            if (next_id == 124900) break; // <|im_end|>
+            if (next_id != 124902) {      // not </think>
+                if (!send_tok_event(next_id)) break;
+            }
+
             if (step + 1 < max_new_tokens) {
-                if (!engine.forward_chunk(&next_id, 1, true, decode_t)) break;
+                int rem = max_new_tokens - (step + 1);
+                if (engine.is_speculative_pld() && rem >= 2) {
+                    draft_pld(history, std::min(engine.pld_max_k(), rem), draft);
+                } else {
+                    draft.clear();
+                }
+
+                if (draft.empty()) {
+                    if (!engine.forward_chunk(&next_id, 1, true, decode_t)) break;
+                } else {
+                    cand.clear();
+                    cand.push_back(next_id);
+                    cand.insert(cand.end(), draft.begin(), draft.end());
+                    int B = static_cast<int>(cand.size());
+                    pld_steps++;
+                    pld_drafted += (B - 1);
+
+                    if (!engine.forward_verify_t8(cand.data(), B, decode_t)) break;
+                    bool stop_gen = false;
+                    for (int j = 0; j < B; ++j) {
+                        if (!engine.compute_logits_for_hidden(j, decode_t)) {
+                            stop_gen = true;
+                            break;
+                        }
+                        if (j < B - 1) {
+                            int32_t pred_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
+                            if (pred_id == cand[j + 1]) {
+                                pld_accepted++;
+                                step++;
+                                sampler.accept(pred_id);
+                                history.push_back(pred_id);
+                                if (pred_id == 124900) {
+                                    engine.commit_verify_t8(j, decode_t);
+                                    stop_gen = true;
+                                    break;
+                                }
+                                if (pred_id != 124902) {
+                                    if (!send_tok_event(pred_id)) {
+                                        engine.commit_verify_t8(j, decode_t);
+                                        stop_gen = true;
+                                        break;
+                                    }
+                                }
+                                if (step + 1 >= max_new_tokens) {
+                                    engine.commit_verify_t8(j, decode_t);
+                                    stop_gen = true;
+                                    break;
+                                }
+                            } else {
+                                engine.commit_verify_t8(j, decode_t);
+                                pre_sampled_id = pred_id;
+                                has_pre_sampled = true;
+                                break;
+                            }
+                        } else {
+                            engine.commit_verify_t8(B - 1, decode_t);
+                        }
+                    }
+                    if (stop_gen) break;
+                }
             }
         }
         g_in_generation.store(false);
@@ -4135,9 +4495,16 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         send(client_fd, done_event.data(), done_event.size(), 0);
 #endif
         close(client_fd);
-        std::printf("[Daemon] Turn completed: %zu prompt tok (%.1f ms), %d decode tok (%.1f ms = %.2f tok/s)\n",
-                    prompt_ids.size(), prefill_t.total_ms(), step, decode_t.total_ms(),
-                    decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0);
+        if (pld_steps > 0) {
+            std::printf("[Daemon] Turn completed: %zu prompt tok (%.1f ms), %d decode tok (%.1f ms = %.2f tok/s | PLD accepted %d/%d across %d steps)\n",
+                        prompt_ids.size(), prefill_t.total_ms(), step, decode_t.total_ms(),
+                        decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0,
+                        pld_accepted, pld_drafted, pld_steps);
+        } else {
+            std::printf("[Daemon] Turn completed: %zu prompt tok (%.1f ms), %d decode tok (%.1f ms = %.2f tok/s)\n",
+                        prompt_ids.size(), prefill_t.total_ms(), step, decode_t.total_ms(),
+                        decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0);
+        }
     }
     close(server_fd);
     std::printf("[+] LFM3 Daemon shut down cleanly.\n");
@@ -4146,6 +4513,10 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
 } // namespace
 
 int main(int argc, char **argv) {
+    if (!std::getenv("GOMP_SPINCOUNT")) {
+        setenv("GOMP_SPINCOUNT", "5000", 1);
+        execv("/proc/self/exe", argv);
+    }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::signal(SIGINT, sigint_handler);
     std::signal(SIGPIPE, SIG_IGN);
@@ -4189,6 +4560,8 @@ int main(int argc, char **argv) {
     bool use_shared_archetype_scales = true;
     bool ab_shared_weights = false;
     int requested_tp_degree = 0;
+    bool enable_pld = false;
+    int pld_max_k = 7;
     bool daemon_mode = false;
     int daemon_port = 8088;
 
@@ -4237,6 +4610,8 @@ int main(int argc, char **argv) {
         else if (a == "--int8") force_int8 = true;
         else if (a == "--tp2" || a == "--tp") requested_tp_degree = 2;
         else if (a == "--pp2" || a == "--pp") requested_tp_degree = 1;
+        else if (a == "--speculative-pld" || a == "--pld") enable_pld = true;
+        else if (a == "--pld-k") { enable_pld = true; pld_max_k = std::stoi(next_arg()); }
         else if (a == "--per-subgraph-scales") use_shared_archetype_scales = false;
         else if (a == "--weights-layer0") ab_shared_weights = true;
         else if (a == "--daemon" || a == "--server") {
@@ -4247,13 +4622,16 @@ int main(int argc, char **argv) {
         }
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--int8] [--pp2 | --tp2] [--per-subgraph-scales] [--weights-layer0]\n"
+                        "          [--int8] [--pp2 | --tp2] [--speculative-pld | --pld] [--pld-k K]\n"
+                        "          [--per-subgraph-scales] [--weights-layer0]\n"
                         "          [--prompt TEXT | --prompt-file FILE | -f FILE]\n"
                         "          [--max-tokens N | -n N] [--max-ctx N] [--no-think]\n"
                         "          [--temp F] [--top-k K] [--repeat-penalty F]\n"
                         "          [--daemon [PORT]]\n"
                         "  --pp2             Layer-Parallel (PP=2): Layers 0..11 on Die 0, Layers 12..23 on Die 1.\n"
                         "  --tp2             Tensor-Parallel (TP=2): All 24 layers split across Die 0 and Die 1.\n"
+                        "  --speculative-pld Enable Prompt-Lookup Speculative Decoding with T=8 batch verification.\n"
+                        "  --pld-k K         Maximum speculative draft tokens per T=8 step (1..7, default 7).\n"
                         "  --weights-layer0  Timing experiment: bind every layer of a die to one\n"
                         "                    weight region per archetype to separate NPU streaming\n"
                         "                    speed from per-submit overhead. Generated text is garbage.\n",
@@ -4265,6 +4643,7 @@ int main(int argc, char **argv) {
     Lfm3Engine engine;
     engine.set_quant_options(force_int8, use_shared_archetype_scales);
     engine.set_parallel_mode(requested_tp_degree);
+    engine.set_speculative_pld(enable_pld, pld_max_k);
     engine.set_ab_shared_weights(ab_shared_weights);
     engine.set_extent_probe(std::getenv("LFM3_MEASURE_EXTENT") != nullptr, 2u << 20);
     if (bench_attn && verify_golden_path.empty() && prompt.empty()) {
@@ -4521,8 +4900,7 @@ int main(int argc, char **argv) {
             prompt_text = vis_str + user_text;
         }
         std::string formatted = format_lfm3_chat(prompt_text, system_prompt, enable_thinking);
-        std::vector<int32_t> prompt_ids = engine.tokenizer().encode(formatted, false);
-        for (int32_t id : prompt_ids) sampler.accept(id);
+        std::vector<int32_t> prompt_ids = encode_lfm3_text(engine.tokenizer(), formatted);
 
         StageTimers prefill_t, decode_t;
         g_interrupt_flag.store(false);
@@ -4539,31 +4917,94 @@ int main(int argc, char **argv) {
             std::cout << COLOR_GRAY << "[Thinking: " << std::flush;
         }
 
-        for (int step = 0; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
-            int32_t next_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
-            sampler.accept(next_id);
+        std::vector<int32_t> history = prompt_ids;
+        std::vector<int32_t> draft, cand;
+        bool has_pre_sampled = false;
+        int32_t pre_sampled_id = 0;
+        int pld_steps = 0, pld_drafted = 0, pld_accepted = 0;
 
-            if (next_id == 124900) break; // <|im_end|>
-            if (next_id == 124902) {      // </think>
+        auto print_token = [&](int32_t tok_id) {
+            if (tok_id == 124902) { // </think>
                 if (in_think) {
                     in_think = false;
                     std::cout << "]" << COLOR_RESET << "\n\n" << std::flush;
                 }
-                if (step + 1 < max_new_tokens) {
-                    engine.forward_chunk(&next_id, 1, true, decode_t);
-                }
-                continue;
+                return;
             }
-
-            std::string piece = engine.tokenizer().decode_token(next_id);
+            std::string piece = engine.tokenizer().decode_token(tok_id);
             if (in_think) {
                 std::cout << COLOR_GRAY << piece << std::flush;
             } else {
                 std::cout << piece << std::flush;
             }
+        };
+
+        for (int step = 0; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
+            int32_t next_id = has_pre_sampled
+                ? pre_sampled_id
+                : sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
+            has_pre_sampled = false;
+            sampler.accept(next_id);
+            history.push_back(next_id);
+
+            if (next_id == 124900) break; // <|im_end|>
+            print_token(next_id);
 
             if (step + 1 < max_new_tokens) {
-                if (!engine.forward_chunk(&next_id, 1, true, decode_t)) break;
+                int rem = max_new_tokens - (step + 1);
+                if (engine.is_speculative_pld() && rem >= 2) {
+                    draft_pld(history, std::min(engine.pld_max_k(), rem), draft);
+                } else {
+                    draft.clear();
+                }
+
+                if (draft.empty()) {
+                    if (!engine.forward_chunk(&next_id, 1, true, decode_t)) break;
+                } else {
+                    cand.clear();
+                    cand.push_back(next_id);
+                    cand.insert(cand.end(), draft.begin(), draft.end());
+                    int B = static_cast<int>(cand.size());
+                    pld_steps++;
+                    pld_drafted += (B - 1);
+
+                    if (!engine.forward_verify_t8(cand.data(), B, decode_t)) break;
+                    bool stop_gen = false;
+                    for (int j = 0; j < B; ++j) {
+                        if (!engine.compute_logits_for_hidden(j, decode_t)) {
+                            stop_gen = true;
+                            break;
+                        }
+                        if (j < B - 1) {
+                            int32_t pred_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
+                            if (pred_id == cand[j + 1]) {
+                                pld_accepted++;
+                                step++;
+                                sampler.accept(pred_id);
+                                history.push_back(pred_id);
+                                if (pred_id == 124900) {
+                                    engine.commit_verify_t8(j, decode_t);
+                                    stop_gen = true;
+                                    break;
+                                }
+                                print_token(pred_id);
+                                if (step + 1 >= max_new_tokens) {
+                                    engine.commit_verify_t8(j, decode_t);
+                                    stop_gen = true;
+                                    break;
+                                }
+                            } else {
+                                engine.commit_verify_t8(j, decode_t);
+                                pre_sampled_id = pred_id;
+                                has_pre_sampled = true;
+                                break;
+                            }
+                        } else {
+                            engine.commit_verify_t8(B - 1, decode_t);
+                        }
+                    }
+                    if (stop_gen) break;
+                }
             }
         }
         g_in_generation.store(false);
@@ -4572,11 +5013,26 @@ int main(int argc, char **argv) {
         double tok_s = (dec_s > 0.0) ? ((decode_t.tokens_run + 1) / dec_s) : 0.0;
         double pref_s = prefill_t.total_ms() / 1000.0;
         double pref_tok_s = (pref_s > 0.0) ? (prompt_ids.size() / pref_s) : 0.0;
-        std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok)]%s\n\n",
-                    COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(), pref_tok_s,
-                    prefill_t.total_ms() / std::max<size_t>(1, prompt_ids.size()),
-                    decode_t.tokens_run + 1, tok_s,
-                    decode_t.total_ms() / std::max(1, decode_t.tokens_run), COLOR_RESET);
+        if (engine.is_speculative_pld()) {
+            double acc_rate = (pld_drafted > 0) ? (100.0 * pld_accepted / pld_drafted) : 0.0;
+            std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok) | PLD(T=8): %d/%d draft accepted (%.1f%%) in %d verify steps]%s\n\n",
+                        COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(), pref_tok_s,
+                        prefill_t.total_ms() / std::max<size_t>(1, prompt_ids.size()),
+                        decode_t.tokens_run + 1, tok_s,
+                        decode_t.total_ms() / std::max(1, decode_t.tokens_run),
+                        pld_accepted, pld_drafted, acc_rate, pld_steps, COLOR_RESET);
+        } else {
+            std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok)]%s\n\n",
+                        COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(), pref_tok_s,
+                        prefill_t.total_ms() / std::max<size_t>(1, prompt_ids.size()),
+                        decode_t.tokens_run + 1, tok_s,
+                        decode_t.total_ms() / std::max(1, decode_t.tokens_run), COLOR_RESET);
+        }
+        if (std::getenv("LFM3_TIMING_REPORT")) {
+            prefill_t.print_report("Prefill Stage Breakdown");
+            decode_t.print_report("Decode Stage Breakdown");
+            decode_t.print_arch_report();
+        }
     };
 
     if (!prompt.empty()) {

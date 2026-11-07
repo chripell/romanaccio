@@ -14,8 +14,10 @@ This file is only "how to run what is already built".
 | package | accuracy gate | decode (short / 4K ctx) | prefill (4K C code) | use it for |
 |---|---|---|---|---|
 | **FP16** (`LFM3-1.7B_FP16`, `--pp2`) | **PASSES** -- logits cosine 0.99999111 vs PyTorch FP32, min-layer 0.99998251, 4/4 greedy (§43.1, §47) | **6.19 tok/s** (`161.5 ms/tok`) | ~30 tok/s | highest-precision reference |
-| **INT8 Hybrid `TP=2`** (`LFM3-1.7B_ENNP --tp2`) | **PASSES** -- logits cosine **0.99243842** vs PyTorch FP32, min-layer **0.98038221**, **4/4 greedy** (`[17479, 20, 309, 358]`, §50) | **11.34 / 9.18 tok/s** (`88.2 / 109.8 ms/tok`) | **73.9 tok/s** (`83.9 tok/s` peak, `13.5 ms/tok`) | fastest INT8 dual-die deployment (`0.88 GiB/die`) |
-| **INT8 Layer-Parallel `PP=2`** (`LFM3-1.7B_ENNP --pp2`) | **PASSES** -- logits cosine **0.99563595** vs PyTorch FP32, min-layer **0.98887394**, **4/4 greedy** (`[17479, 20, 309, 358]`, §46.5, §50) | **10.49 / 8.93 tok/s** (`95.4 / 112.9 ms/tok`) | **67.8 tok/s** (`72.9 tok/s` peak, `14.8 ms/tok`) | layer-pipelined INT8 baseline (`0.88 GiB/die`) |
+| **INT8 Hybrid `TP=2` + Speculative PLD (`T=8`)** (`LFM3-1.7B_TP2 --tp2 --speculative-pld`) | **PASSES** -- bit-exact match to standard `T=1` decode (§51) | **16.65 – 23.85 tok/s** (`42.2 – 60.4 ms/tok`, `65%–84%` draft acceptance) | **80.4 – 85.2 tok/s** (`11.7 ms/tok`) | fastest agentic / code / structured generation (`16` models/die) |
+| **INT8 Layer-Parallel `PP=2` + Speculative PLD (`T=8`)** (`LFM3-1.7B_ENNP --pp2 --speculative-pld`) | **PASSES** -- bit-exact match to standard `T=1` decode (§51) | **15.89 – 20.24 tok/s** (`49.7 – 63.3 ms/tok`, `67%–77%` draft acceptance) | **78.1 – 79.7 tok/s** (`12.5 ms/tok`) | layer-parallel speculative decoding (`16` models/die) |
+| **INT8 Hybrid `TP=2`** (`LFM3-1.7B_ENNP --tp2`) | **PASSES** -- logits cosine **0.99243842** vs PyTorch FP32, min-layer **0.98038221**, **4/4 greedy** (`[17479, 20, 309, 358]`, §50) | **11.74 / 9.18 tok/s** (`85.2 / 109.8 ms/tok`) | **73.9 tok/s** (`83.9 tok/s` peak, `13.5 ms/tok`) | default single-token INT8 `TP=2` deployment (`12` models/die) |
+| **INT8 Layer-Parallel `PP=2`** (`LFM3-1.7B_ENNP --pp2`) | **PASSES** -- logits cosine **0.99563595** vs PyTorch FP32, min-layer **0.98887394**, **4/4 greedy** (`[17479, 20, 309, 358]`, §46.5, §50) | **10.49 / 8.93 tok/s** (`95.4 / 112.9 ms/tok`) | **67.8 tok/s** (`72.9 tok/s` peak, `14.8 ms/tok`) | layer-pipelined INT8 baseline (`12` models/die) |
 | mixed, FP16 `proj2048` (`LFM3-1.7B_MIXED`) | FAILS -- min-layer 0.857, logits 0.816 (pre-§46.5 ablation artifact, §43.2) | ~5.1 tok/s | -- | historical ablation only |
 
 Both **FP16** (`LFM3-1.7B_FP16`) and **INT8** (`LFM3-1.7B_ENNP`, after the §46.5 SmoothQuant +
@@ -32,9 +34,10 @@ Everything runs natively on `roma` (`ssh roma`), and the NPU character devices (
 ssh roma
 cd /home/chri/models/LFM3-1.7B_ENNP   # Or LFM3-1.7B_FP16 (omit --int8 for FP16)
 
-# 1. One-shot command line prompt (Hybrid TP=2 or Layer-Parallel PP=2)
+# 1. One-shot command line prompt (Hybrid TP=2 or Layer-Parallel PP=2, with optional --speculative-pld)
 sudo ./lfm3_v2 --int8 --tp2 --prompt "Explain depthwise convolution in one sentence." -n 64
-sudo ./lfm3_v2 --int8 --pp2 --prompt "Explain depthwise convolution in one sentence." -n 64
+sudo ./lfm3_v2 --int8 --tp2 --speculative-pld -f /tmp/test_pld_c_refactor.txt --no-think -n 180 --temp 0
+sudo ./lfm3_v2 --int8 --pp2 --speculative-pld -f /tmp/test_pld_c_refactor.txt --no-think -n 180 --temp 0
 
 # 2. Prompt from file (codebase analysis / benchmarking)
 sudo ./lfm3_v2 --int8 --tp2 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
@@ -64,8 +67,10 @@ sudo ./lfm3_v2 --bench-attn
 | `--prompt TEXT` | `-p` | `""` | One-shot user prompt text (starts with `@FILE` to load from file). |
 | `--prompt-file FILE` | `-f` | `""` | Path to text/source file to use as prompt (ideal for multi-KB code/benchmarks). |
 | `--int8` | | `false` | Enable INT8/INT16 boundary scaling for quantized packages (`LFM3-1.7B_ENNP`, `Heretic`). **Do not use with FP16.** |
-| `--tp2` / `--tp` | | `auto` | Select 2-way Tensor-Parallel execution (`TP=2`) across both NPU dies (automatically switches `.` $\to$ `./tp2` if present). |
+| `--tp2` / `--tp` | | `auto` | Select 2-way Tensor-Parallel execution (`TP=2`) across both NPU dies (automatically switches `.` $\to$ `./tp2` or `../LFM3-1.7B_TP2`). |
 | `--pp2` / `--pp` | | `auto` | Select Layer-Parallel execution (`PP=2`, Layers 0–11 on Die 0, 12–23 on Die 1). |
+| `--speculative-pld` | `--pld` | `false` | Enable Prompt-Lookup Speculative Decoding with `T=8` batch verification (`16` resident models/die; `15.9–23.9 tok/s` on code/agentic tasks). |
+| `--pld-k K` | | `7` | Set maximum speculative draft tokens $K \in [1, 7]$ per `T=8` batch verification step (implicitly enables `--speculative-pld`). |
 | `--no-think` | | `false` | Disable internal `<think>` loops, forcing instant generation of the direct answer. |
 | `--max-tokens N` | `-n` | `128` | Maximum new tokens to decode autoregressively. |
 | `--max-ctx N` | | `4096` | Context window size in tokens (supports up to `32768`–`40960` for 32K prompts). |
@@ -108,10 +113,11 @@ $V inspect_and_golden.py                      # config audit + golden oracle  (M
 $V export_lfm3.py                             # 74 static 4D opset-13 ONNX + CPU weight sidecars (M2)
 $V batch_compile_lfm3.py                      # EsAAC -> .model loadables + manifest (M3, container)
 $V export_lfm3_prefill.py                     # T=64 prefill graphs               (M3.5)
+$V export_lfm3_t8.py                          # T=8 speculative verify archetypes (M9)
 $V calibrate_lfm3_int8.py                     # real-activation INT8 tables      (M5)
-$V build_lfm3_int8_pkg.py                     # INT8 PP=2 package via NVDLA tiler (M5)
+$V build_lfm3_int8_pkg.py                     # INT8 PP=2 package (+ T=8 models)  (M5, M9)
 $V export_lfm3_tp2.py                         # half-width TP=2 ONNX archetypes  (M7)
-$V build_lfm3_tp2_pkg.py                      # INT8 Hybrid TP=2 package         (M7)
+$V build_lfm3_tp2_pkg.py                      # INT8 Hybrid TP=2 package (+ T=8)  (M7, M9)
 $V build_mixed_proj2048_fp16.py               # mixed FP16-proj2048 package
 ```
 
