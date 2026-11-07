@@ -538,6 +538,11 @@ struct LayerCpuWeights {
     const float *q_norm = nullptr;        // [128]
     const float *k_norm = nullptr;        // [128]
     const float *gate_proj = nullptr;     // [16, 2048]
+
+    // Milestone 8 (Phase 1): Fused SmoothQuant & scaled weights (zero runtime multiplications)
+    std::vector<float> op_norm_smooth;    // [2048] = op_norm[c] * in_inv_smooth[c]
+    std::vector<float> ffn_norm_smooth;   // [2048] = ffn_norm[c] * in_inv_smooth[c]
+    std::vector<float> ffn_norm_scaled;   // [2048] = ffn_norm[c] * in_inv_smooth[c] * (1.0f / mlp_scale.in_step)
 };
 
 enum class BoundaryDtype : uint8_t {
@@ -624,6 +629,151 @@ static void rms_norm_f32(const float *x, const float *w, float *out, int T, int 
         float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(C) + eps);
         #pragma omp simd
         for (int i = 0; i < C; ++i) orow[i] = row[i] * inv_rms * w[i];
+    }
+}
+
+// Milestone 8 (Phase 1): Fused Pre-operator RMSNorm + SmoothQuant + dynamic per-token INT8 NPU input packing
+// Computes u_smooth[c] = h[c] * inv_rms * op_norm_smooth[c]
+// Tracks amax = max(|u_smooth[c]|)
+// Emits dst_npu[c] = round_clamp(u_smooth[c] * (127.0f / amax), 127.0f)
+// If u_out != nullptr (Attention layer), also computes u_out[c] = h[c] * inv_rms * op_norm[c]
+static void fused_rms_norm_pack_dyntok_t1(const float *h, const float *op_norm, const float *op_norm_smooth,
+                                          int8_t *dst_npu, int C, float in_thresh, float *scale_ratios,
+                                          float *u_out = nullptr, float eps = 1e-5f) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int c = 0;
+    for (; c + 3 < C; c += 4) {
+        s0 += h[c + 0] * h[c + 0];
+        s1 += h[c + 1] * h[c + 1];
+        s2 += h[c + 2] * h[c + 2];
+        s3 += h[c + 3] * h[c + 3];
+    }
+    float sum_sq = (s0 + s1) + (s2 + s3);
+    for (; c < C; ++c) sum_sq += h[c] * h[c];
+    float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(C) + eps);
+
+    alignas(64) float u_smooth[4096];
+    float amax = 0.0f;
+    if (u_out) {
+        for (int i = 0; i < C; ++i) {
+            u_out[i] = h[i] * inv_rms * op_norm[i];
+            float us = h[i] * inv_rms * op_norm_smooth[i];
+            u_smooth[i] = us;
+            float a = std::fabs(us);
+            if (a > amax) amax = a;
+        }
+    } else {
+        for (int i = 0; i < C; ++i) {
+            float us = h[i] * inv_rms * op_norm_smooth[i];
+            u_smooth[i] = us;
+            float a = std::fabs(us);
+            if (a > amax) amax = a;
+        }
+    }
+    amax = std::max(amax, 1e-8f);
+    scale_ratios[0] = amax / std::max(in_thresh, 1e-8f);
+    const float inv_step = 127.0f / amax;
+
+    #pragma omp simd
+    for (int i = 0; i < C; ++i) {
+        dst_npu[i] = static_cast<int8_t>(round_clamp_f32(u_smooth[i] * inv_step, 127.0f));
+    }
+}
+
+// Milestone 8 (Phase 1): Fuses post_operator_norm, residual add (h_mid = h + op_normed),
+// ffn_norm, SmoothQuant, and static INT8 packing into mlp act_buf.
+static void fused_post_op_residual_ffn_pack_mlp_t1(const float *op_out, const float *post_op_norm,
+                                                  const float *h, float *h_mid,
+                                                  const float *ffn_norm_scaled,
+                                                  int8_t *act_mlp, int C, float eps = 1e-5f) {
+    // Pass 1: sum_sq of op_out
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int c = 0;
+    for (; c + 3 < C; c += 4) {
+        s0 += op_out[c + 0] * op_out[c + 0];
+        s1 += op_out[c + 1] * op_out[c + 1];
+        s2 += op_out[c + 2] * op_out[c + 2];
+        s3 += op_out[c + 3] * op_out[c + 3];
+    }
+    float sum_sq_op = (s0 + s1) + (s2 + s3);
+    for (; c < C; ++c) sum_sq_op += op_out[c] * op_out[c];
+    float inv_rms_op = 1.0f / std::sqrt(sum_sq_op / static_cast<float>(C) + eps);
+
+    // Pass 2: compute h_mid[c] = h[c] + op_out[c] * inv_rms_op * post_op_norm[c]
+    // and simultaneously accumulate sum_sq of h_mid!
+    float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+    c = 0;
+    for (; c + 3 < C; c += 4) {
+        float hm0 = h[c + 0] + op_out[c + 0] * inv_rms_op * post_op_norm[c + 0];
+        float hm1 = h[c + 1] + op_out[c + 1] * inv_rms_op * post_op_norm[c + 1];
+        float hm2 = h[c + 2] + op_out[c + 2] * inv_rms_op * post_op_norm[c + 2];
+        float hm3 = h[c + 3] + op_out[c + 3] * inv_rms_op * post_op_norm[c + 3];
+        h_mid[c + 0] = hm0;
+        h_mid[c + 1] = hm1;
+        h_mid[c + 2] = hm2;
+        h_mid[c + 3] = hm3;
+        m0 += hm0 * hm0;
+        m1 += hm1 * hm1;
+        m2 += hm2 * hm2;
+        m3 += hm3 * hm3;
+    }
+    float sum_sq_hmid = (m0 + m1) + (m2 + m3);
+    for (; c < C; ++c) {
+        float hm = h[c] + op_out[c] * inv_rms_op * post_op_norm[c];
+        h_mid[c] = hm;
+        sum_sq_hmid += hm * hm;
+    }
+    float inv_rms_ffn = 1.0f / std::sqrt(sum_sq_hmid / static_cast<float>(C) + eps);
+
+    // Pass 3: pack directly into act_mlp with ffn_norm_scaled!
+    #pragma omp simd
+    for (int i = 0; i < C; ++i) {
+        float val = h_mid[i] * inv_rms_ffn * ffn_norm_scaled[i];
+        act_mlp[i] = static_cast<int8_t>(round_clamp_f32(val, 127.0f));
+    }
+}
+
+// Milestone 8 (Phase 1): Fuses post_ffn_norm on mlp_out and residual addition: h[c] = h_mid[c] + mlp_normed[c]
+static void fused_post_ffn_residual_t1(const float *mlp_out, const float *post_ffn_norm,
+                                      const float *h_mid, float *h, int C, float eps = 1e-5f) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int c = 0;
+    for (; c + 3 < C; c += 4) {
+        s0 += mlp_out[c + 0] * mlp_out[c + 0];
+        s1 += mlp_out[c + 1] * mlp_out[c + 1];
+        s2 += mlp_out[c + 2] * mlp_out[c + 2];
+        s3 += mlp_out[c + 3] * mlp_out[c + 3];
+    }
+    float sum_sq = (s0 + s1) + (s2 + s3);
+    for (; c < C; ++c) sum_sq += mlp_out[c] * mlp_out[c];
+    float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(C) + eps);
+
+    #pragma omp simd
+    for (int i = 0; i < C; ++i) {
+        h[i] = h_mid[i] + (mlp_out[i] * inv_rms * post_ffn_norm[i]);
+    }
+}
+
+// Milestone 8 (Phase 1): Fuses final embedding_norm and static INT8 packing directly into Die 0 and Die 1 act buffers
+static void fused_emb_norm_broadcast_t1(const float *h, const float *emb_norm_scaled,
+                                        int8_t *dst_die0, int8_t *dst_die1, int C, float eps = 1e-5f) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int c = 0;
+    for (; c + 3 < C; c += 4) {
+        s0 += h[c + 0] * h[c + 0];
+        s1 += h[c + 1] * h[c + 1];
+        s2 += h[c + 2] * h[c + 2];
+        s3 += h[c + 3] * h[c + 3];
+    }
+    float sum_sq = (s0 + s1) + (s2 + s3);
+    for (; c < C; ++c) sum_sq += h[c] * h[c];
+    float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(C) + eps);
+
+    #pragma omp simd
+    for (int i = 0; i < C; ++i) {
+        int8_t q = static_cast<int8_t>(round_clamp_f32(h[i] * inv_rms * emb_norm_scaled[i], 127.0f));
+        dst_die0[i] = q;
+        dst_die1[i] = q;
     }
 }
 
@@ -1316,6 +1466,7 @@ public:
         // 10 heap allocations/zero-fills per decode step.
         m_buf_h.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_u.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_u_smooth.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_bcx.assign(static_cast<size_t>(kChunk) * 6144, 0.0f);
         m_buf_qkv.assign(static_cast<size_t>(kChunk) * 3072, 0.0f);
         m_buf_y.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
@@ -1388,6 +1539,7 @@ public:
 
         float *h       = m_buf_h.data();
         float *u       = m_buf_u.data();
+        float *u_smooth = m_buf_u_smooth.data();
         float *bcx     = m_buf_bcx.data();
         float *qkv     = m_buf_qkv.data();
         float *y       = m_buf_y.data();
@@ -1492,8 +1644,22 @@ public:
 
             // 1. Pre-operator Sandwich RMSNorm
             auto tn0 = std::chrono::steady_clock::now();
-            rms_norm_f32(h, cw.op_norm, u, T_valid, kHidden);
-            pack_npu_input(u, act_buf, T, kHidden, no.op_in_scale, op_in_ratios, T_valid);
+            if (T == 1 && !cw.op_norm_smooth.empty() && no.op_in_scale.in_dtype == BoundaryDtype::Int8) {
+                float *u_attn = (kLayerSchedule[l] != Lfm3LayerType::Conv) ? u : nullptr;
+                fused_rms_norm_pack_dyntok_t1(h, cw.op_norm, cw.op_norm_smooth.data(),
+                                              act_buf->as<int8_t>(), kHidden,
+                                              no.op_in_scale.in_thresh, op_in_ratios, u_attn);
+            } else if (T > 1 && !cw.op_norm_smooth.empty() && no.op_in_scale.in_dtype == BoundaryDtype::Int8) {
+                if (kLayerSchedule[l] != Lfm3LayerType::Conv) {
+                    rms_norm_f32(h, cw.op_norm, u, T_valid, kHidden);
+                }
+                rms_norm_f32(h, cw.op_norm_smooth.data(), u_smooth, T_valid, kHidden);
+                pack_npu_input_int8_dyntok(u_smooth, act_buf->as<int8_t>(), T, kHidden,
+                                           no.op_in_scale.in_thresh, op_in_ratios, nullptr, T_valid);
+            } else {
+                rms_norm_f32(h, cw.op_norm, u, T_valid, kHidden);
+                pack_npu_input(u, act_buf, T, kHidden, no.op_in_scale, op_in_ratios, T_valid);
+            }
             act_buf->flush_cache();
             auto tn1 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn1 - tn0).count();
@@ -1744,11 +1910,23 @@ public:
 
             // 2. Sandwich post_operator_norm + Residual + ffn_norm
             auto tn4 = std::chrono::steady_clock::now();
-            rms_norm_f32(op_out, cw.post_op_norm, op_out, T_valid, kHidden);
-            #pragma omp simd
-            for (int i = 0; i < T_valid * kHidden; ++i) h_mid[i] = h[i] + op_out[i];
-            rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
-            pack_npu_input(v, act_buf, T, kHidden, no.mlp_scale, nullptr, T_valid);
+            if (T == 1 && !cw.ffn_norm_scaled.empty() && no.mlp_scale.in_dtype == BoundaryDtype::Int8) {
+                fused_post_op_residual_ffn_pack_mlp_t1(op_out, cw.post_op_norm, h, h_mid,
+                                                       cw.ffn_norm_scaled.data(),
+                                                       act_buf->as<int8_t>(), kHidden);
+            } else if (T > 1 && !cw.ffn_norm_smooth.empty() && no.mlp_scale.in_dtype == BoundaryDtype::Int8) {
+                rms_norm_f32(op_out, cw.post_op_norm, op_out, T_valid, kHidden);
+                #pragma omp simd
+                for (int i = 0; i < T_valid * kHidden; ++i) h_mid[i] = h[i] + op_out[i];
+                rms_norm_f32(h_mid, cw.ffn_norm_smooth.data(), v, T_valid, kHidden);
+                pack_npu_input_int8(v, act_buf->as<int8_t>(), T, kHidden, no.mlp_scale.in_step, nullptr, T_valid);
+            } else {
+                rms_norm_f32(op_out, cw.post_op_norm, op_out, T_valid, kHidden);
+                #pragma omp simd
+                for (int i = 0; i < T_valid * kHidden; ++i) h_mid[i] = h[i] + op_out[i];
+                rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
+                pack_npu_input(v, act_buf, T, kHidden, no.mlp_scale, nullptr, T_valid);
+            }
             act_buf->flush_cache();
             auto tn5 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn5 - tn4).count();
@@ -1770,9 +1948,13 @@ public:
             // 4. Sandwich post_ffn_norm + Residual
             auto tn6 = std::chrono::steady_clock::now();
             unpack_npu_output(out_buf, mlp_out, T, kHidden, no.mlp_scale, nullptr, T_valid);
-            rms_norm_f32(mlp_out, cw.post_ffn_norm, mlp_out, T_valid, kHidden);
-            #pragma omp simd
-            for (int i = 0; i < T_valid * kHidden; ++i) h[i] = h_mid[i] + mlp_out[i];
+            if (T == 1) {
+                fused_post_ffn_residual_t1(mlp_out, cw.post_ffn_norm, h_mid, h, kHidden);
+            } else {
+                rms_norm_f32(mlp_out, cw.post_ffn_norm, mlp_out, T_valid, kHidden);
+                #pragma omp simd
+                for (int i = 0; i < T_valid * kHidden; ++i) h[i] = h_mid[i] + mlp_out[i];
+            }
             auto tn7 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn7 - tn6).count();
 
@@ -1791,21 +1973,28 @@ public:
         // Final embedding_norm on the last token's hidden state [1, 2048]
         auto tfn0 = std::chrono::steady_clock::now();
         const float *last_h = h + static_cast<size_t>(T_valid - 1) * kHidden;
-        float h_final[kHidden];
-        rms_norm_f32(last_h, m_emb_norm_weight, h_final, 1, kHidden);
-        if (debug_emb_norm) {
-            debug_emb_norm->assign(h_final, h_final + kHidden);
-        }
-
-        // Broadcast normalized [1, 2048] vector (FP16 or INT8) to both Die 0 and Die 1 activation buffers.
-        // Do NOT use dyntok on the static EsAAC-compiled LM head slices: their internal CvtPrecision_QuantM
-        // was calibrated against static input_threshold=20.82, so scaling h_final (amax ~10.1) up by 2.05x
-        // drives all logits > 13.1 into +127 output saturation and makes slice d0_s0 (out_step=0.21785)
-        // systematically beat slice d0_s1 (out_step=0.21118, where token 17479 ' Monday' lives).
         const SubgraphScaleInfo &lm_in_sc = m_die_models[0].lm_head_scale[0];
-        pack_npu_input(h_final, m_act_t1[0].get(), 1, kHidden, lm_in_sc);
-        size_t lm_copy_bytes = static_cast<size_t>(kHidden) * dtype_elem_size(lm_in_sc.in_dtype);
-        std::memcpy(m_act_t1[1]->data(), m_act_t1[0]->data(), lm_copy_bytes);
+
+        if (!m_emb_norm_scaled.empty()) {
+            fused_emb_norm_broadcast_t1(last_h, m_emb_norm_scaled.data(),
+                                        m_act_t1[0]->as<int8_t>(),
+                                        m_act_t1[1]->as<int8_t>(),
+                                        kHidden);
+            if (debug_emb_norm) {
+                float h_final[kHidden];
+                rms_norm_f32(last_h, m_emb_norm_weight, h_final, 1, kHidden);
+                debug_emb_norm->assign(h_final, h_final + kHidden);
+            }
+        } else {
+            float h_final[kHidden];
+            rms_norm_f32(last_h, m_emb_norm_weight, h_final, 1, kHidden);
+            if (debug_emb_norm) {
+                debug_emb_norm->assign(h_final, h_final + kHidden);
+            }
+            pack_npu_input(h_final, m_act_t1[0].get(), 1, kHidden, lm_in_sc);
+            size_t lm_copy_bytes = static_cast<size_t>(kHidden) * dtype_elem_size(lm_in_sc.in_dtype);
+            std::memcpy(m_act_t1[1]->data(), m_act_t1[0]->data(), lm_copy_bytes);
+        }
         m_act_t1[0]->flush_cache();
         m_act_t1[1]->flush_cache();
         auto tfn1 = std::chrono::steady_clock::now();
@@ -3275,6 +3464,40 @@ private:
                     m_chan_scales_buf.empty() ? "off" : "on",
                     (m_layer_npu[0].mlp_scale.out_dtype == BoundaryDtype::Int16) ? "int16" : "int8",
                     (m_die_models[0].lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? "int8" : "fp16");
+
+        // Milestone 8 (Phase 1): Precompute fused SmoothQuant and scaled RMSNorm weights
+        for (int l = 0; l < kNumLayers; ++l) {
+            // 1. op_norm_smooth for conv_in / attn_qkv
+            if (m_layer_npu[l].op_in_scale.in_inv_smooth && m_layer_npu[l].op_in_scale.in_dtype == BoundaryDtype::Int8) {
+                m_layer_cpu[l].op_norm_smooth.resize(kHidden);
+                const float *sm = m_layer_npu[l].op_in_scale.in_inv_smooth;
+                const float *w  = m_layer_cpu[l].op_norm;
+                for (int c = 0; c < kHidden; ++c) {
+                    m_layer_cpu[l].op_norm_smooth[c] = w[c] * sm[c];
+                }
+            }
+            // 2. ffn_norm_smooth & ffn_norm_scaled for mlp
+            if (m_layer_npu[l].mlp_scale.in_dtype == BoundaryDtype::Int8) {
+                m_layer_cpu[l].ffn_norm_smooth.resize(kHidden);
+                m_layer_cpu[l].ffn_norm_scaled.resize(kHidden);
+                const float *sm = m_layer_npu[l].mlp_scale.in_inv_smooth;
+                const float *w  = m_layer_cpu[l].ffn_norm;
+                float inv_step  = 1.0f / m_layer_npu[l].mlp_scale.in_step;
+                for (int c = 0; c < kHidden; ++c) {
+                    float s = sm ? sm[c] : 1.0f;
+                    m_layer_cpu[l].ffn_norm_smooth[c] = w[c] * s;
+                    m_layer_cpu[l].ffn_norm_scaled[c] = w[c] * s * inv_step;
+                }
+            }
+        }
+        // 3. m_emb_norm_scaled for LM head
+        if (m_die_models[0].lm_head_scale[0].in_dtype == BoundaryDtype::Int8 && m_emb_norm_weight) {
+            m_emb_norm_scaled.resize(kHidden);
+            float inv_step = 1.0f / m_die_models[0].lm_head_scale[0].in_step;
+            for (int c = 0; c < kHidden; ++c) {
+                m_emb_norm_scaled[c] = m_emb_norm_weight[c] * inv_step;
+            }
+        }
         return true;
     }
 
@@ -3300,6 +3523,7 @@ private:
     std::vector<float> m_cpu_weights_buf;
     std::vector<float> m_chan_scales_buf;
     const float *m_emb_norm_weight = nullptr;
+    std::vector<float> m_emb_norm_scaled;
     LayerCpuWeights m_layer_cpu[kNumLayers];
     LayerNpuOffsets m_layer_npu[kNumLayers];
     DieModels m_die_models[2];
@@ -3326,7 +3550,7 @@ private:
     NumaKvBuffer<uint16_t> m_glob_k_sum;
     std::vector<float> m_scores_ws;
     std::vector<float> m_logits;
-    std::vector<float> m_buf_h, m_buf_u, m_buf_bcx, m_buf_qkv, m_buf_y,
+    std::vector<float> m_buf_h, m_buf_u, m_buf_u_smooth, m_buf_bcx, m_buf_qkv, m_buf_y,
                        m_buf_op_out, m_buf_h_mid, m_buf_v, m_buf_mlp_out, m_buf_gates;
 };
 

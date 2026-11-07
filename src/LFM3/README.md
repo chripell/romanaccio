@@ -441,6 +441,6 @@ During execution:
   [Prefill: 3781 tok in 59168.8 ms (63.90 tok/s, 15.6 ms/tok) | Decode: 128 tok at 7.84 tok/s (128.6 ms/tok)]
   ```
   - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs while the 8 P550 CPU cores execute L2-tiled, NUMA-pinned (`mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE` 2 MiB HugePages) batched INT8 64-bit SWAR attention (`63.90 tok/s` sustained over 3,781 tokens, peaking at `74.4 tok/s`).
-  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (`~8.85–9.02 tok/s` at short context, `7.84 tok/s` at `~4,000` tokens context).
+  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (`9.44 tok/s` at short context, `7.96 tok/s` at `~4,000` tokens context with fused SmoothQuant RMSNorm).
 
 
