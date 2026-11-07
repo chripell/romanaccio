@@ -2769,6 +2769,62 @@ Extended the package builder with CLI configuration options:
      ```
    - Verified via OpenAI HTTP endpoint (`POST /v1/chat/completions`) with both non-streaming JSON and streaming token-by-token Server-Sent Events (SSE).
 
+---
+
+## 50. Milestone 7 — Hybrid 2-Way Tensor Parallelism (`TP=2`) Across Both NPU Dies vs. Layer-Parallel (`PP=2`)
+
+### 50.1 Hardware Discovery: Cross-Die `eic7700_npu` Kernel Serialization on Small Subgraphs (`0.70 ms` Floor)
+
+1. **Full 4-Archetype `TP=2` vs. Kernel `ioctl` Serialization**:
+   - We first compiled and benchmarked a full 4-archetype `TP=2` package where every layer's 4 NPU subgraphs (`conv_in`, `attn_qkv`, `proj2048`, and `mlp`) were sharded across Die 0 and Die 1:
+     - `conv_in_tp2`: `2048 -> 3072` per die (`6.3 MB` per die).
+     - `attn_qkv_tp2`: `2048 -> 1536` per die (`3.2 MB` per die, `8 Q + 2 K + 2 V` heads per die).
+     - `proj2048_tp2`: `2048 -> 1024` per die (column-split output channels `0..1023` on Die 0, `1024..2047` on Die 1, avoiding `K`-dimension splitting so input SmoothQuant scales remain identical on both dies).
+     - `mlp_tp2`: `2048 -> 3840 -> 2048` per die (column-split `w1, w3`, row-split `w2`).
+   - On `roma` (`EIC7700X`), per-archetype driver instrumentation (`StageTimers::ArchStat`) revealed a fundamental property of the vendor `eic7700_npu` kernel driver:
+     - Concurrent `ES_NPU_Submit` / `ES_SYS_MemFlushCache` ioctls to `/dev/npu0` and `/dev/npu1` incur a **`~0.35 ms` cross-die kernel lock serialization floor** (`~0.70 ms` minimum wall-clock time for a dual-die pair).
+     - For `mlp` (`63.9 MB/layer` = `31.95 MB/die`, taking `1.88 ms/layer` single-die), dual-die `TP=2` cut driver time from `45.06 ms/tok` to **`30.34 ms/tok`** (**`50.58 GB/s` aggregate driver bandwidth**).
+     - Conversely, for the 48 small projections per token (`conv_in`: `0.60 ms`, `attn_qkv`: `0.47 ms`, `proj2048`: `0.42 ms` single-die), paying the `0.70 ms` cross-die serialization floor on every submit *increased* their combined execution time from `33.7 ms/tok` (`PP=2`) to `47.6 ms/tok` (`+13.9 ms/tok` penalty), wiping out the `mlp` speedup.
+
+2. **Hybrid `TP=2` Architecture (Single-Die Small Projections + Dual-Die `TP=2` SwiGLU MLP & LM Head)**:
+   - By keeping `conv_in`, `attn_qkv`, and `proj2048` single-die (`PP=2` placement: Layers `0..11` on Die 0, Layers `12..23` on Die 1) while sharding all 24 layers' `mlp` (`82%` of layer weights) and the `LM Head` across both dies (`no.mlp_tp = 2`):
+     - We eliminate all 48 small-subgraph cross-die barriers per token.
+     - Both dies retain **12 resident `.model` loadables per die** (`< 55` gate) and exact weight blob size parity with `PP=2` (`0.878 GiB` Die 0, `0.872 GiB` Die 1).
+     - Both `--pp2` and `--tp2` coexist cleanly in [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp) (`--tp2` automatically resolves `./tp2` when invoked from `/home/chri/models/LFM3-1.7B_ENNP`).
+
+### 50.2 Eliminating `w2` `CvtPrecision_QuantM` Ceiling Saturation (`truncate = 25` + Per-Die Quantization)
+
+1. **Root Cause of `truncate = 28` Saturation in `shared_mlp_table.json`**:
+   - `EsAAC` compiled `mlp_tp2_{t1,t64}_npu_b1.model` using `shared_mlp_table.json` (`m1_s = 0.0012938867`, calibrated from Layer 22's wide SwiGLU dynamic range), which set `w2`'s SDP output right-shift to `truncate = 28`.
+   - For Layers `0..21`, where `y_part` (`K = 3840` half-sum) is `10x–45x` smaller than Layer 22, computing `qm = round((m1_s * ws / out_s_c) * 2^28)` hit the signed `int16` ceiling (`32,767`) on **all 2,048 output channels**, forcing the effective output step to be `7x–45x` larger than calibrated (`min-layer = 0.9797`).
+2. **Fix in [`src/LFM3/build_lfm3_tp2_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/build_lfm3_tp2_pkg.py)**:
+   - Patched `TRUNCS_TP2_MLP = [14] * 15 + [15] * 15 + [25] * 16` (`truncate = 25` instead of `28` on all 16 `w2` slices), providing `8x` (`3` extra bits) higher `int16` output resolution per die before hitting `qm = 32,767`.
+   - Computed per-die `w2` `int16` weight quantization (`tile_int16_slice(w2_d[sl])`) and per-die output scale bounds `y_bound_c = torch.maximum(y_max_c * 1.65, q98 * u2_c * 1.65)`.
+   - On `roma`, this raised `--tp2` `Min Layer Cosine` to **`0.98038221`** (`>= 0.9800` `[PASS]`) and `128K Logits Cosine` to **`0.99243842`** (`>= 0.9900` `[PASS]`).
+
+### 50.3 Zero-IPC Direct Submission & Disjoint-Core Worker Pre-Wakeup
+
+1. **Direct Single-Die Submission (`execute_direct`)**:
+   - Replaced the `WorkerThread` condition-variable queue on single-die calls with direct execution on the calling thread (`m_workers[die_id]->execute_direct(task)`), eliminating 72 mutex/condvar round-trips per token (`~10.6 ms/tok` saved) and boosting `--pp2` decode from `9.44 tok/s` (`105.95 ms/tok`) to **`10.49 tok/s` (`95.36 ms/tok`)**.
+2. **Disjoint CPU Affinity (`Cores 0..6` vs. `Core 7`) & Post-`proj2048` Pre-Wakeup**:
+   - After initializing the 8-thread OpenMP pool (`Cores 0..7`), `start_tp_worker()` restricts the main thread to `Cores 0..6` while pinning the Die-1 `TP=2` dispatcher (`m_tp_thread`) to `Core 7` (`NUMA Node 1`), guaranteeing the main thread and `m_tp_thread` never collide on the same physical CPU core.
+   - During `T=1` decode, `prewake_tp_worker()` wakes `m_tp_thread` immediately after `proj2048`'s `submit_arch` returns, overlapping the Linux futex wakeup with `unpack_npu_output` + `fused_post_op_residual_ffn_pack_mlp_t1` (`~80 µs`) while keeping `m_tp_thread` asleep during `proj2048`, OpenMP Attention, and `T=64` batched prefill.
+
+### 50.4 Silicon Benchmark Comparison on `roma` (`--pp2` vs. `--tp2`)
+
+| Metric | Milestone 8 Baseline (`PP=2`) | Milestone 7 `--pp2` (Direct Submit) | Milestone 7 `--tp2` (Hybrid `TP=2`) | Improvement (`--tp2` vs. M8) |
+|---|---|---|---|---|
+| **Resident Loadables / Die** | `12 / 62` `[PASS]` | `12 / 62` `[PASS]` | **`12 / 62` `[PASS]`** | Zero extra `.model` slots |
+| **Min Layer Cosine (24L)** | `0.98892771` `[PASS]` | `0.98887394` `[PASS]` | **`0.98038221` `[PASS]`** | All gates `>= 0.9800` |
+| **128K Logits Cosine** | `0.99594256` `[PASS]` | `0.99563595` `[PASS]` | **`0.99243842` `[PASS]`** | All gates `>= 0.9900` |
+| **Greedy 4-Token Match** | `4/4 exact` `[PASS]` | `4/4 exact` `[PASS]` | **`4/4 exact` `[PASS]`** | Bit-exact greedy match |
+| **MLP Driver / Master Time** | `45.32 / 57.20 ms/tok` | `45.06 / 49.23 ms/tok` | **`30.34 / 40.81 ms/tok`** | **`-33.0%` driver (`50.58 GB/s`)** |
+| **NPU Layer Projections** | `89.20 ms/tok` | `82.93 ms/tok` | **`76.03–77.23 ms/tok`** | **`-14.8%` (`-13.17 ms/tok`)** |
+| **Short-Context Decode (`16` tok)** | `9.44 tok/s` (`105.95 ms/tok`) | `10.49 tok/s` (`95.36 ms/tok`) | **`11.19–11.34 tok/s` (`88.19 ms/tok`)** | **`+20.1%` (`+103.6%` vs `5.57` base)** |
+| **4K C-Code Prefill (`3,781` tok)** | `63.90 tok/s` (`59.17 s`, `74.4` peak) | `67.76 tok/s` (`55.80 s`, `72.9` peak) | **`73.92 tok/s` (`51.15 s`, `83.9` peak)** | **`+15.7%` (`-8.02 s` on 4K prompt)** |
+| **4K-Context Decode (`128` tok)** | `7.96 tok/s` (`125.6 ms/tok`) | `8.93 tok/s` (`112.9 ms/tok`) | **`9.18 tok/s` (`109.8 ms/tok`)** | **`+15.3%` at 4K context** |
+
+
 
 
 

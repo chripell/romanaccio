@@ -29,12 +29,14 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <fstream>
@@ -574,16 +576,26 @@ static inline size_t dtype_elem_size(BoundaryDtype dt) {
 
 struct LayerNpuOffsets {
     uint16_t die_id = 0;
-    size_t op_in_offset = 0;   // conv_in (25,362,432 B) or attn_qkv (12,681,216 B)
-    size_t op_in_size   = 0;
-    size_t op_out_offset = 0;  // conv_out or attn_out (8,454,144 B)
-    size_t op_out_size   = 0;
-    size_t mlp_offset    = 0;  // mlp (94,863,360 B)
-    size_t mlp_size      = 0;
+    uint8_t op_in_tp  = 1;
+    uint8_t op_out_tp = 1;
+    uint8_t mlp_tp    = 1;
+    size_t op_in_offset     = 0;   // conv_in or attn_qkv (Die 0 or single die)
+    size_t op_in_offset_d1  = 0;   // Die 1 offset when op_in_tp == 2
+    size_t op_in_size       = 0;
+    size_t op_out_offset    = 0;   // conv_out or attn_out (Die 0 or single die)
+    size_t op_out_offset_d1 = 0;   // Die 1 offset when op_out_tp == 2
+    size_t op_out_size      = 0;
+    size_t mlp_offset       = 0;   // mlp (Die 0 or single die)
+    size_t mlp_offset_d1    = 0;   // Die 1 offset when mlp_tp == 2
+    size_t mlp_size         = 0;
 
     SubgraphScaleInfo op_in_scale{};
     SubgraphScaleInfo op_out_scale{};
     SubgraphScaleInfo mlp_scale{};
+    // TP=2 Die 1 per-channel output dequantization scales
+    SubgraphScaleInfo op_in_scale_d1{};
+    SubgraphScaleInfo op_out_scale_d1{};
+    SubgraphScaleInfo mlp_scale_d1{};
 };
 
 struct LoadedArchetype {
@@ -685,7 +697,8 @@ static void fused_rms_norm_pack_dyntok_t1(const float *h, const float *op_norm, 
 static void fused_post_op_residual_ffn_pack_mlp_t1(const float *op_out, const float *post_op_norm,
                                                   const float *h, float *h_mid,
                                                   const float *ffn_norm_scaled,
-                                                  int8_t *act_mlp, int C, float eps = 1e-5f) {
+                                                  int8_t *act_mlp, int C, float eps = 1e-5f,
+                                                  int8_t *act_mlp_d1 = nullptr) {
     // Pass 1: sum_sq of op_out
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int c = 0;
@@ -725,27 +738,61 @@ static void fused_post_op_residual_ffn_pack_mlp_t1(const float *op_out, const fl
     }
     float inv_rms_ffn = 1.0f / std::sqrt(sum_sq_hmid / static_cast<float>(C) + eps);
 
-    // Pass 3: pack directly into act_mlp with ffn_norm_scaled!
-    #pragma omp simd
-    for (int i = 0; i < C; ++i) {
-        float val = h_mid[i] * inv_rms_ffn * ffn_norm_scaled[i];
-        act_mlp[i] = static_cast<int8_t>(round_clamp_f32(val, 127.0f));
+    // Pass 3: pack directly into act_mlp (and act_mlp_d1 when TP=2) with ffn_norm_scaled!
+    if (act_mlp_d1) {
+        #pragma omp simd
+        for (int i = 0; i < C; ++i) {
+            float val = h_mid[i] * inv_rms_ffn * ffn_norm_scaled[i];
+            int8_t q = static_cast<int8_t>(round_clamp_f32(val, 127.0f));
+            act_mlp[i] = q;
+            act_mlp_d1[i] = q;
+        }
+    } else {
+        #pragma omp simd
+        for (int i = 0; i < C; ++i) {
+            float val = h_mid[i] * inv_rms_ffn * ffn_norm_scaled[i];
+            act_mlp[i] = static_cast<int8_t>(round_clamp_f32(val, 127.0f));
+        }
     }
 }
 
-// Milestone 8 (Phase 1): Fuses post_ffn_norm on mlp_out and residual addition: h[c] = h_mid[c] + mlp_normed[c]
-static void fused_post_ffn_residual_t1(const float *mlp_out, const float *post_ffn_norm,
-                                      const float *h_mid, float *h, int C, float eps = 1e-5f) {
+// Milestone 8 (Phase 1) + Milestone 7 (TP=2): Fuses optional TP=2 partial sum (mlp_out + mlp_out_d1),
+// post_ffn_norm on mlp_out, and residual addition: h[c] = h_mid[c] + mlp_normed[c]
+static void fused_post_ffn_residual_t1(float *mlp_out, const float *post_ffn_norm,
+                                      const float *h_mid, float *h, int C, float eps = 1e-5f,
+                                      const float *mlp_out_d1 = nullptr) {
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int c = 0;
-    for (; c + 3 < C; c += 4) {
-        s0 += mlp_out[c + 0] * mlp_out[c + 0];
-        s1 += mlp_out[c + 1] * mlp_out[c + 1];
-        s2 += mlp_out[c + 2] * mlp_out[c + 2];
-        s3 += mlp_out[c + 3] * mlp_out[c + 3];
+    if (mlp_out_d1) {
+        for (; c + 3 < C; c += 4) {
+            float m0 = mlp_out[c + 0] + mlp_out_d1[c + 0];
+            float m1 = mlp_out[c + 1] + mlp_out_d1[c + 1];
+            float m2 = mlp_out[c + 2] + mlp_out_d1[c + 2];
+            float m3 = mlp_out[c + 3] + mlp_out_d1[c + 3];
+            mlp_out[c + 0] = m0;
+            mlp_out[c + 1] = m1;
+            mlp_out[c + 2] = m2;
+            mlp_out[c + 3] = m3;
+            s0 += m0 * m0;
+            s1 += m1 * m1;
+            s2 += m2 * m2;
+            s3 += m3 * m3;
+        }
+        for (; c < C; ++c) {
+            float m = mlp_out[c] + mlp_out_d1[c];
+            mlp_out[c] = m;
+            s0 += m * m;
+        }
+    } else {
+        for (; c + 3 < C; c += 4) {
+            s0 += mlp_out[c + 0] * mlp_out[c + 0];
+            s1 += mlp_out[c + 1] * mlp_out[c + 1];
+            s2 += mlp_out[c + 2] * mlp_out[c + 2];
+            s3 += mlp_out[c + 3] * mlp_out[c + 3];
+        }
+        for (; c < C; ++c) s0 += mlp_out[c] * mlp_out[c];
     }
     float sum_sq = (s0 + s1) + (s2 + s3);
-    for (; c < C; ++c) sum_sq += mlp_out[c] * mlp_out[c];
     float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(C) + eps);
 
     #pragma omp simd
@@ -805,9 +852,11 @@ static void pack_npu_input_fp16(const float *src_tc, uint16_t *dst_npu, int T, i
     }
 }
 
-// Unpack NPU NCHW [1, C_out, T, 1] FP16 output into [T_valid, C_out] FP32
-static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int T, int C_out, int T_valid = -1) {
+// Unpack NPU NCHW [1, C_out, T, 1] FP16 output into [T_valid, dst_stride] FP32
+static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int T, int C_out,
+                                   int T_valid = -1, int dst_stride = 0) {
     if (T_valid < 0 || T_valid > T) T_valid = T;
+    if (dst_stride <= 0) dst_stride = C_out;
     if (T == 1) {
         for (int c = 0; c < C_out; ++c) {
             dst_tc[c] = fp16_to_fp32(src_nchw[c]);
@@ -826,7 +875,7 @@ static void unpack_npu_output_fp16(const uint16_t *src_nchw, float *dst_tc, int 
                 }
             }
             for (int dt = 0; dt < dt_end; ++dt) {
-                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * dst_stride + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
@@ -913,10 +962,11 @@ static void pack_npu_input_int16(const float *src_tc, int16_t *dst_npu, int T, i
     }
 }
 
-// Unpack NPU NCHW [1, C_out, T, 1] INT8 output into [T_valid, C_out] FP32
+// Unpack NPU NCHW [1, C_out, T, 1] INT8 output into [T_valid, dst_stride] FP32
 static void unpack_npu_output_int8(const int8_t *src_nchw, float *dst_tc, int T, int C_out, float out_step,
-                                   const float *out_step_chan = nullptr, int T_valid = -1) {
+                                   const float *out_step_chan = nullptr, int T_valid = -1, int dst_stride = 0) {
     if (T_valid < 0 || T_valid > T) T_valid = T;
+    if (dst_stride <= 0) dst_stride = C_out;
     if (T == 1) {
         if (out_step_chan) {
             #pragma omp simd
@@ -945,16 +995,17 @@ static void unpack_npu_output_int8(const int8_t *src_nchw, float *dst_tc, int T,
                 }
             }
             for (int dt = 0; dt < dt_end; ++dt) {
-                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * dst_stride + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
 }
 
-// Unpack NPU NCHW [1, C_out, T, 1] INT16 output into [T_valid, C_out] FP32
+// Unpack NPU NCHW [1, C_out, T, 1] INT16 output into [T_valid, dst_stride] FP32
 static void unpack_npu_output_int16(const int16_t *src_nchw, float *dst_tc, int T, int C_out, float out_step,
-                                    const float *out_step_chan = nullptr, int T_valid = -1) {
+                                    const float *out_step_chan = nullptr, int T_valid = -1, int dst_stride = 0) {
     if (T_valid < 0 || T_valid > T) T_valid = T;
+    if (dst_stride <= 0) dst_stride = C_out;
     if (T == 1) {
         if (out_step_chan) {
             #pragma omp simd
@@ -983,7 +1034,7 @@ static void unpack_npu_output_int16(const int16_t *src_nchw, float *dst_tc, int 
                 }
             }
             for (int dt = 0; dt < dt_end; ++dt) {
-                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * dst_stride + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
@@ -1086,8 +1137,10 @@ static void pack_npu_input_int8_dyntok(const float *src_tc, int8_t *dst_npu, int
 // Dynamic per-token INT8 output unpacker for homogeneous 1x1 linear projections
 static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc, int T, int C_out,
                                           float out_step, const float *scale_ratios,
-                                          const float *out_step_chan = nullptr, int T_valid = -1) {
+                                          const float *out_step_chan = nullptr, int T_valid = -1,
+                                          int dst_stride = 0) {
     if (T_valid < 0 || T_valid > T) T_valid = T;
+    if (dst_stride <= 0) dst_stride = C_out;
     if (T == 1) {
         if (out_step_chan) {
             const float r0 = scale_ratios[0];
@@ -1118,7 +1171,7 @@ static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc,
                 }
             }
             for (int dt = 0; dt < dt_end; ++dt) {
-                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * C_out + c0, tile[dt], 16 * sizeof(float));
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * dst_stride + c0, tile[dt], 16 * sizeof(float));
             }
         }
     }
@@ -1145,23 +1198,24 @@ static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C
     }
 }
 
-// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T_valid, C_out]
+// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T_valid, dst_stride]
 static void unpack_npu_output(const DmaBuffer *src_buf, float *dst_tc, int T, int C_out,
-                              const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr, int T_valid = -1) {
+                              const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr,
+                              int T_valid = -1, int dst_stride = 0) {
     switch (sc.out_dtype) {
         case BoundaryDtype::Int8:
             if (dyntok_ratios) {
-                unpack_npu_output_int8_dyntok(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, dyntok_ratios, sc.out_step_chan, T_valid);
+                unpack_npu_output_int8_dyntok(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, dyntok_ratios, sc.out_step_chan, T_valid, dst_stride);
             } else {
-                unpack_npu_output_int8(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid);
+                unpack_npu_output_int8(src_buf->as<int8_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid, dst_stride);
             }
             break;
         case BoundaryDtype::Int16:
-            unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid);
+            unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid, dst_stride);
             break;
         case BoundaryDtype::Fp16:
         default:
-            unpack_npu_output_fp16(src_buf->as<uint16_t>(), dst_tc, T, C_out, T_valid);
+            unpack_npu_output_fp16(src_buf->as<uint16_t>(), dst_tc, T, C_out, T_valid, dst_stride);
             break;
     }
 }
@@ -1183,16 +1237,156 @@ public:
     static constexpr int kChunk = 64;
     static constexpr int kSwaCap = kSwaWin + kChunk; // 320 slots so T<=64 prefill never overwrites active SWA window
 
+    Lfm3Engine() = default;
+    ~Lfm3Engine() { stop_tp_worker(); }
+
+    void start_tp_worker() {
+        if (m_tp_worker_running || m_num_dies < 2) return;
+        // Force OpenMP thread pool initialization with full 8-core mask before restricting main thread away from Core 7
+        #pragma omp parallel
+        {
+            __asm__ volatile("" ::: "memory");
+        }
+        {
+            cpu_set_t main_set;
+            CPU_ZERO(&main_set);
+            for (int c = 0; c < 7; ++c) CPU_SET(c, &main_set); // Main thread on Cores 0..6 (never Core 7)
+            sched_setaffinity(0, sizeof(cpu_set_t), &main_set);
+        }
+        m_tp_stop.store(false, std::memory_order_relaxed);
+        m_tp_sleeping.store(false, std::memory_order_relaxed);
+        m_tp_prewake.store(false, std::memory_order_relaxed);
+        m_tp_seq.store(0, std::memory_order_relaxed);
+        m_tp_ack.store(0, std::memory_order_relaxed);
+        m_tp_worker_running = true;
+        m_tp_thread = std::thread([this]() {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(7, &cpuset); // Pin Die-1 dispatcher thread to Core 7 (NUMA Node 1 / Die 1)
+            sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+            uint64_t last_seq = 0;
+            while (true) {
+                uint64_t cur = m_tp_seq.load(std::memory_order_acquire);
+                if (cur == last_seq) {
+                    if (!m_tp_prewake.load(std::memory_order_acquire)) {
+                        std::unique_lock<std::mutex> lk(m_tp_mtx);
+                        m_tp_sleeping.store(true, std::memory_order_release);
+                        m_tp_cv.wait(lk, [&]() {
+                            cur = m_tp_seq.load(std::memory_order_acquire);
+                            return cur != last_seq ||
+                                   m_tp_prewake.load(std::memory_order_acquire) ||
+                                   m_tp_stop.load(std::memory_order_relaxed);
+                        });
+                        m_tp_sleeping.store(false, std::memory_order_relaxed);
+                    }
+                    while ((cur = m_tp_seq.load(std::memory_order_acquire)) == last_seq &&
+                           !m_tp_stop.load(std::memory_order_relaxed)) {
+#if defined(__riscv)
+                        __asm__ volatile("nop");
+#endif
+                    }
+                }
+                if (m_tp_stop.load(std::memory_order_relaxed)) break;
+                m_tp_prewake.store(false, std::memory_order_relaxed);
+                last_seq = cur;
+                if (m_tp_fn) (*m_tp_fn)();
+                m_tp_ack.store(last_seq, std::memory_order_release);
+            }
+        });
+    }
+
+    void prewake_tp_worker() {
+        if (!m_tp_worker_running || m_num_dies < 2) return;
+        if (!m_tp_prewake.load(std::memory_order_relaxed)) {
+            m_tp_prewake.store(true, std::memory_order_release);
+            if (m_tp_sleeping.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(m_tp_mtx);
+                m_tp_cv.notify_one();
+            }
+        }
+    }
+
+    void stop_tp_worker() {
+        if (!m_tp_worker_running) return;
+        {
+            std::lock_guard<std::mutex> lk(m_tp_mtx);
+            m_tp_stop.store(true, std::memory_order_relaxed);
+            m_tp_seq.fetch_add(1, std::memory_order_release);
+        }
+        m_tp_cv.notify_all();
+        if (m_tp_thread.joinable()) m_tp_thread.join();
+        m_tp_worker_running = false;
+    }
+
+    template <typename Fn0, typename Fn1>
+    void run_dual_die(Fn0 &&fn0, Fn1 &&fn1) {
+        if (m_tp_worker_running && m_num_dies >= 2) {
+            std::function<void()> f1(std::forward<Fn1>(fn1));
+            m_tp_fn = &f1;
+            uint64_t next_seq = m_tp_seq.load(std::memory_order_relaxed) + 1;
+            m_tp_seq.store(next_seq, std::memory_order_release);
+            if (m_tp_sleeping.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(m_tp_mtx);
+                m_tp_cv.notify_one();
+            }
+            fn0();
+            while (m_tp_ack.load(std::memory_order_acquire) != next_seq) {
+#if defined(__riscv)
+                __asm__ volatile("nop");
+#endif
+            }
+            m_tp_fn = nullptr;
+        } else {
+            fn0();
+            fn1();
+        }
+    }
+
+    static int peek_pkg_tp_degree(const std::string &dir) {
+        std::string map_path = dir + "/weights_map.json";
+        std::ifstream jf(map_path);
+        if (!jf.is_open()) return 0;
+        std::stringstream ss;
+        ss << jf.rdbuf();
+        std::string err;
+        JsonValue root = JsonValue::parse(ss.str(), err);
+        if (!err.empty() || !root.is_object()) return 0;
+        return root.has("tp_degree") ? static_cast<int>(root["tp_degree"].as_int64(1)) : 1;
+    }
+
     bool init(const std::string &pkg_dir, int max_ctx = 4096) {
         auto t_init0 = std::chrono::steady_clock::now();
         m_pkg_dir = pkg_dir;
+        int cur_tp = peek_pkg_tp_degree(m_pkg_dir);
+        if (m_requested_tp_degree == 2 && cur_tp != 2) {
+            for (const char *cand : {"/tp2", "/../LFM3-1.7B_TP2", "/../eswin_pkg_tp2"}) {
+                std::string cdir = m_pkg_dir + cand;
+                if (peek_pkg_tp_degree(cdir) == 2) {
+                    std::printf("[+] --tp2 selected: switching package directory %s -> %s\n",
+                                m_pkg_dir.c_str(), cdir.c_str());
+                    m_pkg_dir = cdir;
+                    break;
+                }
+            }
+        } else if (m_requested_tp_degree == 1 && cur_tp == 2) {
+            for (const char *cand : {"/../LFM3-1.7B_ENNP", "/../eswin_pkg_int8", "/../eswin_pkg"}) {
+                std::string cdir = m_pkg_dir + cand;
+                if (peek_pkg_tp_degree(cdir) == 1) {
+                    std::printf("[+] --pp2 selected: switching package directory %s -> %s\n",
+                                m_pkg_dir.c_str(), cdir.c_str());
+                    m_pkg_dir = cdir;
+                    break;
+                }
+            }
+        }
         // Round m_max_ctx up to a multiple of 2048 so every per-die half-layer (2 * m_max_ctx slots)
         // is an exact multiple of 4 KiB OS pages (and 2 MiB HugePages for FP32 KV caches).
         m_max_ctx = std::max(2048, (max_ctx + 2047) & ~2047);
 
         std::printf("=================================================================\n");
         std::printf(" LFM3-1.7B Tri-Hybrid Dual-Die Engine (Route D Class B)\n");
-        std::printf(" Package directory: %s (max_ctx=%d)\n", pkg_dir.c_str(), m_max_ctx);
+        std::printf(" Package directory: %s (max_ctx=%d)\n", m_pkg_dir.c_str(), m_max_ctx);
         std::printf("=================================================================\n\n");
 
         // 1. Load cpu_weights.bin & cpu_weights.json
@@ -1245,6 +1439,7 @@ public:
         }
         m_num_dies = m_pool.active_worker_count();
         std::printf("[+] Started WorkerPool with %u isolated NPU die worker(s)\n", m_num_dies);
+        start_tp_worker();
 
         for (uint16_t d = 0; d < 2; ++d) {
             uint16_t phys_die = (d < m_num_dies) ? d : 0;
@@ -1376,8 +1571,10 @@ public:
                                              &dm.lm_head[1], &dm.lm_head[2], &dm.lm_head[3]})
                 max_entry = std::max({max_entry, a->in_surface_bytes, a->out_surface_bytes});
 
-            size_t s_act1 = 4096, s_out1 = 32768, s_act64 = 262144, s_out64 = 786432;
-            size_t s_lmout = 32768;
+            size_t s_act1 = 4096;
+            size_t s_out1 = is_quant_active() ? 8192 : 32768;
+            size_t s_act64 = 262144, s_out64 = 786432;
+            size_t s_lmout = (dm.lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? 16384 : 32768;
             // Geometry-sized surface buffers (32 KiB for T=1 outputs, 256/768 KiB for T=64) are
             // the default, avoiding 74 x 2 MiB = 148 MiB/token of whole-allocation cache-flush
             // overhead (~54 ms/tok saved). As proven in FINDINGS §45.3, zero-initializing and
@@ -1474,6 +1671,7 @@ public:
         m_buf_h_mid.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_v.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_mlp_out.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_mlp_out_d1.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_gates.assign(static_cast<size_t>(kChunk) * kQHeads, 0.0f);
 
         auto t_init1 = std::chrono::steady_clock::now();
@@ -1547,6 +1745,7 @@ public:
         float *h_mid   = m_buf_h_mid.data();
         float *v       = m_buf_v.data();
         float *mlp_out = m_buf_mlp_out.data();
+        float *mlp_out_d1 = m_buf_mlp_out_d1.data();
         float *gates   = m_buf_gates.data();
 
         // Lookup FP16 embeddings -> FP32 for the T_valid tokens
@@ -1570,26 +1769,34 @@ public:
         bool surface_overflow = false;
 
         for (int l = 0; l < kNumLayers; ++l) {
-            uint16_t logical_die = (l < 12) ? 0 : 1;
-            uint16_t phys_die = (logical_die < m_num_dies) ? logical_die : 0;
-            const DieModels &dm = m_die_models[logical_die];
             const LayerNpuOffsets &no = m_layer_npu[l];
             const LayerCpuWeights &cw = m_layer_cpu[l];
-            DmaBuffer *act_buf = (T == 1) ? m_act_t1[logical_die].get() : m_act_t64[logical_die].get();
-            DmaBuffer *out_buf = (T == 1) ? m_out_t1[logical_die].get() : m_out_t64[logical_die].get();
-            DmaBuffer *w_buf   = m_w_blob[logical_die].get();
+            uint16_t logical_die = no.die_id;
+            uint16_t phys_die = (logical_die < m_num_dies) ? logical_die : 0;
+            const DieModels &dm    = m_die_models[logical_die];
+            const DieModels &dm_d0 = m_die_models[0];
+            const DieModels &dm_d1 = m_die_models[1];
+            DmaBuffer *act_buf    = (T == 1) ? m_act_t1[logical_die].get() : m_act_t64[logical_die].get();
+            DmaBuffer *out_buf    = (T == 1) ? m_out_t1[logical_die].get() : m_out_t64[logical_die].get();
+            DmaBuffer *w_buf      = m_w_blob[logical_die].get();
+            DmaBuffer *act_buf_d0 = (T == 1) ? m_act_t1[0].get() : m_act_t64[0].get();
+            DmaBuffer *out_buf_d0 = (T == 1) ? m_out_t1[0].get() : m_out_t64[0].get();
+            DmaBuffer *w_buf_d0   = m_w_blob[0].get();
+            DmaBuffer *act_buf_d1 = (T == 1) ? m_act_t1[1].get() : m_act_t64[1].get();
+            DmaBuffer *out_buf_d1 = (T == 1) ? m_out_t1[1].get() : m_out_t64[1].get();
+            DmaBuffer *w_buf_d1   = m_w_blob[1].get();
 
             // First region per archetype on this die, for --weights-layer0.
-            struct AbRegion { size_t off = 0, sz = 0; };
+            struct AbRegion { size_t off = 0, off_d1 = 0, sz = 0; };
             AbRegion ab[4] = {};
             if (m_ab_shared_weights) {
                 for (int j = (logical_die == 0) ? 0 : 12; j < (logical_die == 0 ? 12 : 24); ++j) {
                     const LayerNpuOffsets &o = m_layer_npu[j];
                     const bool is_conv = (kLayerSchedule[j] == Lfm3LayerType::Conv);
-                    if (!ab[0].sz && is_conv && o.op_in_size) ab[0] = {o.op_in_offset, o.op_in_size};
-                    if (!ab[1].sz && o.op_out_size)          ab[1] = {o.op_out_offset, o.op_out_size};
-                    if (!ab[2].sz && !is_conv && o.op_in_size) ab[2] = {o.op_in_offset, o.op_in_size};
-                    if (!ab[3].sz && o.mlp_size)             ab[3] = {o.mlp_offset, o.mlp_size};
+                    if (!ab[0].sz && is_conv && o.op_in_size)  ab[0] = {o.op_in_offset,  o.op_in_offset_d1,  o.op_in_size};
+                    if (!ab[1].sz && o.op_out_size)            ab[1] = {o.op_out_offset, o.op_out_offset_d1, o.op_out_size};
+                    if (!ab[2].sz && !is_conv && o.op_in_size) ab[2] = {o.op_in_offset,  o.op_in_offset_d1,  o.op_in_size};
+                    if (!ab[3].sz && o.mlp_size)               ab[3] = {o.mlp_offset,    o.mlp_offset_d1,    o.mlp_size};
                 }
             }
             const double weight_gb_total =
@@ -1600,7 +1807,7 @@ public:
                             weight_gb_total / 1e9);
 
             // Record cross-die handoff at Layer 12 boundary
-            if (l == 12) {
+            if (l == 12 && no.op_in_tp == 1) {
                 auto td0 = std::chrono::steady_clock::now();
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 auto td1 = std::chrono::steady_clock::now();
@@ -1618,6 +1825,10 @@ public:
             auto wsel = [&](int slot, size_t off, size_t sz) -> std::pair<size_t, size_t> {
                 if (!m_ab_shared_weights || ab[slot].sz == 0) return {off, sz};
                 return {ab[slot].off, ab[slot].sz};
+            };
+            auto wsel_d1 = [&](int slot, size_t off_d1) -> size_t {
+                if (!m_ab_shared_weights || ab[slot].sz == 0) return off_d1;
+                return ab[slot].off_d1;
             };
 
             auto submit_arch = [&](int arch_idx, uint32_t model_id,
@@ -1640,6 +1851,108 @@ public:
                                 weight_bytes);
                 return ok;
             };
+
+            auto submit_and_unpack = [&](int arch_idx,
+                                         int op_tp,
+                                         const LoadedArchetype &arch_single_or_d0,
+                                         const LoadedArchetype &arch_d1,
+                                         const std::pair<size_t, size_t> &w_slice,
+                                         size_t w_off_d1,
+                                         int C_in, int C_out_per_die, int dst_stride,
+                                         const SubgraphScaleInfo &sc_d0,
+                                         const SubgraphScaleInfo &sc_d1,
+                                         const float *dyn_ratios,
+                                         float *dst_d0, float *dst_d1,
+                                         double &npu_stage_ms,
+                                         double &cpu_unpack_ms,
+                                         bool already_broadcast = false) -> bool {
+                if (op_tp == 1) {
+                    act_buf->flush_cache();
+                    size_t in_b  = surf_or(act_buf, arch_single_or_d0.in_surface_bytes,  T, C_in,          sc_d0.in_dtype,  "pp2 act");
+                    size_t out_b = surf_or(out_buf, arch_single_or_d0.out_surface_bytes, T, C_out_per_die, sc_d0.out_dtype, "pp2 out");
+                    if (surface_overflow) return false;
+                    if (!submit_arch(arch_idx, arch_single_or_d0.id,
+                            {DmaBufferSlice{act_buf, 0, in_b},
+                             DmaBufferSlice{w_buf, w_slice.first, w_slice.second}},
+                            {DmaBufferSlice{out_buf, 0, out_b}}, out_buf,
+                            static_cast<double>(w_slice.second), npu_stage_ms)) {
+                        return false;
+                    }
+                    if (T == 1 && arch_idx == StageTimers::ARCH_PROJ2048 && no.mlp_tp == 2) prewake_tp_worker();
+                    auto tu0 = std::chrono::steady_clock::now();
+                    unpack_npu_output(out_buf, dst_d0, T, C_out_per_die, sc_d0, dyn_ratios, T_valid, dst_stride);
+                    auto tu1 = std::chrono::steady_clock::now();
+                    cpu_unpack_ms += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
+                    return true;
+                }
+
+                // TP=2 Dual-Die Concurrent Execution across Die 0 and Die 1
+                size_t in_b0  = surf_or(act_buf_d0, arch_single_or_d0.in_surface_bytes,  T, C_in,          sc_d0.in_dtype,  "tp2 act0");
+                size_t out_b0 = surf_or(out_buf_d0, arch_single_or_d0.out_surface_bytes, T, C_out_per_die, sc_d0.out_dtype, "tp2 out0");
+                size_t in_b1  = surf_or(act_buf_d1, arch_d1.in_surface_bytes,            T, C_in,          sc_d1.in_dtype,  "tp2 act1");
+                size_t out_b1 = surf_or(out_buf_d1, arch_d1.out_surface_bytes,           T, C_out_per_die, sc_d1.out_dtype, "tp2 out1");
+                if (surface_overflow) return false;
+
+                if (!already_broadcast) {
+                    const size_t copy_bytes = static_cast<size_t>(T) * C_in * dtype_elem_size(sc_d0.in_dtype);
+                    if (act_buf != act_buf_d0) {
+                        std::memcpy(act_buf_d0->data(), act_buf->data(), copy_bytes);
+                    }
+                    if (act_buf != act_buf_d1) {
+                        std::memcpy(act_buf_d1->data(), act_buf->data(), copy_bytes);
+                    }
+                }
+
+                bool ok0 = false, ok1 = false;
+                uint64_t drv0_ns = 0, drv1_ns = 0;
+                const uint16_t phys1 = (1 < m_num_dies) ? 1 : 0;
+                const auto s0 = std::chrono::steady_clock::now();
+
+                run_dual_die(
+                    [&]() {
+                        act_buf_d0->flush_cache();
+                        prime_guard(out_buf_d0);
+                        prime_input_tail(act_buf_d0, in_b0);
+                        ok0 = m_pool.submit_task(0, arch_single_or_d0.id,
+                            {DmaBufferSlice{act_buf_d0, 0, in_b0},
+                             DmaBufferSlice{w_buf_d0, w_slice.first, w_slice.second}},
+                            {DmaBufferSlice{out_buf_d0, 0, out_b0}}, &drv0_ns);
+                        if (ok0) out_buf_d0->flush_cache();
+                        if (ok0 && T_valid == 1) {
+                            unpack_npu_output(out_buf_d0, dst_d0, T, C_out_per_die, sc_d0, dyn_ratios, T_valid, dst_stride);
+                        }
+                    },
+                    [&]() {
+                        act_buf_d1->flush_cache();
+                        prime_guard(out_buf_d1);
+                        prime_input_tail(act_buf_d1, in_b1);
+                        ok1 = m_pool.submit_task(phys1, arch_d1.id,
+                            {DmaBufferSlice{act_buf_d1, 0, in_b1},
+                             DmaBufferSlice{w_buf_d1, w_off_d1, w_slice.second}},
+                            {DmaBufferSlice{out_buf_d1, 0, out_b1}}, &drv1_ns);
+                        if (ok1) out_buf_d1->flush_cache();
+                        if (ok1 && T_valid == 1) {
+                            unpack_npu_output(out_buf_d1, dst_d1, T, C_out_per_die, sc_d1, dyn_ratios, T_valid, dst_stride);
+                        }
+                    }
+                );
+
+                const auto s1 = std::chrono::steady_clock::now();
+                const double master_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
+                npu_stage_ms += master_ms;
+                const double drv_ms = static_cast<double>(std::max(drv0_ns, drv1_ns)) / 1e6;
+                timers.add_arch(arch_idx, master_ms, drv_ms, 2.0 * static_cast<double>(w_slice.second));
+                if (!ok0 || !ok1) return false;
+
+                if (T_valid > 1) {
+                    auto tu0 = std::chrono::steady_clock::now();
+                    unpack_npu_output(out_buf_d0, dst_d0, T, C_out_per_die, sc_d0, dyn_ratios, T_valid, dst_stride);
+                    unpack_npu_output(out_buf_d1, dst_d1, T, C_out_per_die, sc_d1, dyn_ratios, T_valid, dst_stride);
+                    auto tu1 = std::chrono::steady_clock::now();
+                    cpu_unpack_ms += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
+                }
+                return true;
+            };
             float op_in_ratios[64], op_out_ratios[64];
 
             // 1. Pre-operator Sandwich RMSNorm
@@ -1660,32 +1973,28 @@ public:
                 rms_norm_f32(h, cw.op_norm, u, T_valid, kHidden);
                 pack_npu_input(u, act_buf, T, kHidden, no.op_in_scale, op_in_ratios, T_valid);
             }
-            act_buf->flush_cache();
             auto tn1 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn1 - tn0).count();
 
             if (kLayerSchedule[l] == Lfm3LayerType::Conv) {
                 // --- Primitive 2: Gated ShortConv Layer ---
-                const LoadedArchetype &m_in  = (T == 1) ? dm.conv_in_t1  : dm.conv_in_t64;
-                const LoadedArchetype &m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
-                size_t in_bytes  = surf_or(act_buf, m_in.in_surface_bytes,   T, 2048, no.op_in_scale.in_dtype,  "conv_in act");
-                size_t mid_bytes = surf_or(out_buf, m_in.out_surface_bytes,  T, 6144, no.op_in_scale.out_dtype, "conv_in mid");
-                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype,  "conv_out act");
-                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype, "conv_out out");
-                if (surface_overflow) return false;
+                const LoadedArchetype &m_in     = (T == 1) ? dm.conv_in_t1     : dm.conv_in_t64;
+                const LoadedArchetype &m_in_d1  = (T == 1) ? dm_d1.conv_in_t1  : dm_d1.conv_in_t64;
+                const LoadedArchetype &m_out    = (T == 1) ? dm.proj2048_t1    : dm.proj2048_t64;
+                const LoadedArchetype &m_out_d1 = (T == 1) ? dm_d1.proj2048_t1 : dm_d1.proj2048_t64;
 
                 const auto conv_in_w = wsel(0, no.op_in_offset, no.op_in_size);
-                if (!submit_arch(StageTimers::ARCH_CONV_IN, m_in.id,
-                        {DmaBufferSlice{act_buf, 0, in_bytes},
-                         DmaBufferSlice{w_buf, conv_in_w.first, conv_in_w.second}},
-                        {DmaBufferSlice{out_buf, 0, mid_bytes}}, out_buf,
-                        static_cast<double>(conv_in_w.second), timers.npu_layer_ms)) {
+                const size_t conv_in_w_d1 = wsel_d1(0, no.op_in_offset_d1);
+                const int conv_in_c_out = (no.op_in_tp == 2) ? 3072 : 6144;
+                if (!submit_and_unpack(StageTimers::ARCH_CONV_IN, no.op_in_tp, m_in, m_in_d1,
+                        conv_in_w, conv_in_w_d1, 2048, conv_in_c_out, 6144,
+                        no.op_in_scale, no.op_in_scale_d1,
+                        op_in_ratios, bcx, bcx + 3072, timers.npu_layer_ms, timers.cpu_conv_ms)) {
                     return false;
                 }
 
                 // CPU 7-tap depthwise ShortConv state update
                 auto tconv0 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, bcx, T, 6144, no.op_in_scale, op_in_ratios, T_valid);
                 float *layer_st = m_conv_state.data() + static_cast<size_t>(conv_idx) * kHidden * 6;
                 const float *w_conv = cw.conv_weight;
 
@@ -1724,41 +2033,35 @@ public:
                 }
                 conv_idx++;
                 pack_npu_input(y, act_buf, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
-                act_buf->flush_cache();
                 auto tconv1 = std::chrono::steady_clock::now();
                 timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tconv1 - tconv0).count();
 
                 const auto proj_w = wsel(1, no.op_out_offset, no.op_out_size);
-                if (!submit_arch(StageTimers::ARCH_PROJ2048, m_out.id,
-                        {DmaBufferSlice{act_buf, 0, oin_bytes},
-                         DmaBufferSlice{w_buf, proj_w.first, proj_w.second}},
-                        {DmaBufferSlice{out_buf, 0, out_bytes}}, out_buf,
-                        static_cast<double>(proj_w.second), timers.npu_layer_ms)) {
+                const size_t proj_w_d1 = wsel_d1(1, no.op_out_offset_d1);
+                const int proj_c_out = (no.op_out_tp == 2) ? 1024 : 2048;
+                if (!submit_and_unpack(StageTimers::ARCH_PROJ2048, no.op_out_tp, m_out, m_out_d1,
+                        proj_w, proj_w_d1, 2048, proj_c_out, 2048,
+                        no.op_out_scale, no.op_out_scale_d1,
+                        op_out_ratios, op_out, op_out + 1024, timers.npu_layer_ms, timers.cpu_conv_ms)) {
                     return false;
                 }
-
-                auto tn2 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, op_out, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
-                auto tn3 = std::chrono::steady_clock::now();
-                timers.cpu_conv_ms += std::chrono::duration<double, std::milli>(tn3 - tn2).count();
 
             } else {
                 // --- Primitive 3: SWA or Global GQA Attention Layer ---
                 bool is_swa = (kLayerSchedule[l] == Lfm3LayerType::SlidingAttention);
-                const LoadedArchetype &m_qkv = (T == 1) ? dm.attn_qkv_t1 : dm.attn_qkv_t64;
-                const LoadedArchetype &m_out = (T == 1) ? dm.proj2048_t1 : dm.proj2048_t64;
-                size_t in_bytes  = surf_or(act_buf, m_qkv.in_surface_bytes,  T, 2048, no.op_in_scale.in_dtype,  "attn_qkv act");
-                size_t qkv_bytes = surf_or(out_buf, m_qkv.out_surface_bytes, T, 3072, no.op_in_scale.out_dtype, "attn_qkv out");
-                size_t oin_bytes = surf_or(act_buf, m_out.in_surface_bytes,  T, 2048, no.op_out_scale.in_dtype,  "attn_out act");
-                size_t out_bytes = surf_or(out_buf, m_out.out_surface_bytes, T, 2048, no.op_out_scale.out_dtype, "attn_out out");
-                if (surface_overflow) return false;
+                const LoadedArchetype &m_qkv    = (T == 1) ? dm.attn_qkv_t1    : dm.attn_qkv_t64;
+                const LoadedArchetype &m_qkv_d1 = (T == 1) ? dm_d1.attn_qkv_t1 : dm_d1.attn_qkv_t64;
+                const LoadedArchetype &m_out    = (T == 1) ? dm.proj2048_t1    : dm.proj2048_t64;
+                const LoadedArchetype &m_out_d1 = (T == 1) ? dm_d1.proj2048_t1 : dm_d1.proj2048_t64;
+                double &attn_cpu_timer = is_swa ? timers.cpu_swa_ms : timers.cpu_glob_ms;
 
                 const auto qkv_w = wsel(2, no.op_in_offset, no.op_in_size);
-                if (!submit_arch(StageTimers::ARCH_ATTN_QKV, m_qkv.id,
-                        {DmaBufferSlice{act_buf, 0, in_bytes},
-                         DmaBufferSlice{w_buf, qkv_w.first, qkv_w.second}},
-                        {DmaBufferSlice{out_buf, 0, qkv_bytes}}, out_buf,
-                        static_cast<double>(qkv_w.second), timers.npu_layer_ms)) {
+                const size_t qkv_w_d1 = wsel_d1(2, no.op_in_offset_d1);
+                const int qkv_c_out = (no.op_in_tp == 2) ? 1536 : 3072;
+                if (!submit_and_unpack(StageTimers::ARCH_ATTN_QKV, no.op_in_tp, m_qkv, m_qkv_d1,
+                        qkv_w, qkv_w_d1, 2048, qkv_c_out, 3072,
+                        no.op_in_scale, no.op_in_scale_d1,
+                        op_in_ratios, qkv, qkv + 1536, timers.npu_layer_ms, attn_cpu_timer)) {
                     return false;
                 }
 
@@ -1792,7 +2095,6 @@ public:
 
                 // QK-Norm + RoPE + KV Cache Update + GQA Attention
                 auto tattn0 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, qkv, T, 3072, no.op_in_scale, op_in_ratios, T_valid);
 
                 float *k_cache = is_swa
                     ? (m_swa_k.data() + static_cast<size_t>(swa_idx) * kSwaCap * kKvHeads * kHeadDim)
@@ -1886,34 +2188,39 @@ public:
                 }
 
                 pack_npu_input(y, act_buf, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
-                act_buf->flush_cache();
                 auto tattn1 = std::chrono::steady_clock::now();
-                double attn_dt = std::chrono::duration<double, std::milli>(tattn1 - tattn0).count();
-                if (is_swa) timers.cpu_swa_ms += attn_dt;
-                else        timers.cpu_glob_ms += attn_dt;
+                attn_cpu_timer += std::chrono::duration<double, std::milli>(tattn1 - tattn0).count();
 
                 const auto proj_w = wsel(1, no.op_out_offset, no.op_out_size);
-                if (!submit_arch(StageTimers::ARCH_PROJ2048, m_out.id,
-                        {DmaBufferSlice{act_buf, 0, oin_bytes},
-                         DmaBufferSlice{w_buf, proj_w.first, proj_w.second}},
-                        {DmaBufferSlice{out_buf, 0, out_bytes}}, out_buf,
-                        static_cast<double>(proj_w.second), timers.npu_layer_ms)) {
+                const size_t proj_w_d1 = wsel_d1(1, no.op_out_offset_d1);
+                const int proj_c_out = (no.op_out_tp == 2) ? 1024 : 2048;
+                if (!submit_and_unpack(StageTimers::ARCH_PROJ2048, no.op_out_tp, m_out, m_out_d1,
+                        proj_w, proj_w_d1, 2048, proj_c_out, 2048,
+                        no.op_out_scale, no.op_out_scale_d1,
+                        op_out_ratios, op_out, op_out + 1024, timers.npu_layer_ms, attn_cpu_timer)) {
                     return false;
                 }
-
-                auto tattn2 = std::chrono::steady_clock::now();
-                unpack_npu_output(out_buf, op_out, T, kHidden, no.op_out_scale, op_out_ratios, T_valid);
-                auto tattn3 = std::chrono::steady_clock::now();
-                if (is_swa) timers.cpu_swa_ms += std::chrono::duration<double, std::milli>(tattn3 - tattn2).count();
-                else        timers.cpu_glob_ms += std::chrono::duration<double, std::milli>(tattn3 - tattn2).count();
             }
+
+            // Pre-wake Die 1 TP worker now (after proj2048 NPU wait has finished) on T=1 decode so its futex wakeup
+            // overlaps with single-threaded post_operator_norm + ffn_norm + INT8 pack (~80 us) without contending with OpenMP
+            if (T == 1 && no.mlp_tp == 2) prewake_tp_worker();
 
             // 2. Sandwich post_operator_norm + Residual + ffn_norm
             auto tn4 = std::chrono::steady_clock::now();
+            bool mlp_bcast_done = false;
             if (T == 1 && !cw.ffn_norm_scaled.empty() && no.mlp_scale.in_dtype == BoundaryDtype::Int8) {
-                fused_post_op_residual_ffn_pack_mlp_t1(op_out, cw.post_op_norm, h, h_mid,
-                                                       cw.ffn_norm_scaled.data(),
-                                                       act_buf->as<int8_t>(), kHidden);
+                if (no.mlp_tp == 2) {
+                    fused_post_op_residual_ffn_pack_mlp_t1(op_out, cw.post_op_norm, h, h_mid,
+                                                           cw.ffn_norm_scaled.data(),
+                                                           act_buf_d0->as<int8_t>(), kHidden, 1e-5f,
+                                                           act_buf_d1->as<int8_t>());
+                    mlp_bcast_done = true;
+                } else {
+                    fused_post_op_residual_ffn_pack_mlp_t1(op_out, cw.post_op_norm, h, h_mid,
+                                                           cw.ffn_norm_scaled.data(),
+                                                           act_buf->as<int8_t>(), kHidden);
+                }
             } else if (T > 1 && !cw.ffn_norm_smooth.empty() && no.mlp_scale.in_dtype == BoundaryDtype::Int8) {
                 rms_norm_f32(op_out, cw.post_op_norm, op_out, T_valid, kHidden);
                 #pragma omp simd
@@ -1927,30 +2234,34 @@ public:
                 rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
                 pack_npu_input(v, act_buf, T, kHidden, no.mlp_scale, nullptr, T_valid);
             }
-            act_buf->flush_cache();
             auto tn5 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn5 - tn4).count();
 
             // 3. SwiGLU MLP on NPU
-            const LoadedArchetype &m_mlp = (T == 1) ? dm.mlp_t1 : dm.mlp_t64;
-            size_t mlp_in_bytes  = surf_or(act_buf, m_mlp.in_surface_bytes,  T, 2048, no.mlp_scale.in_dtype,  "mlp act");
-            size_t mlp_out_bytes = surf_or(out_buf, m_mlp.out_surface_bytes, T, 2048, no.mlp_scale.out_dtype, "mlp out");
-            if (surface_overflow) return false;
+            const LoadedArchetype &m_mlp_0  = (no.mlp_tp == 2)
+                ? ((T == 1) ? dm_d0.mlp_t1 : dm_d0.mlp_t64)
+                : ((T == 1) ? dm.mlp_t1    : dm.mlp_t64);
+            const LoadedArchetype &m_mlp_d1 = (T == 1) ? dm_d1.mlp_t1 : dm_d1.mlp_t64;
             const auto mlp_w = wsel(3, no.mlp_offset, no.mlp_size);
-            if (!submit_arch(StageTimers::ARCH_MLP, m_mlp.id,
-                    {DmaBufferSlice{act_buf, 0, mlp_in_bytes},
-                     DmaBufferSlice{w_buf, mlp_w.first, mlp_w.second}},
-                    {DmaBufferSlice{out_buf, 0, mlp_out_bytes}}, out_buf,
-                    static_cast<double>(mlp_w.second), timers.npu_layer_ms)) {
+            const size_t mlp_w_d1 = wsel_d1(3, no.mlp_offset_d1);
+            if (!submit_and_unpack(StageTimers::ARCH_MLP, no.mlp_tp, m_mlp_0, m_mlp_d1,
+                    mlp_w, mlp_w_d1, 2048, 2048, 2048,
+                    no.mlp_scale, no.mlp_scale_d1,
+                    nullptr, mlp_out, mlp_out_d1, timers.npu_layer_ms, timers.cpu_norm_ms,
+                    mlp_bcast_done)) {
                 return false;
             }
 
             // 4. Sandwich post_ffn_norm + Residual
             auto tn6 = std::chrono::steady_clock::now();
-            unpack_npu_output(out_buf, mlp_out, T, kHidden, no.mlp_scale, nullptr, T_valid);
             if (T == 1) {
-                fused_post_ffn_residual_t1(mlp_out, cw.post_ffn_norm, h_mid, h, kHidden);
+                fused_post_ffn_residual_t1(mlp_out, cw.post_ffn_norm, h_mid, h, kHidden, 1e-5f,
+                                           (no.mlp_tp == 2) ? mlp_out_d1 : nullptr);
             } else {
+                if (no.mlp_tp == 2) {
+                    #pragma omp simd
+                    for (int i = 0; i < T_valid * kHidden; ++i) mlp_out[i] += mlp_out_d1[i];
+                }
                 rms_norm_f32(mlp_out, cw.post_ffn_norm, mlp_out, T_valid, kHidden);
                 #pragma omp simd
                 for (int i = 0; i < T_valid * kHidden; ++i) h[i] = h_mid[i] + mlp_out[i];
@@ -2050,15 +2361,10 @@ public:
             }
         };
 
-        if (m_num_dies >= 2) {
-            std::thread th0(run_die_lm_head, 0, std::ref(ok_d0));
-            std::thread th1(run_die_lm_head, 1, std::ref(ok_d1));
-            th0.join();
-            th1.join();
-        } else {
-            run_die_lm_head(0, ok_d0);
-            run_die_lm_head(1, ok_d1);
-        }
+        run_dual_die(
+            [&]() { run_die_lm_head(0, ok_d0); },
+            [&]() { run_die_lm_head(1, ok_d1); }
+        );
         auto tlm1 = std::chrono::steady_clock::now();
         timers.npu_lmhead_ms += std::chrono::duration<double, std::milli>(tlm1 - tlm0).count();
         for (int d = 0; d < 2; ++d)
@@ -2132,6 +2438,10 @@ public:
     void set_quant_options(bool force_int8, bool use_shared_archetype_scales) {
         m_force_int8 = force_int8;
         m_use_shared_archetype_scales = use_shared_archetype_scales;
+    }
+
+    void set_parallel_mode(int tp_degree) {
+        m_requested_tp_degree = tp_degree;
     }
 
     /// Binds every layer of a die to one weight region per archetype. Timing experiment only:
@@ -3316,11 +3626,17 @@ private:
             return false;
         }
 
+        if (root.has("tp_degree") && root["tp_degree"].as_int64(1) == 2) {
+            m_tp_degree = 2;
+            std::printf("[+] Tensor Parallelism enabled: TP=%d across both NPU dies\n", m_tp_degree);
+        } else {
+            m_tp_degree = 1;
+        }
+
         for (int l = 0; l < kNumLayers; ++l) {
             char pfx[32];
             std::snprintf(pfx, sizeof(pfx), "lfm3_l%02d_", l);
             std::string s_pfx(pfx);
-            m_layer_npu[l].die_id = (l < 12) ? 0 : 1;
 
             std::string k_in  = s_pfx + ((kLayerSchedule[l] == Lfm3LayerType::Conv) ? "conv_in"  : "attn_qkv");
             std::string k_out = s_pfx + ((kLayerSchedule[l] == Lfm3LayerType::Conv) ? "conv_out" : "attn_out");
@@ -3330,12 +3646,22 @@ private:
                 std::printf("FAIL: missing layer %d entries in weights_map.json\n", l);
                 return false;
             }
-            m_layer_npu[l].op_in_offset  = static_cast<size_t>(root[k_in]["weight_offset"].as_int64(0));
-            m_layer_npu[l].op_in_size    = static_cast<size_t>(root[k_in]["weight_size"].as_int64(0));
-            m_layer_npu[l].op_out_offset = static_cast<size_t>(root[k_out]["weight_offset"].as_int64(0));
-            m_layer_npu[l].op_out_size   = static_cast<size_t>(root[k_out]["weight_size"].as_int64(0));
-            m_layer_npu[l].mlp_offset    = static_cast<size_t>(root[k_mlp]["weight_offset"].as_int64(0));
-            m_layer_npu[l].mlp_size      = static_cast<size_t>(root[k_mlp]["weight_size"].as_int64(0));
+            m_layer_npu[l].op_in_tp         = static_cast<uint8_t>(root[k_in]["tp_degree"].as_int64(m_tp_degree));
+            m_layer_npu[l].op_out_tp        = static_cast<uint8_t>(root[k_out]["tp_degree"].as_int64(m_tp_degree));
+            m_layer_npu[l].mlp_tp           = static_cast<uint8_t>(root[k_mlp]["tp_degree"].as_int64(m_tp_degree));
+            m_layer_npu[l].die_id           = (m_layer_npu[l].op_in_tp == 2) ? 0 : ((l < 12) ? 0 : 1);
+            m_layer_npu[l].op_in_offset     = static_cast<size_t>(root[k_in]["weight_offset"].as_int64(0));
+            m_layer_npu[l].op_in_offset_d1  = static_cast<size_t>(root[k_in].has("weight_offset_d1")
+                ? root[k_in]["weight_offset_d1"].as_int64(0) : root[k_in]["weight_offset"].as_int64(0));
+            m_layer_npu[l].op_in_size       = static_cast<size_t>(root[k_in]["weight_size"].as_int64(0));
+            m_layer_npu[l].op_out_offset    = static_cast<size_t>(root[k_out]["weight_offset"].as_int64(0));
+            m_layer_npu[l].op_out_offset_d1 = static_cast<size_t>(root[k_out].has("weight_offset_d1")
+                ? root[k_out]["weight_offset_d1"].as_int64(0) : root[k_out]["weight_offset"].as_int64(0));
+            m_layer_npu[l].op_out_size      = static_cast<size_t>(root[k_out]["weight_size"].as_int64(0));
+            m_layer_npu[l].mlp_offset       = static_cast<size_t>(root[k_mlp]["weight_offset"].as_int64(0));
+            m_layer_npu[l].mlp_offset_d1    = static_cast<size_t>(root[k_mlp].has("weight_offset_d1")
+                ? root[k_mlp]["weight_offset_d1"].as_int64(0) : root[k_mlp]["weight_offset"].as_int64(0));
+            m_layer_npu[l].mlp_size         = static_cast<size_t>(root[k_mlp]["weight_size"].as_int64(0));
         }
         return true;
     }
@@ -3446,6 +3772,18 @@ private:
                             l, qs_path.c_str());
                 return false;
             }
+            m_layer_npu[l].op_in_scale_d1  = m_layer_npu[l].op_in_scale;
+            m_layer_npu[l].op_out_scale_d1 = m_layer_npu[l].op_out_scale;
+            m_layer_npu[l].mlp_scale_d1    = m_layer_npu[l].mlp_scale;
+            if (m_layer_npu[l].op_in_tp == 2 && m_layer_npu[l].op_in_scale_d1.out_step_chan) {
+                m_layer_npu[l].op_in_scale_d1.out_step_chan += (is_conv ? 3072 : 1536);
+            }
+            if (m_layer_npu[l].op_out_tp == 2 && m_layer_npu[l].op_out_scale_d1.out_step_chan) {
+                m_layer_npu[l].op_out_scale_d1.out_step_chan += 1024;
+            }
+            if (m_layer_npu[l].mlp_tp == 2 && m_layer_npu[l].mlp_scale_d1.out_step_chan) {
+                m_layer_npu[l].mlp_scale_d1.out_step_chan += 2048;
+            }
         }
 
         for (uint16_t d = 0; d < 2; ++d) {
@@ -3505,6 +3843,18 @@ private:
     int m_max_ctx = 4096;
     int m_pos = 0;
     uint16_t m_num_dies = 1;
+    int m_tp_degree = 1;
+    int m_requested_tp_degree = 0; // 0 = auto from weights_map.json, 1 = --pp2, 2 = --tp2
+    bool m_tp_worker_running = false;
+    std::thread m_tp_thread;
+    std::mutex m_tp_mtx;
+    std::condition_variable m_tp_cv;
+    std::atomic<uint64_t> m_tp_seq{0};
+    std::atomic<uint64_t> m_tp_ack{0};
+    std::atomic<bool> m_tp_stop{false};
+    std::atomic<bool> m_tp_sleeping{false};
+    std::atomic<bool> m_tp_prewake{false};
+    std::function<void()> *m_tp_fn = nullptr;
     bool m_force_int8 = false;
     bool m_use_shared_archetype_scales = true;
     bool m_ab_shared_weights = false;   // --weights-layer0: timing experiment, numerics invalid
@@ -3551,7 +3901,7 @@ private:
     std::vector<float> m_scores_ws;
     std::vector<float> m_logits;
     std::vector<float> m_buf_h, m_buf_u, m_buf_u_smooth, m_buf_bcx, m_buf_qkv, m_buf_y,
-                       m_buf_op_out, m_buf_h_mid, m_buf_v, m_buf_mlp_out, m_buf_gates;
+                       m_buf_op_out, m_buf_h_mid, m_buf_v, m_buf_mlp_out, m_buf_mlp_out_d1, m_buf_gates;
 };
 
 static double cosine_similarity(const float *a, const float *b, size_t n) {
@@ -3838,6 +4188,7 @@ int main(int argc, char **argv) {
     bool force_int8 = false;
     bool use_shared_archetype_scales = true;
     bool ab_shared_weights = false;
+    int requested_tp_degree = 0;
     bool daemon_mode = false;
     int daemon_port = 8088;
 
@@ -3884,6 +4235,8 @@ int main(int argc, char **argv) {
         else if (a == "--no-think") enable_thinking = false;
         else if (a == "--bench-attn") bench_attn = true;
         else if (a == "--int8") force_int8 = true;
+        else if (a == "--tp2" || a == "--tp") requested_tp_degree = 2;
+        else if (a == "--pp2" || a == "--pp") requested_tp_degree = 1;
         else if (a == "--per-subgraph-scales") use_shared_archetype_scales = false;
         else if (a == "--weights-layer0") ab_shared_weights = true;
         else if (a == "--daemon" || a == "--server") {
@@ -3894,11 +4247,13 @@ int main(int argc, char **argv) {
         }
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--int8] [--per-subgraph-scales] [--weights-layer0]\n"
+                        "          [--int8] [--pp2 | --tp2] [--per-subgraph-scales] [--weights-layer0]\n"
                         "          [--prompt TEXT | --prompt-file FILE | -f FILE]\n"
                         "          [--max-tokens N | -n N] [--max-ctx N] [--no-think]\n"
                         "          [--temp F] [--top-k K] [--repeat-penalty F]\n"
                         "          [--daemon [PORT]]\n"
+                        "  --pp2             Layer-Parallel (PP=2): Layers 0..11 on Die 0, Layers 12..23 on Die 1.\n"
+                        "  --tp2             Tensor-Parallel (TP=2): All 24 layers split across Die 0 and Die 1.\n"
                         "  --weights-layer0  Timing experiment: bind every layer of a die to one\n"
                         "                    weight region per archetype to separate NPU streaming\n"
                         "                    speed from per-submit overhead. Generated text is garbage.\n",
@@ -3909,6 +4264,7 @@ int main(int argc, char **argv) {
 
     Lfm3Engine engine;
     engine.set_quant_options(force_int8, use_shared_archetype_scales);
+    engine.set_parallel_mode(requested_tp_degree);
     engine.set_ab_shared_weights(ab_shared_weights);
     engine.set_extent_probe(std::getenv("LFM3_MEASURE_EXTENT") != nullptr, 2u << 20);
     if (bench_attn && verify_golden_path.empty() && prompt.empty()) {

@@ -1,19 +1,21 @@
 # LFM3-1.7B on the ESWIN EIC7700X (dual-die)
 
 Native C++17 engine (`lfm3_v2`) for LiquidAI's LFM3-1.7B tri-hybrid backbone: 13 gated short
-convolutions, 5 sliding-window attentions (256) and 6 global attentions across 24 layers, run
-layer-pipelined over both NPU dies (`PP=2`, layers 0-11 on die 0, 12-23 on die 1) with a
-tensor-parallel LM head split 8 x 16,000.
+convolutions, 5 sliding-window attentions (256) and 6 global attentions across 24 layers, supporting
+both **Hybrid 2-Way Tensor Parallelism (`--tp2`, `TP=2` across both NPU dies)** and **Layer-Pipelined
+Parallelism (`--pp2`, `PP=2`, layers 0-11 on die 0, 12-23 on die 1)** with a tensor-parallel LM head
+split 8 x 16,000.
 
-Design and milestones live in `PLAN.md`. Measurements live in `../../FINDINGS.md` (§36-§47).
+Design and milestones live in `PLAN.md`. Measurements live in `../../FINDINGS.md` (§36-§50).
 This file is only "how to run what is already built".
 
 ## 1. Which build to run today
 
-| package | accuracy gate | decode | prefill (41 / 286 tok) | use it for |
+| package | accuracy gate | decode (short / 4K ctx) | prefill (4K C code) | use it for |
 |---|---|---|---|---|
-| **FP16** (`LFM3-1.7B_FP16`) | **PASSES** -- logits cosine 0.99999111 vs PyTorch FP32, min-layer 0.99998251, 4/4 greedy (§43.1, §47) | **6.19 tok/s** (`161.5 ms/tok`) | ~30 tok/s | highest-precision reference |
-| **INT8** (`LFM3-1.7B_ENNP`) | **PASSES** -- logits cosine **0.99594256** vs PyTorch FP32, min-layer **0.98892771**, **4/4 greedy** (`[17479, 20, 309, 358]`, §46.5, §47.4) | **8.96 tok/s** (`111.6 ms/tok`) | **55.5 / 72.1 tok/s** (`18.0 / 13.9 ms/tok`) | fast, reduced-memory (`0.88 GiB/die`) INT8 deployment |
+| **FP16** (`LFM3-1.7B_FP16`, `--pp2`) | **PASSES** -- logits cosine 0.99999111 vs PyTorch FP32, min-layer 0.99998251, 4/4 greedy (§43.1, §47) | **6.19 tok/s** (`161.5 ms/tok`) | ~30 tok/s | highest-precision reference |
+| **INT8 Hybrid `TP=2`** (`LFM3-1.7B_ENNP --tp2`) | **PASSES** -- logits cosine **0.99243842** vs PyTorch FP32, min-layer **0.98038221**, **4/4 greedy** (`[17479, 20, 309, 358]`, §50) | **11.34 / 9.18 tok/s** (`88.2 / 109.8 ms/tok`) | **73.9 tok/s** (`83.9 tok/s` peak, `13.5 ms/tok`) | fastest INT8 dual-die deployment (`0.88 GiB/die`) |
+| **INT8 Layer-Parallel `PP=2`** (`LFM3-1.7B_ENNP --pp2`) | **PASSES** -- logits cosine **0.99563595** vs PyTorch FP32, min-layer **0.98887394**, **4/4 greedy** (`[17479, 20, 309, 358]`, §46.5, §50) | **10.49 / 8.93 tok/s** (`95.4 / 112.9 ms/tok`) | **67.8 tok/s** (`72.9 tok/s` peak, `14.8 ms/tok`) | layer-pipelined INT8 baseline (`0.88 GiB/die`) |
 | mixed, FP16 `proj2048` (`LFM3-1.7B_MIXED`) | FAILS -- min-layer 0.857, logits 0.816 (pre-§46.5 ablation artifact, §43.2) | ~5.1 tok/s | -- | historical ablation only |
 
 Both **FP16** (`LFM3-1.7B_FP16`) and **INT8** (`LFM3-1.7B_ENNP`, after the §46.5 SmoothQuant +
@@ -30,20 +32,22 @@ Everything runs natively on `roma` (`ssh roma`), and the NPU character devices (
 ssh roma
 cd /home/chri/models/LFM3-1.7B_ENNP   # Or LFM3-1.7B_FP16 (omit --int8 for FP16)
 
-# 1. One-shot command line prompt
-sudo ./lfm3_v2 --int8 --prompt "Explain depthwise convolution in one sentence." -n 64
+# 1. One-shot command line prompt (Hybrid TP=2 or Layer-Parallel PP=2)
+sudo ./lfm3_v2 --int8 --tp2 --prompt "Explain depthwise convolution in one sentence." -n 64
+sudo ./lfm3_v2 --int8 --pp2 --prompt "Explain depthwise convolution in one sentence." -n 64
 
 # 2. Prompt from file (codebase analysis / benchmarking)
-sudo ./lfm3_v2 --int8 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
+sudo ./lfm3_v2 --int8 --tp2 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
 
 # 3. Interactive terminal chat REPL (supports /image <path>, /nothink, /exit)
-sudo ./lfm3_v2 --int8
+sudo ./lfm3_v2 --int8 --tp2
 
 # 4. Resident background daemon (listening on port 8088 for OpenAI server or d1_runner)
-sudo ./lfm3_v2 --int8 --daemon 8088
+sudo ./lfm3_v2 --int8 --tp2 --daemon 8088
 
-# 5. Full acceptance gate (golden numerical verification & determinism tests)
-sudo ./lfm3_v2 --verify-golden golden_ref.bin
+# 5. Full acceptance gate (golden numerical verification & determinism tests in both modes)
+sudo ./lfm3_v2 --int8 --tp2 --verify-golden golden_ref.bin
+sudo ./lfm3_v2 --int8 --pp2 --verify-golden golden_ref.bin
 
 # 6. Global attention kernel micro-benchmark
 sudo ./lfm3_v2 --bench-attn
@@ -60,6 +64,8 @@ sudo ./lfm3_v2 --bench-attn
 | `--prompt TEXT` | `-p` | `""` | One-shot user prompt text (starts with `@FILE` to load from file). |
 | `--prompt-file FILE` | `-f` | `""` | Path to text/source file to use as prompt (ideal for multi-KB code/benchmarks). |
 | `--int8` | | `false` | Enable INT8/INT16 boundary scaling for quantized packages (`LFM3-1.7B_ENNP`, `Heretic`). **Do not use with FP16.** |
+| `--tp2` / `--tp` | | `auto` | Select 2-way Tensor-Parallel execution (`TP=2`) across both NPU dies (automatically switches `.` $\to$ `./tp2` if present). |
+| `--pp2` / `--pp` | | `auto` | Select Layer-Parallel execution (`PP=2`, Layers 0–11 on Die 0, 12–23 on Die 1). |
 | `--no-think` | | `false` | Disable internal `<think>` loops, forcing instant generation of the direct answer. |
 | `--max-tokens N` | `-n` | `128` | Maximum new tokens to decode autoregressively. |
 | `--max-ctx N` | | `4096` | Context window size in tokens (supports up to `32768`–`40960` for 32K prompts). |
@@ -103,7 +109,9 @@ $V export_lfm3.py                             # 74 static 4D opset-13 ONNX + CPU
 $V batch_compile_lfm3.py                      # EsAAC -> .model loadables + manifest (M3, container)
 $V export_lfm3_prefill.py                     # T=64 prefill graphs               (M3.5)
 $V calibrate_lfm3_int8.py                     # real-activation INT8 tables      (M5)
-$V build_lfm3_int8_pkg.py                     # INT8 package via the NVDLA tiler (M5)
+$V build_lfm3_int8_pkg.py                     # INT8 PP=2 package via NVDLA tiler (M5)
+$V export_lfm3_tp2.py                         # half-width TP=2 ONNX archetypes  (M7)
+$V build_lfm3_tp2_pkg.py                      # INT8 Hybrid TP=2 package         (M7)
 $V build_mixed_proj2048_fp16.py               # mixed FP16-proj2048 package
 ```
 
@@ -409,8 +417,9 @@ Run a single-turn prefill and generation with thinking disabled (`--no-think`) a
 ssh roma
 cd /home/chri/models/LFM3-1.7B_ENNP
 
-# Prefill 3,781 tokens, generate up to 1024 tokens
-sudo ./lfm3_v2 --int8 -f bench_c_code_4k.c --no-think -n 1024 --max-ctx 8192
+# Prefill 3,781 tokens, generate up to 1024 tokens (in TP=2 or PP=2 mode)
+sudo ./lfm3_v2 --int8 --tp2 -f bench_c_code_4k.c --no-think -n 1024 --max-ctx 8192
+sudo ./lfm3_v2 --int8 --pp2 -f bench_c_code_4k.c --no-think -n 1024 --max-ctx 8192
 ```
 
 ### 9.2 Full 32K Token Context Window Benchmark (~7–8 minutes)
@@ -438,9 +447,9 @@ During execution:
   ```
 - **Performance Report**: Upon completing generation, the engine displays the exact prefill and decode metrics:
   ```text
-  [Prefill: 3781 tok in 59168.8 ms (63.90 tok/s, 15.6 ms/tok) | Decode: 128 tok at 7.84 tok/s (128.6 ms/tok)]
+  [Prefill: 3781 tok in 51149.2 ms (73.92 tok/s, 13.5 ms/tok) | Decode: 128 tok at 9.18 tok/s (109.8 ms/tok)]
   ```
-  - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs while the 8 P550 CPU cores execute L2-tiled, NUMA-pinned (`mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE` 2 MiB HugePages) batched INT8 64-bit SWAR attention (`63.90 tok/s` sustained over 3,781 tokens, peaking at `74.4 tok/s`).
-  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (`9.44 tok/s` at short context, `7.96 tok/s` at `~4,000` tokens context with fused SmoothQuant RMSNorm).
+  - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs while the 8 P550 CPU cores execute L2-tiled, NUMA-pinned (`mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE` 2 MiB HugePages) batched INT8 64-bit SWAR attention (**`73.92 tok/s` sustained over 3,781 tokens, peaking at `83.9 tok/s` in `--tp2` mode**, and **`67.76 tok/s` sustained / `72.9 tok/s` peak in `--pp2` mode**).
+  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (**`11.34 tok/s` at short context and `9.18 tok/s` at `~4,000` tokens context in `--tp2` mode**, vs **`10.49 tok/s` short context and `8.93 tok/s` at `~4,000` tokens context in `--pp2` mode**).
 
 
