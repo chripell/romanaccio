@@ -1766,6 +1766,7 @@ public:
         size_t visual_idx = 0;
         if (!force_t1) {
             constexpr int kPrefillBatch = 64;
+            auto t_pref0 = std::chrono::steady_clock::now();
             while (idx < n) {
                 int step = std::min(kPrefillBatch, n - idx);
                 bool is_last = (idx + step == n);
@@ -1776,6 +1777,16 @@ public:
                     return false;
                 }
                 idx += step;
+                if (n > 128 && (idx % (kPrefillBatch * 4) == 0 || is_last)) {
+                    double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pref0).count();
+                    double cur_tok_s = (elapsed_s > 0.0) ? (idx / elapsed_s) : 0.0;
+                    std::printf("\r[Prefill progress: %d/%d tokens (%.1f%%) | %.1f tok/s]   ",
+                                idx, n, (100.0 * idx) / n, cur_tok_s);
+                    std::fflush(stdout);
+                }
+            }
+            if (n > 128) {
+                std::printf("\n");
             }
             return true;
         }
@@ -3161,7 +3172,29 @@ int main(int argc, char **argv) {
         };
         if (a == "--model-dir" || a == "-m") pkg_dir = next_arg();
         else if (a == "--verify-golden") verify_golden_path = next_arg();
-        else if (a == "--prompt" || a == "-p") prompt = next_arg();
+        else if (a == "--prompt" || a == "-p") {
+            std::string arg = next_arg();
+            if (!arg.empty() && arg[0] == '@') {
+                std::string path = arg.substr(1);
+                std::ifstream ifs(path);
+                if (!ifs) {
+                    std::fprintf(stderr, "Failed to open prompt file: %s\n", path.c_str());
+                    std::exit(1);
+                }
+                prompt = std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            } else {
+                prompt = arg;
+            }
+        }
+        else if (a == "--prompt-file" || a == "-f") {
+            std::string path = next_arg();
+            std::ifstream ifs(path);
+            if (!ifs) {
+                std::fprintf(stderr, "Failed to open prompt file: %s\n", path.c_str());
+                std::exit(1);
+            }
+            prompt = std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        }
         else if (a == "--system") system_prompt = next_arg();
         else if (a == "--max-tokens" || a == "-n") max_new_tokens = std::stoi(next_arg());
         else if (a == "--max-ctx") max_ctx = std::stoi(next_arg());
@@ -3181,11 +3214,14 @@ int main(int argc, char **argv) {
         }
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--int8] [--per-subgraph-scales] [--weights-layer0] [--prompt TEXT] [--max-tokens N]\n"
+                        "          [--int8] [--per-subgraph-scales] [--weights-layer0]\n"
+                        "          [--prompt TEXT | --prompt-file FILE | -f FILE]\n"
+                        "          [--max-tokens N | -n N] [--max-ctx N] [--no-think]\n"
+                        "          [--temp F] [--top-k K] [--repeat-penalty F]\n"
+                        "          [--daemon [PORT]]\n"
                         "  --weights-layer0  Timing experiment: bind every layer of a die to one\n"
                         "                    weight region per archetype to separate NPU streaming\n"
-                        "                    speed from per-submit overhead. Generated text is garbage.\n"
-                        "          [--temp F] [--top-k K] [--no-think]\n",
+                        "                    speed from per-submit overhead. Generated text is garbage.\n",
                         argv[0]);
             return 0;
         }
@@ -3498,8 +3534,10 @@ int main(int argc, char **argv) {
         if (in_think) std::cout << COLOR_RESET;
         double dec_s = decode_t.total_ms() / 1000.0;
         double tok_s = (dec_s > 0.0) ? ((decode_t.tokens_run + 1) / dec_s) : 0.0;
-        std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok)]%s\n\n",
-                    COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(),
+        double pref_s = prefill_t.total_ms() / 1000.0;
+        double pref_tok_s = (pref_s > 0.0) ? (prompt_ids.size() / pref_s) : 0.0;
+        std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok)]%s\n\n",
+                    COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(), pref_tok_s,
                     prefill_t.total_ms() / std::max<size_t>(1, prompt_ids.size()),
                     decode_t.tokens_run + 1, tok_s,
                     decode_t.total_ms() / std::max(1, decode_t.tokens_run), COLOR_RESET);

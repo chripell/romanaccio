@@ -366,4 +366,59 @@ Measured on `roma`:
 - **Decode Speed**: **`9.02 tokens/sec`** (`112.6 ms/token`).
 - Fully accessible via the resident daemon and OpenAI endpoint (`"model": "lfm3-1.7b-heretic"`).
 
+---
+
+## 9. Prefill Throughput & Large Context Window Benchmarks (4K–32K)
+
+Benchmarking LLM prefill speed requires a representative workload. Rather than artificial repetitive sequences (e.g. repeated words or synthetic patterns that compress trivially or skew attention distributions), real C source code provides the gold standard:
+- **Realistic BPE Distribution**: Tests tokens spanning identifiers, control flow keywords, punctuation, indentation, and function declarations.
+- **Hierarchical Dependency Chains**: Stresses KV-cache preservation across nested blocks, header declarations, and implementation scopes.
+- **Authentic Engineering Workload**: Measures how quickly the model digests a multi-thousand-line codebase before answering developer queries.
+
+Two self-contained benchmark source files are included:
+1. `bench_c_code_4k.c` (~3,781 ChatML prefill tokens): A fast validation benchmark completing in ~55 seconds.
+2. `bench_c_code_32k.c` (~31,762 ChatML prefill tokens): A full 32K context stress test encompassing the complete ESWIN contiguous DMA allocator, NUMA worker pool, multi-die mailbox driver, and hardware KV-cache.
+
+### 9.1 Fast 4K Token Prefill Benchmark (~55 seconds)
+
+Run a single-turn prefill and generation with thinking disabled (`--no-think`) and a 1024-token response budget:
+
+```bash
+ssh roma
+cd /home/chri/models/LFM3-1.7B_ENNP
+
+# Prefill 3,781 tokens, generate up to 1024 tokens
+sudo ./lfm3_v2 --int8 -f bench_c_code_4k.c --no-think -n 1024 --max-ctx 8192
+```
+
+### 9.2 Full 32K Token Context Window Benchmark (~7–8 minutes)
+
+For the full 32K context window evaluation:
+- Use `-f bench_c_code_32k.c` (or `--prompt-file bench_c_code_32k.c`) as the prompt.
+- Set `--max-ctx 36864` (or `40960`) so the engine allocates sufficient host KV-cache headroom for both the 31,762 prefill tokens and the 4,096 response tokens.
+- Set `-n 4096` to allow a comprehensive technical explanation.
+- Pass `--no-think` to prevent the model from spending generation cycles inside internal `<think>` loops.
+
+```bash
+ssh roma
+cd /home/chri/models/LFM3-1.7B_ENNP
+
+# Full 32K context benchmark: 31,762 prefill tokens + up to 4,096 generated tokens
+sudo ./lfm3_v2 --int8 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
+```
+
+### 9.3 Live Progress & Output Metrics
+
+During execution:
+- **Live Prefill Progress**: When running prompts over 128 tokens, `lfm3_v2` dynamically prints chunked progress updates:
+  ```text
+  [Prefill progress: 24576/31762 tokens (77.4%) | 71.2 tok/s]
+  ```
+- **Performance Report**: Upon completing generation, the engine displays the exact prefill and decode metrics:
+  ```text
+  [Prefill: 31762 tok in 446720.0 ms (71.10 tok/s, 14.1 ms/tok) | Decode: 412 tok at 9.02 tok/s (110.8 ms/tok)]
+  ```
+  - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs.
+  - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (~9.0 tok/s on INT8).
+
 
