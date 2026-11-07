@@ -22,39 +22,61 @@ golden accuracy, gate-integrity (determinism, sensitivity, restore), and 4/4 gre
 
 ## 2. Run it
 
-Everything is on `roma` (`ssh roma`), and the NPU nodes need root (`sudo`).
+Everything runs natively on `roma` (`ssh roma`), and the NPU character devices (`/dev/eic7700_npu*`, `/dev/es_mem`) require root privileges (`sudo`).
+
+### 2.1 Common Invocations by Use Case
 
 ```bash
 ssh roma
-cd /home/chri/models/LFM3-1.7B_FP16
+cd /home/chri/models/LFM3-1.7B_ENNP   # Or LFM3-1.7B_FP16 (omit --int8 for FP16)
 
-# one-shot prompt
-sudo ./lfm3_v2 --prompt "Explain what a depthwise convolution does in one sentence." -n 64
+# 1. One-shot command line prompt
+sudo ./lfm3_v2 --int8 --prompt "Explain depthwise convolution in one sentence." -n 64
 
-# the full acceptance gate: 6-token teacher-forced prefill, cosine per layer,
-# 4-token greedy match against the golden, 16-token sustained throughput
+# 2. Prompt from file (codebase analysis / benchmarking)
+sudo ./lfm3_v2 --int8 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
+
+# 3. Interactive terminal chat REPL (supports /image <path>, /nothink, /exit)
+sudo ./lfm3_v2 --int8
+
+# 4. Resident background daemon (listening on port 8088 for OpenAI server or d1_runner)
+sudo ./lfm3_v2 --int8 --daemon 8088
+
+# 5. Full acceptance gate (golden numerical verification & determinism tests)
 sudo ./lfm3_v2 --verify-golden golden_ref.bin
+
+# 6. Global attention kernel micro-benchmark
+sudo ./lfm3_v2 --bench-attn
 ```
 
-**`--model-dir` matters, and silently.** The engine now resolves its package from the **current
-working directory** (falling back to the well-known board paths, and failing loudly if it finds
-no `cpu_weights.bin`). It prints the resolved absolute path and, per die, the weight blob's path
-with an FNV checksum of its first and last 64 KiB. Until §43 this defaulted to a hardcoded path,
-which made a package-swap experiment "reproduce" the previous package's numbers bit for bit -- so
-**check those two lines before believing any result**.
+**`--model-dir` matters, and silently.** The engine resolves its package from the **current working directory** (falling back to well-known board paths, and failing loudly if it finds no `cpu_weights.bin`). It prints the resolved absolute path and, per die, the weight blob's path with an FNV checksum of its first and last 64 KiB. Always check those lines before recording performance numbers.
 
-Useful flags and environment variables:
+---
 
-| | meaning |
-|---|---|
-| `--int8` | force INT8/INT16 boundary scaling (the INT8 and mixed packages need it; **FP16 must not have it** -- FP16 weights under INT8 scaling give cosine ≈ -0.06, worse than chance) |
-| `--per-subgraph-scales` | use per-subgraph thresholds instead of the shared per-archetype ones |
-| `--verify-golden FILE` | run the acceptance gate; exits non-zero if it fails |
-| `--max-tokens N`, `--max-ctx N` | generation and context limits |
-| `--weights-layer0` | timing experiment only: bind every layer to one weight region per archetype, to separate NPU streaming speed from per-submit overhead. **Generated text is garbage.** |
-| `LFM3_DUMP_SURFACES=1` | print what `ModelInfo` reports for every input/output slot at load time |
-| `LFM3_MEASURE_EXTENT=1` | write-extent probe: sentinel-fill each output buffer, submit, report the high-water mark per archetype (§45). Slow; diagnostic only |
-| `LFM3_WIDE_SURFACES=1` | force legacy `2 MiB` driver-bucket output buffers instead of the default deterministic `32 KiB` / `256-768 KiB` geometry-sized surfaces (§47.1) |
+### 2.2 CLI Flags & Environment Variables Reference
+
+| Flag / Option | Short | Default | Description |
+|---|---|---|---|
+| `--prompt TEXT` | `-p` | `""` | One-shot user prompt text (starts with `@FILE` to load from file). |
+| `--prompt-file FILE` | `-f` | `""` | Path to text/source file to use as prompt (ideal for multi-KB code/benchmarks). |
+| `--int8` | | `false` | Enable INT8/INT16 boundary scaling for quantized packages (`LFM3-1.7B_ENNP`, `Heretic`). **Do not use with FP16.** |
+| `--no-think` | | `false` | Disable internal `<think>` loops, forcing instant generation of the direct answer. |
+| `--max-tokens N` | `-n` | `128` | Maximum new tokens to decode autoregressively. |
+| `--max-ctx N` | | `4096` | Context window size in tokens (supports up to `32768`–`40960` for 32K prompts). |
+| `--daemon [PORT]` | `--server` | `8088` | Run as resident socket daemon for the OpenAI REST server or `d1_runner.py`. |
+| `--model-dir DIR` | `-m` | `.` | Directory containing `cpu_weights.bin`, `weights_die*.bin`, `embedding.bin`. |
+| `--system TEXT` | | `"You are a..."` | Custom system prompt for ChatML template. |
+| `--temp F` | | `0.1` | Sampling temperature ($F \ge 0.0$). |
+| `--top-k K` | | `50` | Top-k vocabulary sampling filter. |
+| `--repeat-penalty F`| | `1.1` | Sliding-window repetition penalty. |
+| `--verify-golden FILE`| | `""` | Run golden verification acceptance gate against golden tensor file. |
+| `--bench-attn` | | `false` | Benchmark CPU global attention kernel throughput. |
+| `--per-subgraph-scales`| | `false` | Use per-subgraph scale entries instead of shared archetype scales. |
+| `--weights-layer0` | | `false` | Bandwidth timing experiment only: reuses layer 0 weights across all layers. **Outputs garbage text.** |
+| `LFM3_PREFILL_T1=1` | env | `0` | Force sequential unbatched $T=1$ prefill (diagnostic only; batched $T=64$ is default). |
+| `LFM3_DUMP_SURFACES=1`| env | `0` | Print detailed NPU input/output surface descriptors at load time. |
+| `LFM3_MEASURE_EXTENT=1`| env | `0` | Sentinel-fill buffers to probe actual NPU byte write extents (§45). Slow. |
+| `LFM3_WIDE_SURFACES=1`| env | `0` | Force legacy 2 MiB driver-bucket output buffers instead of compact geometry surfaces. |
 
 ### Gate-integrity checks (built in, not optional)
 
