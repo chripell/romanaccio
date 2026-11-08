@@ -394,6 +394,95 @@ void WorkerChannel::run_worker_loop() {
                 break;
             }
 
+            case IpcCmd::SubmitExpertBatch: {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                if (is_hw) {
+                    driver.set_device(m_die_id);
+                    uint8_t batch_n = req.output_count;
+                    uint64_t act_snd = req.inputs[0].mem_fd;
+                    auto it_act = rcvd_fds.find(act_snd);
+                    uint64_t act_fd = (it_act != rcvd_fds.end()) ? it_act->second : act_snd;
+                    int ret = 0;
+                    for (uint8_t b = 0; b < batch_n && b < 8; ++b) {
+                        NpuTask task{};
+                        task.modelId = req.model_id;
+                        task.inputFdNum = 2;
+                        task.outputFdNum = 1;
+                        task.inputFd[0].mem_fd   = act_fd;
+                        task.inputFd[0].offset   = req.inputs[0].offset;
+                        task.inputFd[0].size     = req.inputs[0].size;
+                        task.inputFd[0].reserved = 0;
+
+                        uint64_t w_snd = req.inputs[1 + b].mem_fd;
+                        auto it_w = rcvd_fds.find(w_snd);
+                        task.inputFd[1].mem_fd   = (it_w != rcvd_fds.end()) ? it_w->second : w_snd;
+                        task.inputFd[1].offset   = req.inputs[1 + b].offset;
+                        task.inputFd[1].size     = req.inputs[1 + b].size;
+                        task.inputFd[1].reserved = 0;
+
+                        uint64_t o_snd = req.outputs[b].mem_fd;
+                        auto it_o = rcvd_fds.find(o_snd);
+                        task.outputFd[0].mem_fd   = (it_o != rcvd_fds.end()) ? it_o->second : o_snd;
+                        task.outputFd[0].offset   = req.outputs[b].offset;
+                        task.outputFd[0].size     = req.outputs[b].size;
+                        task.outputFd[0].reserved = 0;
+
+                        ret = driver.submit_task(&task, 1);
+                        if (ret != 0) break;
+                    }
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    resp.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                    resp.status = (ret == 0) ? IpcStatus::Success : IpcStatus::ErrorExecutionFailed;
+                    resp.driver_error = ret;
+                } else {
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    resp.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                    resp.status = IpcStatus::Success;
+                }
+                break;
+            }
+
+            case IpcCmd::SubmitLmHeadBatch: {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                if (is_hw) {
+                    driver.set_device(m_die_id);
+                    uint8_t batch_n = req.output_count;
+                    uint64_t act_snd = req.inputs[0].mem_fd;
+                    auto it_act = rcvd_fds.find(act_snd);
+                    uint64_t act_fd = (it_act != rcvd_fds.end()) ? it_act->second : act_snd;
+                    int ret = 0;
+                    for (uint8_t b = 0; b < batch_n && b < 4; ++b) {
+                        NpuTask task{};
+                        task.modelId = static_cast<uint32_t>(req.inputs[1 + b].mem_fd);
+                        task.inputFdNum = 1;
+                        task.outputFdNum = 1;
+                        task.inputFd[0].mem_fd   = act_fd;
+                        task.inputFd[0].offset   = req.inputs[0].offset;
+                        task.inputFd[0].size     = req.inputs[0].size;
+                        task.inputFd[0].reserved = 0;
+
+                        uint64_t o_snd = req.outputs[b].mem_fd;
+                        auto it_o = rcvd_fds.find(o_snd);
+                        task.outputFd[0].mem_fd   = (it_o != rcvd_fds.end()) ? it_o->second : o_snd;
+                        task.outputFd[0].offset   = req.outputs[b].offset;
+                        task.outputFd[0].size     = req.outputs[b].size;
+                        task.outputFd[0].reserved = 0;
+
+                        ret = driver.submit_task(&task, 1);
+                        if (ret != 0) break;
+                    }
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    resp.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                    resp.status = (ret == 0) ? IpcStatus::Success : IpcStatus::ErrorExecutionFailed;
+                    resp.driver_error = ret;
+                } else {
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    resp.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                    resp.status = IpcStatus::Success;
+                }
+                break;
+            }
+
             case IpcCmd::Shutdown: {
                 if (is_hw) {
                     for (auto &pair : rcvd_fds) {
@@ -645,6 +734,80 @@ bool WorkerPool::submit_task(
     for (const DmaBuffer *b : inputs) in_slices.push_back(DmaBufferSlice{b});
     for (const DmaBuffer *b : outputs) out_slices.push_back(DmaBufferSlice{b});
     return submit_task(die_id, model_id, in_slices, out_slices, out_elapsed_ns);
+}
+
+bool WorkerPool::submit_expert_batch(
+    uint16_t die_id,
+    uint32_t model_id,
+    const DmaBufferSlice &act_input,
+    const std::vector<DmaBufferSlice> &weight_inputs,
+    const std::vector<DmaBufferSlice> &outputs,
+    uint64_t *out_elapsed_ns
+) {
+    if (die_id >= m_channels.size() || !m_channels[die_id]) return false;
+    if (weight_inputs.empty() || weight_inputs.size() != outputs.size() || weight_inputs.size() > 8) {
+        return false;
+    }
+
+    std::vector<DmaBufferSlice> all_inputs;
+    all_inputs.reserve(1 + weight_inputs.size());
+    all_inputs.push_back(act_input);
+    for (const auto &w : weight_inputs) all_inputs.push_back(w);
+
+    IpcRequest req{};
+    req.cmd = IpcCmd::SubmitExpertBatch;
+    req.model_id = model_id;
+
+    size_t n_inputs = 0, n_outputs = 0;
+    SliceError err = fill_ipc_buffers(all_inputs, req.inputs, kIpcBufferSlots, n_inputs);
+    if (err == SliceError::Success) {
+        err = fill_ipc_buffers(outputs, req.outputs, kIpcBufferSlots, n_outputs);
+    }
+    if (err != SliceError::Success) return false;
+
+    req.input_count = static_cast<uint8_t>(n_inputs);
+    req.output_count = static_cast<uint8_t>(n_outputs);
+
+    IpcResponse resp{};
+    if (m_channels[die_id]->send_request(req, resp)) {
+        if (out_elapsed_ns) *out_elapsed_ns = resp.elapsed_ns;
+        return true;
+    }
+    return false;
+}
+
+bool WorkerPool::submit_lm_head_batch(
+    uint16_t die_id,
+    const uint32_t model_ids[4],
+    const DmaBufferSlice &act_input,
+    const DmaBufferSlice outputs[4],
+    uint64_t *out_elapsed_ns
+) {
+    if (die_id >= m_channels.size() || !m_channels[die_id]) return false;
+
+    IpcRequest req{};
+    req.cmd = IpcCmd::SubmitLmHeadBatch;
+    req.model_id = model_ids[0];
+
+    std::vector<DmaBufferSlice> act_vec{act_input};
+    std::vector<DmaBufferSlice> out_vec{outputs[0], outputs[1], outputs[2], outputs[3]};
+    size_t n_in = 0, n_out = 0;
+    if (fill_ipc_buffers(act_vec, req.inputs, 1, n_in) != SliceError::Success) return false;
+    if (fill_ipc_buffers(out_vec, req.outputs, 4, n_out) != SliceError::Success) return false;
+    for (int s = 0; s < 4; ++s) {
+        req.inputs[1 + s].mem_fd = model_ids[s];
+        req.inputs[1 + s].offset = 0;
+        req.inputs[1 + s].size   = 0;
+    }
+    req.input_count = 5;
+    req.output_count = 4;
+
+    IpcResponse resp{};
+    if (m_channels[die_id]->send_request(req, resp)) {
+        if (out_elapsed_ns) *out_elapsed_ns = resp.elapsed_ns;
+        return true;
+    }
+    return false;
 }
 
 } // namespace eswin

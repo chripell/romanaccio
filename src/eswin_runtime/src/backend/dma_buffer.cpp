@@ -40,6 +40,11 @@ DmaBuffer::DmaBuffer(size_t size, CacheMode cache_mode, const char *zone)
             driver.mem_free(m_mem_fd);
             m_mem_fd = 0;
         }
+        // Never fall back to posix_memalign in normal OS RAM when hardware is present:
+        // a multi-GB fallback allocation silently exhausts Linux OS RAM (~7.8 GiB total).
+        m_vaddr = nullptr;
+        m_size = 0;
+        return;
     }
 
     // Host development / fallback path

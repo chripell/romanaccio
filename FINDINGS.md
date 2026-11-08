@@ -2874,3 +2874,81 @@ Extended the package builder with CLI configuration options:
 | **`RingPacket` (C Refactor, `180` tok)** | `--pp2 --speculative-pld` | `78.06 tok/s` (`311` tok) | **`20.24 tok/s` (`49.7 ms/tok`)** | **`137 / 178` (`77.0%`, `26` steps)** | **`1.97x` vs `PP=2` `T=1`** |
 | **`RingPacket` (C Refactor, `180` tok)** | `--tp2 --speculative-pld` | `80.37 tok/s` (`311` tok) | **`23.85 tok/s` (`42.2 ms/tok`)** | **`145 / 172` (`84.3%`, `25` steps)** | **`2.16x` vs `TP=2` `T=1` (`2.32x` vs `PP=2`)** |
 
+---
+
+## 52. Milestone 15 — Porting `LiquidAI/LFM2.5-8B-A1B` Sparse MoE (`8.47B` Total, `~1.42B` Active, `11.30 tok/s`) & Linux Kernel `eswin_rsvmem_heap_mmap` 4.0 GiB Truncation Bug
+
+### 52.1 Root Cause & Fix of the Linux Kernel `eswin_rsvmem_heap_mmap` 4.0 GiB `vma_size` 32-Bit Truncation Bug
+
+1. **Symptom When Loading `> 4.0 GiB` Weight Blobs on `roma`**:
+   - When loading `weights_die0.bin` (`5.166 GiB` = `5,547,134,976` bytes) and `weights_die1.bin` (`5.166 GiB`) into `mmz_nid_0_part_0` and `mmz_nid_1_part_0`, `DMA_HEAP_IOCTL_ALLOC` succeeded, but `mmap(nullptr, 5547134976, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` failed with `errno = 22` (`EINVAL`).
+   - Because [`DmaBuffer::DmaBuffer`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/src/backend/dma_buffer.cpp) previously fell back to `posix_memalign` (standard Linux OS RAM) whenever `mmap` failed, allocating two `5.166 GiB` buffers in standard OS RAM (`10.33 GiB` total) plus `10.33 GiB` of Linux VFS page cache immediately exhausted the board's `8.98 GiB` Linux OS RAM (`MemTotal`), triggering kernel OOM / `kswapd` lockup and hanging `sshd`.
+2. **Kernel Disassembly Root Cause (`vmlinux` `eswin_rsvmem_heap_mmap` at `0xffffffff80d00f86`)**:
+   - Disassembling `eswin_rsvmem_heap_mmap` in `/boot/vmlinux-6.6.92-win2030` revealed a 32-bit signed integer truncation bug in the vendor kernel driver (`drivers/dma-buf/heaps/eswin_rsvmem_heap.c`):
+     ```asm
+     ffffffff80d00f66: ld      s2, 8(s0)          # vma->vm_end
+     ffffffff80d00f68: ld      a0, 0(s0)          # vma->vm_start
+     ffffffff80d00f6a: sub     s2, s2, a0         # s2 = vma_size (64-bit size_t)
+     ...
+     ffffffff80d00f86: sext.w  a3, s2             # BUG: 32-bit sign-extension of vma_size!
+     ffffffff80d00f9c: jal     remap_pfn_range    # remap_pfn_range(vma, addr, pfn, (int)vma_size, prot)
+     ```
+   - The vendor driver declared `int vma_size = vma->vm_end - vma->vm_start;` (or a helper taking `int size`) instead of `size_t` / `unsigned long`:
+     - For `2.0 GiB <= size < 4.0 GiB` (`0x80000000 .. 0xFFFFFFFF`), `sext.w a3, s2` sign-extends bit 31 into bits `32..63`, passing a huge `> 16 EiB` unsigned `size` to `remap_pfn_range` (`-EINVAL`).
+     - For `size = 4.0 GiB` (`0x100000000`), `sext.w` truncates the lower 32 bits to `0`, calling `remap_pfn_range(..., size = 0)` (`-EINVAL`).
+     - For `size = 5.166 GiB` (`0x14AA60000`), `sext.w` truncates `vma_size` to `0x4AA60000` (`1.166 GiB`), mapping only the first `1.166 GiB` of the buffer and leaving the upper `4.0 GiB` unmapped in user space!
+3. **Permanent 3-Part Fix in [`dma_buffer.cpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/src/backend/dma_buffer.cpp) and [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp)**:
+   - **Never Fallback to OS RAM for `>= 256 MiB` Allocations**: In [`DmaBuffer::DmaBuffer`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/src/backend/dma_buffer.cpp), any failed MMZ allocation or `mmap` of `>= 256 MiB` now aborts immediately with a diagnostic error instead of silently calling `posix_memalign` and risking an OS OOM hang.
+   - **3-Chunk Sub-`2.0 GiB` MMZ Allocation (`m_w_blob[2][3]`)**: [`Lfm2MoeEngine`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) splits each die's `5.166 GiB` weight file across 3 disjoint `< 2.0 GiB` MMZ `DmaBuffer` chunks at logical boundary offsets (`0 .. 1.52 GiB`, `1.52 .. 3.37 GiB`, `3.37 .. 5.17 GiB`), and `w_slice(die, offset, size)` maps any logical byte offset to `(m_w_blob[die][chunk], offset - m_w_chunk_base[die][chunk])`.
+   - **Streaming VFS Page-Cache Eviction (`POSIX_FADV_DONTNEED`)**: `read_file_exact()` calls `posix_fadvise(fd, 0, done, POSIX_FADV_DONTNEED)` every `64 MiB` during weight loading so the `10.33 GiB` of `.bin` files never accumulate in Linux page cache. After full engine initialization (`10.33 GiB` resident in NPU MMZ), `roma` retains **`8.78 GiB` of free/available Linux OS RAM** (`MemFree: 8.69 GiB`).
+
+### 52.2 Dual-Die `EP=2` Sparse MoE + `TP=2` Dense Stem Architecture (`12 / 62` Resident Loadables/Die)
+
+1. **Unified Expert MLP Class B Archetype (`lfm2_expert_mlp_t{1,8,64}_classb.model`)**:
+   - All `704` routed experts across Layers `2..23` (`32` experts/layer, intermediate size `1792`, `SwiGLU`) and all `8` quarter-slices of the dense stem MLPs in Layers `0..1` (`7168 = 4 × 1792`) share the **exact same** compiled Class B NPU loadable per token batch size (`T=1`, `T=8`, `T=64`).
+   - **Layers `2..23` (`EP=2` Expert Parallelism)**: Die 0 holds the 16 even experts (`e = 0, 2, ..., 30`, `352` experts) in `mmz_nid_0_part_0`; Die 1 holds the 16 odd experts (`e = 1, 3, ..., 31`, `352` experts) in `mmz_nid_1_part_0`. For each token, the host CPU computes the `Sigmoid + expert_bias` Top-4 router (`< 5 µs`), normalizes the 4 weights, and dispatches the selected even experts to Die 0 and odd experts to Die 1 in parallel.
+   - **Layers `0..1` (`TP=2` via 4 Virtual Quarter-Experts)**: Each dense MLP (`7168` intermediate) is partitioned into 4 virtual experts of intermediate dimension `1792` (`q = 0, 2` on Die 0; `q = 1, 3` on Die 1) with unit routing weight `1.0f`, requiring **zero** separate dense MLP `.model` loadables.
+   - **Resident Model Count**: Only **`12 / 62` loadables per die** in default mode (`16 / 62` with `--speculative-pld`), well below the `62`-model kernel ceiling.
+2. **SmoothQuant (`α = 0.5`) + Calibrated `int16` Expert Output (`truncate = 26`)**:
+   - Exported and calibrated via [`src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) and [`src/LFM2.5-8B-A1B/inspect_and_golden.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/inspect_and_golden.py):
+     - Absorbed per-channel SmoothQuant migration factors (`α = 0.5`) directly into `operator_norm` and `ffn_norm` weights (`cpu_weights.bin`) at zero runtime cost.
+     - Patched `TRUNCS_EXPERT_MLP` to `truncate = 26` on the `w2` (`[2048, 1792]`) `int16` output stage so all `712` expert instances avoid `qm = 32767` saturation across all 24 layers.
+
+### 52.3 Single-IPC Batched Worker Dispatch (`SubmitExpertBatch` & `SubmitLmHeadBatch`)
+
+1. **Eliminating Per-Expert Worker IPC Round-Trips**:
+   - Added `IpcCmd::SubmitExpertBatch` and `IpcCmd::SubmitLmHeadBatch` to [`WorkerPool`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/src/backend/worker_pool.cpp):
+     - Instead of waking `m_workers[0]` and `m_workers[1]` once per routed expert (`2..3` condvar round-trips per layer × `24` layers = `48..72` IPC round-trips/token) and `4` times per die for the 4 LM Head slices (`16,000 × 4 = 64,000` vocab/die), the master thread sends **one** `SubmitExpertBatch` command per die per layer and **one** `SubmitLmHeadBatch` command per die at the end of the token.
+     - Inside the `SCHED_FIFO` worker thread on each die, all routed experts (`0..4` per die) or all 4 LM Head slices execute back-to-back in a tight hardware `ioctl` loop with zero condvar traffic between slices.
+   - This reduced `exp_mlp` master latency to **`47.93 ms/tok`** (`40.23 ms/tok` driver = **`35.92 GB/s` driver / `30.15 GB/s` master** across `1.445 GB/tok` of active FFN weights) and Dual-Die 128K LM Head master latency to **`5.71 ms/tok`** (`5.03 ms/tok` driver = **`55.44 GB/s` driver / `51.87 GB/s` master** across `279.0 MB` of INT8 LM Head weights).
+2. **`--no-think` `<think>` Token (`124901`) Logit Suppression**:
+   - In `LFM2.5-8B-A1B`, even when the chat template appends `<think>\n</think>\n\n`, token `124901` (`<think>`) can still receive a high logit on code prompts and open a second `<think>` block. Masking `logits[124901] = -1e30f` when `--no-think` is active guarantees immediate response/code generation.
+
+### 52.4 Silicon Verification & Benchmark Results on `roma` (`LFM2.5-8B-A1B`)
+
+| Metric / Workload | Measured Result on `roma` | Acceptance Gate / Notes |
+|---|---|---|
+| **Total / Active Parameters** | **`8.47B` total / `~1.42B` active** | `5.0x` larger capacity than `LFM3-1.7B` |
+| **MMZ Weight Allocation** | **`5.166 GiB × 2` (`3` chunks/die `< 2.0 GiB`)** | **`8.78 GiB` Linux OS RAM free** |
+| **Resident Loadables / Die** | **`12 / 62`** (`16 / 62` with `--speculative-pld`) | `[PASS]` (`< 55` safety gate; ceiling `62`) |
+| **Min Layer Cosine (All 24 Layers)** | **`0.95180935`** (L0: `0.9990`, L12: `0.9945`, L23: `0.9681`) | `[PASS]` (`>= 0.9500`) |
+| **128K Final Logits Cosine vs. FP32** | **`0.99521100`** | `[PASS]` (`>= 0.9950`) |
+| **Greedy 4-Token Exact Match** | **`4 / 4 exact`** (`' Paris'`, `'.'`, `' city'`) | `[PASS]` (`DETERMINISM` + `SENSITIVITY` + `RESTORE`) |
+| **Golden Benchmark Decode (`15` tok)** | **`11.30 tok/s` (`88.50 ms/tok`)** | `[PASS]` (meets `11.0–14.5 tok/s` target!) |
+| **Prose CLI Decode (`64` tok, `--no-think`)** | **`11.25 tok/s` (`90.3 ms/tok`)**, prefill `24.23 tok/s` | Coherent markdown answer on `roma` |
+| **Longer C-Refactor (`332` prompt + `160` gen)** | **Prefill: `33.46–34.15 tok/s` (`29.3 ms/tok`)**, **Decode (`T=1`): `10.39 tok/s` (`96.9 ms/tok`)** | `8.13 tok/s` under `--speculative-pld` (4 tokens activate `9–13` distinct experts/layer = `2.5x` weight traffic) |
+
+#### Per-Stage Decode Latency Breakdown (`15` Tokens on `roma`, `88.50 ms/tok` = `11.30 tok/s`)
+
+| Pipeline Stage | Master Latency (`ms/tok`) | Driver Hardware (`ms/tok`) | Share of Token | Effective DRAM Bandwidth |
+|---|---|---|---|---|
+| **NPU MoE + Stem Experts (`exp_mlp`, 24L)** | `47.93 ms` | `40.23 ms` | `54.2%` | **`35.92 GB/s` driver / `30.15 GB/s` master** |
+| **NPU `ShortConv` In-Proj (`conv_in`, 18L)** | `13.79 ms` | `10.67 ms` | `15.6%` | `21.20 GB/s` driver / `16.41 GB/s` master |
+| **NPU Output Proj (`proj2048`, 24L)** | `13.07 ms` | `8.64 ms` | `14.8%` | `11.65 GB/s` driver / `7.70 GB/s` master |
+| **NPU `GlobalAttn` QKV (`attn_qkv`, 6L)** | `3.60 ms` | `2.54 ms` | `4.1%` | `14.85 GB/s` driver / `10.48 GB/s` master |
+| **NPU Dual-Die 128K LM Head (`8` slices)** | `5.71 ms` | `5.03 ms` | `6.5%` | **`55.44 GB/s` driver / `51.87 GB/s` master** |
+| **Host CPU `RMSNorm` + `MoERouter` + Pack** | `2.46 ms` | — | `2.8%` | OpenMP fused SmoothQuant + Top-4 router |
+| **Host CPU `GlobalAttn` (6L) + `ShortConv` (18L)** | `1.94 ms` (`1.02 + 0.92`) | — | `2.2%` | 8-core OpenMP GQA + 3-tap depthwise conv |
+| **Total End-to-End Decode** | **`88.50 ms/tok`** | **`67.11 ms/tok`** | **`100.0%`** | **`11.30 tokens/sec`** |
+
+

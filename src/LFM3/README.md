@@ -6,7 +6,8 @@ both **Hybrid 2-Way Tensor Parallelism (`--tp2`, `TP=2` across both NPU dies)** 
 Parallelism (`--pp2`, `PP=2`, layers 0-11 on die 0, 12-23 on die 1)** with a tensor-parallel LM head
 split 8 x 16,000.
 
-Design and milestones live in `PLAN.md`. Measurements live in `../../FINDINGS.md` (§36-§50).
+Design and milestones live in `PLAN.md`. Measurements live in `../../FINDINGS.md` (§36-§52).
+For the **8.47B Sparse MoE (`LiquidAI/LFM2.5-8B-A1B`, `11.30 tok/s`)** engine (`lfm2_moe`), see [`../LFM2.5-8B-A1B/README.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/README.md) and Section 10 below.
 This file is only "how to run what is already built".
 
 ## 1. Which build to run today
@@ -457,5 +458,30 @@ During execution:
   ```
   - **`Prefill tok/s`**: Rate at which the dual-die NPU batches and streams weights across the 64-token chunked graphs while the 8 P550 CPU cores execute L2-tiled, NUMA-pinned (`mmap` + `mbind(MPOL_BIND)` + `MADV_HUGEPAGE` 2 MiB HugePages) batched INT8 64-bit SWAR attention (**`73.92 tok/s` sustained over 3,781 tokens, peaking at `83.9 tok/s` in `--tp2` mode**, and **`67.76 tok/s` sustained / `72.9 tok/s` peak in `--pp2` mode**).
   - **`Decode tok/s`**: Sustained memory-bandwidth-bound autoregressive token generation rate (**`11.34 tok/s` at short context and `9.18 tok/s` at `~4,000` tokens context in `--tp2` mode**, vs **`10.49 tok/s` short context and `8.93 tok/s` at `~4,000` tokens context in `--pp2` mode**).
+
+---
+
+## 10. Sparse Mixture-of-Experts (`LiquidAI/LFM2.5-8B-A1B`, `8.47B` Total / `~1.42B` Active)
+
+The companion `LFM2.5-8B-A1B` Sparse MoE engine (`lfm2_moe`, full documentation in [`../LFM2.5-8B-A1B/README.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/README.md) and `FINDINGS.md` §52) runs all `8.47B` parameters across both NPU dies (`EP=2`, 16 even experts on Die 0 and 16 odd experts on Die 1 across Layers 2–23; `TP=2` dense stem on Layers 0–1) at **`11.30 tok/s` decode** and **`34.15 tok/s` prefill** while keeping **`8.78 GiB` of Linux OS RAM free**:
+
+```bash
+ssh roma
+cd /home/chri/models/LFM2.5-8B-A1B_ENNP
+
+# 1. One-shot CLI prompt (with --no-think for immediate response)
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --no-think -n 64 --temp 0 \
+  --prompt "What is the capital of France and what is it famous for?"
+
+# 2. Prompt from file (e.g., C code refactoring)
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --no-think -n 160 --temp 0 --prompt-file /tmp/prompt_c.txt
+
+# 3. Interactive terminal chat REPL
+sudo LD_LIBRARY_PATH=. ./lfm2_moe
+
+# 4. Golden Oracle verification & acceptance gate (0.9952 logits cosine, 0.9518 min-layer, 4/4 greedy, 11.30 tok/s)
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --verify-golden golden_ref.bin
+```
+
 
 

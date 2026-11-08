@@ -33,6 +33,8 @@ enum class IpcCmd : uint32_t {
     PrepareBuffer,
     UnprepareBuffer,
     SubmitTask,
+    SubmitExpertBatch,
+    SubmitLmHeadBatch,
     Shutdown
 };
 
@@ -247,6 +249,23 @@ public:
         uint32_t model_id,
         const std::vector<DmaBufferSlice> &inputs,
         const std::vector<DmaBufferSlice> &outputs,
+        uint64_t *out_elapsed_ns = nullptr
+    );
+
+    bool submit_expert_batch(
+        uint16_t die_id,
+        uint32_t model_id,
+        const DmaBufferSlice &act_input,
+        const std::vector<DmaBufferSlice> &weight_inputs,
+        const std::vector<DmaBufferSlice> &outputs,
+        uint64_t *out_elapsed_ns = nullptr
+    );
+
+    bool submit_lm_head_batch(
+        uint16_t die_id,
+        const uint32_t model_ids[4],
+        const DmaBufferSlice &act_input,
+        const DmaBufferSlice outputs[4],
         uint64_t *out_elapsed_ns = nullptr
     );
 
