@@ -1269,9 +1269,6 @@ public:
             CPU_ZERO(&cpuset);
             CPU_SET(7, &cpuset); // Pin Die-1 dispatcher thread to Core 7 (NUMA Node 1 / Die 1)
             sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-            struct sched_param sp{};
-            sp.sched_priority = 1;
-            sched_setscheduler(0, SCHED_FIFO, &sp);
 
             uint64_t last_seq = 0;
             while (true) {
@@ -1429,38 +1426,6 @@ public:
             return false;
         }
         m_num_dies = m_pool.active_worker_count();
-        // Elevate NPU worker daemon child processes (and all their internal threads) to SCHED_FIFO
-        // priority 1 so IPC wakeups immediately preempt libgomp post-barrier spin loops on Cores 0..7.
-        {
-            pid_t self_pid = getpid();
-            struct sched_param sp{};
-            sp.sched_priority = 1;
-            std::error_code ec;
-            for (const auto &entry : std::filesystem::directory_iterator("/proc", ec)) {
-                std::string fn = entry.path().filename().string();
-                if (fn.empty() || !std::isdigit(static_cast<unsigned char>(fn[0]))) continue;
-                pid_t cpid = static_cast<pid_t>(std::atoi(fn.c_str()));
-                if (cpid <= 0 || cpid == self_pid) continue;
-                std::ifstream sf(entry.path() / "stat");
-                std::string sline;
-                if (!std::getline(sf, sline)) continue;
-                size_t rp = sline.rfind(')');
-                if (rp == std::string::npos || rp + 4 >= sline.size()) continue;
-                char state = 0;
-                pid_t ppid = 0;
-                if (std::sscanf(sline.c_str() + rp + 2, "%c %d", &state, &ppid) == 2 && ppid == self_pid) {
-                    sched_setscheduler(cpid, SCHED_FIFO, &sp);
-                    std::error_code tec;
-                    for (const auto &tentry : std::filesystem::directory_iterator(entry.path() / "task", tec)) {
-                        std::string tfn = tentry.path().filename().string();
-                        if (!tfn.empty() && std::isdigit(static_cast<unsigned char>(tfn[0]))) {
-                            pid_t tid = static_cast<pid_t>(std::atoi(tfn.c_str()));
-                            if (tid > 0) sched_setscheduler(tid, SCHED_FIFO, &sp);
-                        }
-                    }
-                }
-            }
-        }
         std::printf("[+] Started WorkerPool with %u isolated NPU die worker(s)\n", m_num_dies);
         start_tp_worker();
 
@@ -4553,8 +4518,9 @@ int main(int argc, char **argv) {
     int max_ctx = 4096;
     float temperature = 0.1f;
     int32_t top_k = 50;
-    float repeat_penalty = 1.1f;
+    float repeat_penalty = 1.05f;
     bool enable_thinking = true;
+    int think_budget = 0; // 0 = unlimited; >0 = max thinking tokens before closing </think>
     bool bench_attn = false;
     bool force_int8 = false;
     bool use_shared_archetype_scales = true;
@@ -4564,6 +4530,49 @@ int main(int argc, char **argv) {
     int pld_max_k = 7;
     bool daemon_mode = false;
     int daemon_port = 8088;
+
+    auto apply_think_setting = [&](const std::string &val) -> bool {
+        std::string s = val;
+        for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "none" || s == "off" || s == "0" || s == "false" || s == "nothink") {
+            enable_thinking = false;
+            think_budget = 0;
+            return true;
+        } else if (s == "low") {
+            enable_thinking = true;
+            think_budget = 64;
+            return true;
+        } else if (s == "medium" || s == "med") {
+            enable_thinking = true;
+            think_budget = 256;
+            return true;
+        } else if (s == "high") {
+            enable_thinking = true;
+            think_budget = 512;
+            return true;
+        } else if (s == "xhigh" || s == "max") {
+            enable_thinking = true;
+            think_budget = 1536;
+            return true;
+        } else if (s == "unlimited" || s == "on" || s == "true") {
+            enable_thinking = true;
+            think_budget = 0;
+            return true;
+        }
+        char *endp = nullptr;
+        long n = std::strtol(s.c_str(), &endp, 10);
+        if (endp && *endp == '\0') {
+            if (n <= 0) {
+                enable_thinking = false;
+                think_budget = 0;
+            } else {
+                enable_thinking = true;
+                think_budget = static_cast<int>(n);
+            }
+            return true;
+        }
+        return false;
+    };
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -4605,7 +4614,16 @@ int main(int argc, char **argv) {
         else if (a == "--temp") temperature = std::stof(next_arg());
         else if (a == "--top-k") top_k = std::stoi(next_arg());
         else if (a == "--repeat-penalty") repeat_penalty = std::stof(next_arg());
-        else if (a == "--no-think") enable_thinking = false;
+        else if (a == "--no-think") { enable_thinking = false; think_budget = 0; }
+        else if (a == "--think") { enable_thinking = true; }
+        else if (a == "--think-level" || a == "--think-budget") {
+            std::string val = next_arg();
+            if (!apply_think_setting(val)) {
+                std::fprintf(stderr, "Invalid %s '%s' (expected none|low|medium|high|xhigh or token count N)\n",
+                             a.c_str(), val.c_str());
+                std::exit(1);
+            }
+        }
         else if (a == "--bench-attn") bench_attn = true;
         else if (a == "--int8") force_int8 = true;
         else if (a == "--tp2" || a == "--tp") requested_tp_degree = 2;
@@ -4625,16 +4643,21 @@ int main(int argc, char **argv) {
                         "          [--int8] [--pp2 | --tp2] [--speculative-pld | --pld] [--pld-k K]\n"
                         "          [--per-subgraph-scales] [--weights-layer0]\n"
                         "          [--prompt TEXT | --prompt-file FILE | -f FILE]\n"
-                        "          [--max-tokens N | -n N] [--max-ctx N] [--no-think]\n"
+                        "          [--max-tokens N | -n N] [--max-ctx N]\n"
+                        "          [--no-think | --think-level LEVEL | --think-budget N]\n"
                         "          [--temp F] [--top-k K] [--repeat-penalty F]\n"
                         "          [--daemon [PORT]]\n"
-                        "  --pp2             Layer-Parallel (PP=2): Layers 0..11 on Die 0, Layers 12..23 on Die 1.\n"
-                        "  --tp2             Tensor-Parallel (TP=2): All 24 layers split across Die 0 and Die 1.\n"
-                        "  --speculative-pld Enable Prompt-Lookup Speculative Decoding with T=8 batch verification.\n"
-                        "  --pld-k K         Maximum speculative draft tokens per T=8 step (1..7, default 7).\n"
-                        "  --weights-layer0  Timing experiment: bind every layer of a die to one\n"
-                        "                    weight region per archetype to separate NPU streaming\n"
-                        "                    speed from per-submit overhead. Generated text is garbage.\n",
+                        "  --pp2               Layer-Parallel (PP=2): Layers 0..11 on Die 0, Layers 12..23 on Die 1.\n"
+                        "  --tp2               Tensor-Parallel (TP=2): All 24 layers split across Die 0 and Die 1.\n"
+                        "  --speculative-pld   Enable Prompt-Lookup Speculative Decoding with T=8 batch verification.\n"
+                        "  --pld-k K           Maximum speculative draft tokens per T=8 step (1..7, default 7).\n"
+                        "  --no-think          Disable <think>...</think> reasoning block.\n"
+                        "  --think-level LEVEL Set thinking token budget preset: none (0), low (64),\n"
+                        "                      medium (256), high (512), xhigh (1536), or unlimited.\n"
+                        "  --think-budget N    Set maximum thinking tokens before closing </think> (0 = off).\n"
+                        "  --weights-layer0    Timing experiment: bind every layer of a die to one\n"
+                        "                      weight region per archetype to separate NPU streaming\n"
+                        "                      speed from per-submit overhead. Generated text is garbage.\n",
                         argv[0]);
             return 0;
         }
@@ -4880,7 +4903,7 @@ int main(int argc, char **argv) {
     sp.top_k = top_k;
     sp.repeat_penalty = repeat_penalty;
     sp.repeat_window = 64;
-    sp.max_consecutive_duplicates = 2;
+    sp.max_consecutive_duplicates = 4;
     Sampler sampler(sp);
     std::string current_image_path;
     std::vector<float> current_image_embeds;
@@ -4914,7 +4937,11 @@ int main(int argc, char **argv) {
 
         bool in_think = enable_thinking;
         if (in_think) {
-            std::cout << COLOR_GRAY << "[Thinking: " << std::flush;
+            if (think_budget > 0) {
+                std::cout << COLOR_GRAY << "[Thinking (budget=" << think_budget << "): " << std::flush;
+            } else {
+                std::cout << COLOR_GRAY << "[Thinking: " << std::flush;
+            }
         }
 
         std::vector<int32_t> history = prompt_ids;
@@ -4922,6 +4949,9 @@ int main(int argc, char **argv) {
         bool has_pre_sampled = false;
         int32_t pre_sampled_id = 0;
         int pld_steps = 0, pld_drafted = 0, pld_accepted = 0;
+        int think_tokens_used = 0;
+        bool last_ended_punct = false;
+        bool last_ended_nl = false;
 
         auto print_token = [&](int32_t tok_id) {
             if (tok_id == 124902) { // </think>
@@ -4932,14 +4962,59 @@ int main(int argc, char **argv) {
                 return;
             }
             std::string piece = engine.tokenizer().decode_token(tok_id);
+            if (!piece.empty()) {
+                char back = piece.back();
+                last_ended_nl = (back == '\n');
+                last_ended_punct = (back == '.' || back == '!' || back == '?' || back == '\n');
+            }
             if (in_think) {
+                think_tokens_used++;
                 std::cout << COLOR_GRAY << piece << std::flush;
             } else {
                 std::cout << piece << std::flush;
             }
         };
 
-        for (int step = 0; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
+        auto apply_think_logit_rules = [&]() {
+            float *lg = engine.logits_mut();
+            lg[124901] = -1e30f; // Never emit nested <think> during generation
+            if (!in_think) {
+                lg[124902] = -1e30f; // Never emit stray </think> after thinking has closed
+                return;
+            }
+            if (think_budget > 0) {
+                int soft_start = (think_budget * 3) / 4;
+                if (think_tokens_used >= soft_start) {
+                    float frac = static_cast<float>(think_tokens_used - soft_start) /
+                                 static_cast<float>(std::max(1, think_budget - soft_start));
+                    float boost = std::min(12.0f, 3.0f + 9.0f * frac);
+                    if (think_tokens_used >= think_budget && last_ended_punct) {
+                        boost += 18.0f;
+                    }
+                    lg[124902] += boost;
+                }
+            }
+        };
+
+        const std::vector<int32_t> force_close_ids = encode_lfm3_text(engine.tokenizer(), "\n</think>\n\n");
+
+        for (int step = 0; step < max_new_tokens && engine.pos() < max_ctx - 8 && !g_interrupt_flag.load(); ) {
+            if (in_think && think_budget > 0 &&
+                (think_tokens_used >= think_budget + 24 || (think_tokens_used >= think_budget && last_ended_nl))) {
+                std::cout << " ... [thinking budget reached]]" << COLOR_RESET << "\n\n" << std::flush;
+                in_think = false;
+                has_pre_sampled = false;
+                if (engine.pos() + static_cast<int>(force_close_ids.size()) >= max_ctx) break;
+                if (!engine.forward_chunk(force_close_ids.data(), static_cast<int>(force_close_ids.size()), true, decode_t)) break;
+                for (int32_t cid : force_close_ids) {
+                    sampler.accept(cid);
+                    history.push_back(cid);
+                }
+            }
+
+            if (!has_pre_sampled) {
+                apply_think_logit_rules();
+            }
             int32_t next_id = has_pre_sampled
                 ? pre_sampled_id
                 : sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
@@ -4947,12 +5022,18 @@ int main(int argc, char **argv) {
             sampler.accept(next_id);
             history.push_back(next_id);
 
-            if (next_id == 124900) break; // <|im_end|>
+            if (next_id == 124900 || next_id == 124895) break; // <|im_end|> or <|endoftext|>
+            bool was_in_think = in_think;
             print_token(next_id);
+            if (!was_in_think || think_budget <= 0) {
+                step++;
+            }
 
-            if (step + 1 < max_new_tokens) {
-                int rem = max_new_tokens - (step + 1);
-                if (engine.is_speculative_pld() && rem >= 2) {
+            if (step < max_new_tokens && engine.pos() < max_ctx - 8) {
+                int rem = max_new_tokens - step;
+                bool allow_pld = engine.is_speculative_pld() && rem >= 2 &&
+                                 !(in_think && think_budget > 0 && think_tokens_used >= (think_budget * 3) / 4);
+                if (allow_pld) {
                     draft_pld(history, std::min(engine.pld_max_k(), rem), draft);
                 } else {
                     draft.clear();
@@ -4976,19 +5057,23 @@ int main(int argc, char **argv) {
                             break;
                         }
                         if (j < B - 1) {
+                            apply_think_logit_rules();
                             int32_t pred_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
                             if (pred_id == cand[j + 1]) {
                                 pld_accepted++;
-                                step++;
                                 sampler.accept(pred_id);
                                 history.push_back(pred_id);
-                                if (pred_id == 124900) {
+                                if (pred_id == 124900 || pred_id == 124895) {
                                     engine.commit_verify_t8(j, decode_t);
                                     stop_gen = true;
                                     break;
                                 }
+                                bool prev_think = in_think;
                                 print_token(pred_id);
-                                if (step + 1 >= max_new_tokens) {
+                                if (!prev_think || think_budget <= 0) {
+                                    step++;
+                                }
+                                if (step >= max_new_tokens) {
                                     engine.commit_verify_t8(j, decode_t);
                                     stop_gen = true;
                                     break;
@@ -5041,7 +5126,7 @@ int main(int argc, char **argv) {
     }
 
     std::cout << COLOR_BOLD << COLOR_CYAN
-              << "LFM3-1.7B Interactive Dual-Die Chat REPL (type '/exit' to quit, '/nothink' to toggle thinking, '/image <path>' to load image)"
+              << "LFM3-1.7B Interactive Dual-Die Chat REPL (type '/exit' to quit, '/nothink' or '/think <none|low|medium|high|xhigh|N>' to set thinking budget, '/image <path>' to load image)"
               << COLOR_RESET << std::endl;
     std::string line;
     while (true) {
@@ -5050,8 +5135,27 @@ int main(int argc, char **argv) {
         if (line == "/exit" || line == "/quit") break;
         if (line == "/nothink") {
             enable_thinking = !enable_thinking;
+            if (!enable_thinking) think_budget = 0;
             std::cout << COLOR_YELLOW << (enable_thinking ? "[Thinking enabled]" : "[Thinking disabled]")
                       << COLOR_RESET << std::endl;
+            continue;
+        }
+        if (line == "/think" || line.rfind("/think ", 0) == 0) {
+            std::string arg = (line.size() > 7) ? line.substr(7) : "unlimited";
+            while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.front()))) arg.erase(0, 1);
+            while (!arg.empty() && std::isspace(static_cast<unsigned char>(arg.back()))) arg.pop_back();
+            if (arg.empty()) arg = "unlimited";
+            if (apply_think_setting(arg)) {
+                if (!enable_thinking) {
+                    std::cout << COLOR_YELLOW << "[Thinking disabled]" << COLOR_RESET << std::endl;
+                } else if (think_budget > 0) {
+                    std::cout << COLOR_YELLOW << "[Thinking enabled: budget=" << think_budget << " tokens]" << COLOR_RESET << std::endl;
+                } else {
+                    std::cout << COLOR_YELLOW << "[Thinking enabled: unlimited]" << COLOR_RESET << std::endl;
+                }
+            } else {
+                std::cout << COLOR_RED << "[Usage: /think <none|low|medium|high|xhigh|unlimited|N>]" << COLOR_RESET << std::endl;
+            }
             continue;
         }
         if (line.rfind("/image ", 0) == 0) {

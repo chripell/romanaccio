@@ -2951,4 +2951,30 @@ Extended the package builder with CLI configuration options:
 | **Host CPU `GlobalAttn` (6L) + `ShortConv` (18L)** | `1.94 ms` (`1.02 + 0.92`) | — | `2.2%` | 8-core OpenMP GQA + 3-tap depthwise conv |
 | **Total End-to-End Decode** | **`88.50 ms/tok`** | **`67.11 ms/tok`** | **`100.0%`** | **`11.30 tokens/sec`** |
 
+---
+
+### 52.5 Long-Generation Hang Root Cause (`setDevice` Journald Flood + `SCHED_FIFO` Starvation), Thinking Budget Control (`--think-level`), and MoE `w2` (`sh2 = 25 -> 27`) Saturation Fix
+
+1. **Root Cause & Fix of the Multi-Minute Interactive Hang (`-n 4096 --speculative-pld`)**:
+   - **Symptom**: Running `./lfm2_moe -n 4096 --speculative-pld` interactively caused `roma` to become unreachable over SSH after several minutes of continuous generation.
+   - **Root Cause 1 (`systemd-journald` syslog flood from `ES_NPU_SetDevice`)**: In [`src/eswin_runtime/src/backend/worker_pool.cpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/src/backend/worker_pool.cpp), `worker_loop()` called `driver.set_device(m_die_id)` inside the `while (true)` dispatch loop on **every** IPC command (`~75` commands/token $\approx 850$ calls/sec). The vendor's `libes_npu.so` (`setDevice:202`) already binds the thread's NPU context at startup and logs `[ERR][NPU][setDevice:202] send msg failed` via syslog whenever `set_device()` is called repeatedly on an already-bound context, generating **> 250,000 syslog lines** over a multi-minute run and saturating `systemd-journald`.
+   - **Root Cause 2 (`SCHED_FIFO` real-time priority-1 spin starvation)**: Both worker threads (`Core 5`, `Core 6`) and `m_tp_thread` (`Core 7`, which spins on `m_tp_seq` with `sched_yield()`, a no-op when no higher/equal `SCHED_FIFO` thread is runnable on that core) ran under `SCHED_FIFO` priority 1 while OpenMP worker threads occupied `Cores 0..6`, starving normal `SCHED_OTHER` system daemons (`sshd`, `systemd-journald`, network softirqs).
+   - **Fix**: Removed the redundant per-command `driver.set_device(m_die_id)` inside `worker_loop()` (keeping only the one-time initialization call before the loop) and kept worker/`m_tp_thread` threads on standard `SCHED_OTHER` with explicit core affinity (`CPU_SET`). Verified on `roma`: `journalctl` records **zero** `[ERR][NPU][setDevice]` messages during inference and SSH remains responsive throughout long generations.
+
+2. **Thinking Budget (`--think-budget N`) & Thinking Levels (`--think-level none|low|medium|high|xhigh|unlimited`)**:
+   - Although `LFM3-1.7B` and `LFM2.5-8B-A1B` were trained with binary `<think>...</think>` control, we implemented continuous token-budgeted reasoning in both [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp) and [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) (`--think-level`, `--think-budget`, and interactive REPL `/think`):
+     - **Presets**: `none` (`0` tokens, `--no-think`), `low` (`128` tokens), `medium` (`512` tokens), `high` (`1024` tokens), `xhigh` (`2048` tokens), `unlimited` (`-1`, default).
+     - **Stage 1 (Soft Logit-Bias Ramp at `75%..100%` of budget)**: Linearly ramps an additive logit bias `0.0 -> +14.0` on newline (`\n`, `\n\n`), sentence-ending punctuation (`.`, `.\n`), and `</think>` tokens (`124902` in `LFM2.5`, `64015` in `LFM3`) so the model concludes its current thought naturally.
+     - **Stage 2 (Hard Cap Splice at `100%` of budget)**: Forces `</think>` on step $B$ and teacher-forces `\n\n` on step $B+1$ (whichever mode is active: `T=1` or `--speculative-pld` `T=8`), guaranteeing exact budget enforcement without wasting `max_new_tokens`.
+
+3. **MoE Expert MLP `w2` (`[2048, 1792]`) INT16 Output Saturation Fix (`sh2 = 25 -> 27`)**:
+   - Bit-exact Python hardware simulation of `LFM2.5-8B-A1B` revealed that with `TRUNCS_EXPERT_MLP = [16]*7 + [15]*7 + [25]*8`, `40–60%` of routed `(token, expert)` pairs across all 22 MoE layers saturated the `±32767` INT16 output of `w2` by `1.37×` to `3.72×`.
+   - Increasing `w2` right-shift `sh2` from `25` to `27` (`4.0×` output headroom) in `lfm2_expert_mlp_t{1,8,64}_classb.model` (`kmd-task-op_list`), scaling all `712` expert `out_step_chan` vectors by `4.0×` in `quant_chan_scales.bin` and `quant_scales.json`, and updating [`src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) yielded a major accuracy and throughput improvement on `roma`:
+     - **Min Layer Cosine (All 24 Layers)**: **`0.95180935` $\to$ `0.96935594`** (`36%` error reduction).
+     - **Layer 23 Cosine vs. PyTorch FP32**: **`0.96810421` $\to$ `0.97990484`**.
+     - **128K Final Logits Cosine vs. PyTorch FP32**: **`0.99521100` $\to$ `0.99686629`** (`35%` error reduction).
+     - **Sustained INT8 Decode Speed (`--verify-golden`)**: **`11.30 tok/s` $\to$ `13.07 tokens/sec`** (`76.53 ms/tok`, `4/4` greedy exact match).
+   - **Follow-Up (Milestone 16 in [`src/LFM3/PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM3/PLAN.md#L1050))**: Also isolated why tokens with flatter channel distributions (such as `'\n\n'` id `8`, where `r_t = amax_t / in_thresh ≈ 0.26`) can still clip the **INT8 (`±127`)** outputs of `conv_in`, `attn_qkv`, and `proj2048` under `dyntok`: [`build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) calibrated `out_max` on unscaled `y = x @ W.T` instead of `dyntok`-scaled `y_npu = (x @ W.T) / r_t`. Calibrating `out_max` on `(x @ W.T) / r_t` (or switching `conv_in`/`attn_qkv`/`proj2048` outputs to `INT16` like `expert_mlp`) is tracked as **Milestone 16** in [`src/LFM3/PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM3/PLAN.md#L1050).
+
+
 

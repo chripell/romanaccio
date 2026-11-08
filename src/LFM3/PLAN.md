@@ -1044,3 +1044,50 @@ The most critical operational limit uncovered during reverse engineering (`FINDI
    - In **INT8**, applying the newly verified SmoothQuant + per-output-channel formula (`FINDINGS.md` §46.5 / §49) removes all hardcoded requantization shifts from `kmd-task-op_list`. All per-expert scales are passed externally in `DevBuf.offset` or host sidecar buffers.
    - **Total resident models per die: 14 – 18** (leaving > 44 free slots).
 
+---
+
+## 7. Milestone 16 — `LFM2.5-8B-A1B` `dyntok`-Consistent INT8/INT16 Output Calibration for `conv_in`, `attn_qkv`, and `proj2048`
+
+### 7.1 Background & Root Cause Discovered in Session (2026-11-08)
+
+During interactive long-generation testing of `LFM2.5-8B-A1B` (`./lfm2_moe -n 4096 --speculative-pld`), we diagnosed and fixed three separate issues and isolated a fourth calibration-math mismatch that explains residual code-generation glitches on unseen prompts:
+
+1. **Completed & Fixed in Session**:
+   - **System Hang / SSH Unreachable after Multi-Minute Runs**: Caused by redundant `driver.set_device(m_die_id)` calls on every worker IPC command (`~850/sec`) flooding `systemd-journald` with `[ERR][NPU][setDevice:202]` messages plus `SCHED_FIFO` real-time priority-1 spin loops starving `sshd`. Fixed in [`src/eswin_runtime/src/backend/worker_pool.cpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/src/backend/worker_pool.cpp), [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp), and [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp).
+   - **Thinking Budget & Level Control (`--think-level` / `--think-budget` / REPL `/think`)**: Implemented a 2-stage soft logit-bias ramp (`75%..100%` of budget) + hard `</think>\n\n` splice at `100%` in both `lfm3_v2` and `lfm2_moe`.
+   - **MoE Expert MLP `w2` (`[2048, 1792]`) INT16 Output Saturation (`sh2 = 25` $\to$ `27`)**: `40–60%` of routed `(token, expert)` pairs across all 22 MoE layers previously saturated the `±32767` INT16 output by `1.37×` to `3.72×`. Increasing `w2` right-shift `sh2` from `25` to `27` (`4.0×` output headroom) in `lfm2_expert_mlp_t{1,8,64}_classb.model` and scaling all `712` expert `out_step_chan` vectors by `4.0×` improved `--verify-golden` **Min Layer Cosine from `0.95180935` to `0.96935594`**, **Layer 23 Cosine from `0.96810421` to `0.97990484`**, **128K Logits Cosine from `0.99521100` to `0.99686629`**, and **Sustained Decode Speed to `13.07 tokens/sec`**.
+
+2. **Root Cause of Remaining Code-Generation Degradation on Unseen Prompts (`dyntok` Unscaled `out_max` Calibration)**:
+   - In [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp), dynamic per-token input packing (`pack_npu_input_int8_dyntok` and `fused_rms_norm_pack_dyntok_t1`) normalizes each token vector $x_t$ by its own per-token L-infinity norm $\text{amax}_t = \max_c |x_{t,c}|$:
+     $$\hat{x}_t = \text{round}\left(x_t \cdot \frac{127}{\text{amax}_t}\right), \qquad r_t = \frac{\text{amax}_t}{\text{in\_thresh}}$$
+   - However, [`src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) calibrated the NPU `CvtPrecision_QuantM` multiplier using the **static** `in_step = in_thresh / 127.0` and the **unscaled** output maximum:
+     $$\text{out\_max}_c = \max_t |y_{t,c}| \quad \text{instead of} \quad \text{out\_max}_c^{\text{dyntok}} = \max_t \left( |y_{t,c}| \cdot \frac{\text{in\_thresh}}{\text{amax}_t} \right)$$
+   - Consequently, inside the NPU hardware (before host unpacking multiplies by $r_t$), the integer output produced for token $t$ is:
+     $$q_{\text{out}, t, c} = \text{round}\left( \frac{y_{t,c}}{\text{out\_step}_c} \cdot \frac{\text{in\_thresh}}{\text{amax}_t} \right)$$
+   - When a token has a flatter channel distribution (lower kurtosis) than the spiky calibration token that defined `in_thresh` — for example, newline token `'\n\n'` (id `8`) or `' that'` (id `395`), where $r_t = \text{amax}_t / \text{in\_thresh} \approx 0.25\text{–}0.35$ — its dot product $y_{t,c} = x_t \cdot w_c^T$ is still normal-sized, so multiplying by $1/r_t = 3.0\text{–}4.0\times$ inside the NPU overflows the **INT8 (`±127`)** output of `conv_in`, `conv_out`, `attn_qkv`, and `attn_out` by up to **`4.93×`** (`10.2%` of channels clipped at `±127`).
+   - In the 18 `ShortConv` layers, because the gated recurrence $y_{\text{mid}} = C \odot \text{conv1d}(B \odot x_{\text{proj}})$ is **cubic** in the `conv_in` output $[B, C, x_{\text{proj}}]$, clipping $B, C, x_{\text{proj}}$ on `'\n\n'` drops Layer 0 cosine on `'\n\n'` to `0.6886` and Layer 23 cosine to `0.6033`.
+   - Note: Simply clamping `amax >= in_thresh` at runtime fixes `'\n\n'` (`L00` cosine `0.6886 -> 0.9974`, `L23` cosine `0.6033 -> 0.9575` at `1.25×`), but degrades `expert_mlp` input resolution on `golden_ref.bin` (`0.9694 -> 0.9480`) because `expert_mlp` outputs `INT16` (`±32767`) and never clips.
+
+### 7.2 Actionable Implementation Plan for Milestone 16
+
+1. **Option A (Zero-Model-Change Fast Fix — Calibration-Only Update in `build_lfm2_moe_pkg.py`)**:
+   - In [`src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py), calibrate `out_max` for all `INT8`-output `dyntok` archetypes (`conv_in`, `attn_qkv`, `conv_out`, `attn_out`) using the **actual NPU pre-unpack tensor**:
+     ```python
+     # For each calibration token t:
+     # x_smooth_t = x_t * inv_smooth
+     # r_t = max(|x_smooth_t|) / in_thresh
+     # y_npu_equiv_t = (x_t @ W.T) / r_t
+     out_max_c = np.max(np.abs(y_npu_equiv), axis=0) * 1.15  # 15% safety margin for unseen tokens
+     ```
+   - Re-synthesize `CvtPrecision_QuantM` slices and `out_step_chan` in `weights_die{0,1}.bin`, `quant_chan_scales.bin`, and `quant_scales.json` (using `sh = 21` instead of `sh = 20` on `conv_in`, `attn_qkv`, and `proj2048` if `qm` exceeds `32767`).
+   - Additionally, in [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp), apply a safety floor `scale_ratios[t] >= 1.0f / 1.15f` **only** when `sc.out_dtype == BoundaryDtype::Int8` (leaving `BoundaryDtype::Int16` `expert_mlp` completely unclamped).
+
+2. **Option B (Structural Fix — `INT16` Output Archetypes for `conv_in`, `attn_qkv`, and `proj2048`, Matching `LFM3-1.7B`)**:
+   - Compile `lfm2_conv_in_t{1,8,64}_classb.model`, `lfm2_attn_qkv_t{1,8,64}_classb.model`, and `lfm2_proj2048_t{1,8,64}_classb.model` with `output_data_type=["int16"]` (`±32767` range instead of `±127`), exactly as done for `expert_mlp`.
+   - Because the weights themselves remain `INT8`, `weights_die0.bin` and `weights_die1.bin` stay **`5.166 GiB`** (`0 B` weight size increase!), resident loadables stay **`12 / 62`** per die (`16 / 62` with `--speculative-pld`), and `±32767` output dynamic range permanently eliminates all `dyntok` output saturation across all 24 layers.
+
+3. **Acceptance Gates for Milestone 16**:
+   - `--verify-golden golden_ref.bin`: Min-layer cosine `>= 0.9690`, 128K logits cosine `>= 0.9965`, `4/4` greedy exact match.
+   - Multi-turn & unseen chat/code prompt (`"Can you write a Python function that returns all the palindrome substrings of a given string."` with `<|im_start|>` chat template including `'\n\n'` tokens): Per-layer last-token cosine `>= 0.9750` across all 24 layers and clean, bug-free Python code output.
+
+

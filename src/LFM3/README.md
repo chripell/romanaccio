@@ -35,16 +35,16 @@ Everything runs natively on `roma` (`ssh roma`), and the NPU character devices (
 ssh roma
 cd /home/chri/models/LFM3-1.7B_ENNP   # Or LFM3-1.7B_FP16 (omit --int8 for FP16)
 
-# 1. One-shot command line prompt (Hybrid TP=2 or Layer-Parallel PP=2, with optional --speculative-pld)
-sudo ./lfm3_v2 --int8 --tp2 --prompt "Explain depthwise convolution in one sentence." -n 64
+# 1. One-shot command line prompt (Hybrid TP=2 or Layer-Parallel PP=2, with optional --speculative-pld and --think-level)
+sudo ./lfm3_v2 --int8 --tp2 --think-level low --prompt "Explain depthwise convolution in one sentence." -n 64
 sudo ./lfm3_v2 --int8 --tp2 --speculative-pld -f /tmp/test_pld_c_refactor.txt --no-think -n 180 --temp 0
 sudo ./lfm3_v2 --int8 --pp2 --speculative-pld -f /tmp/test_pld_c_refactor.txt --no-think -n 180 --temp 0
 
 # 2. Prompt from file (codebase analysis / benchmarking)
 sudo ./lfm3_v2 --int8 --tp2 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
 
-# 3. Interactive terminal chat REPL (supports /image <path>, /nothink, /exit)
-sudo ./lfm3_v2 --int8 --tp2
+# 3. Interactive terminal chat REPL (supports /image <path>, /nothink, /think <none|low|medium|high|xhigh|N>, /exit)
+sudo ./lfm3_v2 --int8 --tp2 --speculative-pld --think-level medium
 
 # 4. Resident background daemon (listening on port 8088 for OpenAI server or d1_runner)
 sudo ./lfm3_v2 --int8 --tp2 --daemon 8088
@@ -72,8 +72,10 @@ sudo ./lfm3_v2 --bench-attn
 | `--pp2` / `--pp` | | `auto` | Select Layer-Parallel execution (`PP=2`, Layers 0–11 on Die 0, 12–23 on Die 1). |
 | `--speculative-pld` | `--pld` | `false` | Enable Prompt-Lookup Speculative Decoding with `T=8` batch verification (`16` resident models/die; `15.9–23.9 tok/s` on code/agentic tasks). |
 | `--pld-k K` | | `7` | Set maximum speculative draft tokens $K \in [1, 7]$ per `T=8` batch verification step (implicitly enables `--speculative-pld`). |
-| `--no-think` | | `false` | Disable internal `<think>` loops, forcing instant generation of the direct answer. |
-| `--max-tokens N` | `-n` | `128` | Maximum new tokens to decode autoregressively. |
+| `--no-think` | | `false` | Disable internal `<think>` loops (`think_budget=0`), forcing instant generation of the direct answer. |
+| `--think-level LEVEL` | | `unlimited` | Set thinking token budget preset: `none` (`0`), `low` (`64`), `medium` (`256`), `high` (`512`), `xhigh` (`1536`), or `unlimited`. |
+| `--think-budget N` | | `0` | Set maximum thinking tokens before closing `</think>` (`0` = off; uses soft `</think>` logit ramp at $0.75 N$ + hard cap).Thinking tokens do not count against `--max-tokens N`. |
+| `--max-tokens N` | `-n` | `128` | Maximum new answer tokens to decode autoregressively. |
 | `--max-ctx N` | | `4096` | Context window size in tokens (supports up to `32768`–`40960` for 32K prompts). |
 | `--daemon [PORT]` | `--server` | `8088` | Run as resident socket daemon for the OpenAI REST server or `d1_runner.py`. |
 | `--model-dir DIR` | `-m` | `.` | Directory containing `cpu_weights.bin`, `weights_die*.bin`, `embedding.bin`. |

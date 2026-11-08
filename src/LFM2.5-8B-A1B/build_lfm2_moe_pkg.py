@@ -57,7 +57,7 @@ TRUNCS = {
     "conv_in":    [20] * 12,
     "proj2048":   [20] * 4,
     "attn_qkv":   [21] * 6,
-    "expert_mlp": [16] * 7 + [15] * 7 + [25] * 8,
+    "expert_mlp": [16] * 7 + [15] * 7 + [27] * 8,
     "lm_head":    [22] * 63,
 }
 
@@ -190,7 +190,8 @@ def build_expert_mlp_region(
     min_out_s = (s_m1_eff * ws2 * (1 << sh2)) / 32767.0
     out_s_c = torch.max(out_t_chan / 32767.0, min_out_s)
     qm2_f = torch.clamp(torch.round((s_m1_eff * ws2 / out_s_c) * (1 << sh2)), 1.0, 32767.0)
-    out_step_chan = ((s_m1_eff * ws2 * (1 << sh2)) / qm2_f).float().numpy()
+    # Use sh2_hw = sh2 + 2 (27) in NPU SDP to provide 4.0x INT16 headroom for routed MoE tokens
+    out_step_chan = ((s_m1_eff * ws2 * (1 << (sh2 + 2))) / qm2_f).float().numpy()
     qm2 = qm2_f.to(torch.int16).view(8, 256).numpy()
 
     buf = bytearray(reg.size)

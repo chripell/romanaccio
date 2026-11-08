@@ -26,21 +26,22 @@ Design details live in [`PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM2
 ssh roma
 cd /home/chri/models/LFM2.5-8B-A1B_ENNP
 
-# 1. One-shot CLI prompt (with --no-think for immediate response)
-sudo LD_LIBRARY_PATH=. ./lfm2_moe --no-think -n 64 --temp 0 \
+# 1. One-shot CLI prompt (defaults to --think-level medium = 256 thinking tokens; pass --think-level low or --no-think)
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --think-level low -n 128 --temp 0 \
   --prompt "What is the capital of France and what is it famous for?"
 
 # 2. Prompt from file (e.g., C code refactoring)
 sudo LD_LIBRARY_PATH=. ./lfm2_moe --no-think -n 160 --temp 0 --prompt-file /tmp/prompt_c.txt
 
-# 3. Interactive terminal chat REPL (type '/exit' to quit, '/nothink' to toggle thinking)
-sudo LD_LIBRARY_PATH=. ./lfm2_moe
+# 3. Interactive terminal chat REPL (supports '/think <none|low|medium|high|xhigh|N>', '/nothink', '/image <path>', '/exit')
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --speculative-pld
 
 # 4. Golden Oracle verification & acceptance gate (determinism, sensitivity, restore, 4/4 greedy, 15-tok speed)
 sudo LD_LIBRARY_PATH=. ./lfm2_moe --verify-golden golden_ref.bin
 
-# 5. Optional Prompt-Lookup Speculative Decoding (T=8 batch verification)
-sudo LD_LIBRARY_PATH=. ./lfm2_moe --speculative-pld --no-think -n 160 --temp 0 --prompt-file /tmp/prompt_c.txt
+# 5. Optional Prompt-Lookup Speculative Decoding (T=8 batch verification) with thinking budget
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --speculative-pld --think-level low -n 384 --temp 0 \
+  --prompt "Can you write a Python function that returns all the palindrome substrings of a given string."
 ```
 
 ---
@@ -51,8 +52,10 @@ sudo LD_LIBRARY_PATH=. ./lfm2_moe --speculative-pld --no-think -n 160 --temp 0 -
 |---|---|---|---|
 | `--prompt TEXT` | `-p` | `""` | One-shot user prompt text (`@FILE` loads prompt from file). |
 | `--prompt-file FILE` | `-f` | `""` | Path to text/source file to use as prompt. |
-| `--no-think` | | `false` | Disable `<think>` reasoning block and mask token `124901` (`<think>`). |
-| `--max-tokens N` | `-n` | `128` | Maximum new tokens to decode autoregressively. |
+| `--no-think` | | `false` | Disable `<think>` reasoning block (`think_budget=0`) and mask token `124901` (`<think>`). |
+| `--think-level LEVEL` | | `medium` | Set thinking token budget preset: `none` (`0`), `low` (`64`), `medium` (`256`, default), `high` (`512`), `xhigh` (`1536`), or `unlimited`. |
+| `--think-budget N` | | `256` | Set maximum thinking tokens before closing `</think>` (`0` = off; uses soft `</think>` logit ramp at $0.75 N$ + hard cap). Thinking tokens do not count against `--max-tokens N`. |
+| `--max-tokens N` | `-n` | `128` | Maximum new answer tokens to decode autoregressively. |
 | `--max-ctx N` | | `4096` | Context window size in tokens. |
 | `--model-dir DIR` | `-m` | `.` | Package directory containing `cpu_weights.bin`, `weights_die*.bin`, `embedding.bin`. |
 | `--system TEXT` | | `"You are a..."` | Custom system prompt for ChatML template. |

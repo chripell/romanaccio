@@ -231,7 +231,6 @@ void WorkerChannel::run_worker_loop() {
 
             case IpcCmd::LoadModel: {
                 if (is_hw) {
-                    driver.set_device(m_die_id);
                     uint32_t model_id = 0;
                     int ret = driver.load_model(&model_id, req.model_path);
                     if (ret == 0) {
@@ -273,7 +272,6 @@ void WorkerChannel::run_worker_loop() {
 
             case IpcCmd::UnloadModel: {
                 if (is_hw) {
-                    driver.set_device(m_die_id);
                     int ret = driver.unload_model(req.model_id);
                     resp.status = (ret == 0) ? IpcStatus::Success : IpcStatus::ErrorExecutionFailed;
                     resp.driver_error = ret;
@@ -285,8 +283,6 @@ void WorkerChannel::run_worker_loop() {
 
             case IpcCmd::PrepareBuffer: {
                 if (is_hw) {
-                    driver.set_device(m_die_id);
-
                     uint64_t snd_fd = req.inputs[0].mem_fd;
                     uint64_t rcvd_fd = snd_fd;
 
@@ -323,8 +319,6 @@ void WorkerChannel::run_worker_loop() {
 
             case IpcCmd::UnprepareBuffer: {
                 if (is_hw) {
-                    driver.set_device(m_die_id);
-
                     uint64_t snd_fd = req.inputs[0].mem_fd;
                     uint64_t rcvd_fd = snd_fd;
                     auto it = rcvd_fds.find(snd_fd);
@@ -355,8 +349,6 @@ void WorkerChannel::run_worker_loop() {
                 auto t0 = std::chrono::high_resolution_clock::now();
 
                 if (is_hw) {
-                    driver.set_device(m_die_id);
-
                     NpuTask task{};
                     task.modelId = req.model_id;
                     task.inputFdNum = req.input_count;
@@ -397,7 +389,6 @@ void WorkerChannel::run_worker_loop() {
             case IpcCmd::SubmitExpertBatch: {
                 auto t0 = std::chrono::high_resolution_clock::now();
                 if (is_hw) {
-                    driver.set_device(m_die_id);
                     uint8_t batch_n = req.output_count;
                     uint64_t act_snd = req.inputs[0].mem_fd;
                     auto it_act = rcvd_fds.find(act_snd);
@@ -445,7 +436,6 @@ void WorkerChannel::run_worker_loop() {
             case IpcCmd::SubmitLmHeadBatch: {
                 auto t0 = std::chrono::high_resolution_clock::now();
                 if (is_hw) {
-                    driver.set_device(m_die_id);
                     uint8_t batch_n = req.output_count;
                     uint64_t act_snd = req.inputs[0].mem_fd;
                     auto it_act = rcvd_fds.find(act_snd);
