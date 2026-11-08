@@ -1215,43 +1215,9 @@ public:
         }
     }
 
-    static int peek_pkg_tp_degree(const std::string &dir) {
-        std::string map_path = dir + "/weights_map.json";
-        std::ifstream jf(map_path);
-        if (!jf.is_open()) return 0;
-        std::stringstream ss;
-        ss << jf.rdbuf();
-        std::string err;
-        JsonValue root = JsonValue::parse(ss.str(), err);
-        if (!err.empty() || !root.is_object()) return 0;
-        return root.has("tp_degree") ? static_cast<int>(root["tp_degree"].as_int64(1)) : 1;
-    }
-
     bool init(const std::string &pkg_dir, int max_ctx = 4096) {
         auto t_init0 = std::chrono::steady_clock::now();
         m_pkg_dir = pkg_dir;
-        int cur_tp = peek_pkg_tp_degree(m_pkg_dir);
-        if (m_requested_tp_degree == 2 && cur_tp != 2) {
-            for (const char *cand : {"/tp2", "/../LFM2.5-8B-A1B Sparse MoE_TP2", "/../eswin_pkg_tp2"}) {
-                std::string cdir = m_pkg_dir + cand;
-                if (peek_pkg_tp_degree(cdir) == 2) {
-                    std::printf("[+] --tp2 selected: switching package directory %s -> %s\n",
-                                m_pkg_dir.c_str(), cdir.c_str());
-                    m_pkg_dir = cdir;
-                    break;
-                }
-            }
-        } else if (m_requested_tp_degree == 1 && cur_tp == 2) {
-            for (const char *cand : {"/../LFM2.5-8B-A1B Sparse MoE_ENNP", "/../eswin_pkg_int8", "/../eswin_pkg"}) {
-                std::string cdir = m_pkg_dir + cand;
-                if (peek_pkg_tp_degree(cdir) == 1) {
-                    std::printf("[+] --pp2 selected: switching package directory %s -> %s\n",
-                                m_pkg_dir.c_str(), cdir.c_str());
-                    m_pkg_dir = cdir;
-                    break;
-                }
-            }
-        }
         // Round m_max_ctx up to a multiple of 2048 so every per-die half-layer (2 * m_max_ctx slots)
         // is an exact multiple of 4 KiB OS pages (and 2 MiB HugePages for FP32 KV caches).
         m_max_ctx = std::max(2048, (max_ctx + 2047) & ~2047);
@@ -2703,10 +2669,6 @@ public:
         m_use_shared_archetype_scales = use_shared_archetype_scales;
     }
 
-    void set_parallel_mode(int tp_degree) {
-        m_requested_tp_degree = tp_degree;
-    }
-
     void set_speculative_pld(bool enable, int max_k = 7) {
         m_enable_pld = enable;
         m_pld_max_k = std::clamp(max_k, 1, 7);
@@ -3919,13 +3881,6 @@ private:
             return false;
         }
 
-        if (root.has("tp_degree") && root["tp_degree"].as_int64(1) == 2) {
-            m_tp_degree = 2;
-            std::printf("[+] Tensor Parallelism enabled: TP=%d across both NPU dies\n", m_tp_degree);
-        } else {
-            m_tp_degree = 1;
-        }
-
         for (int l = 0; l < kNumLayers; ++l) {
             char pfx[32];
             std::snprintf(pfx, sizeof(pfx), "lfm2_l%02d_", l);
@@ -4148,8 +4103,6 @@ private:
     int m_max_ctx = 4096;
     int m_pos = 0;
     uint16_t m_num_dies = 1;
-    int m_tp_degree = 1;
-    int m_requested_tp_degree = 0; // 0 = auto from weights_map.json, 1 = --pp2, 2 = --tp2
     bool m_tp_worker_running = false;
     std::thread m_tp_thread;
     std::mutex m_tp_mtx;
@@ -4759,7 +4712,6 @@ int main(int argc, char **argv) {
     bool force_int8 = false;
     bool use_shared_archetype_scales = true;
     bool ab_shared_weights = false;
-    int requested_tp_degree = 0;
     bool enable_pld = false;
     int pld_max_k = 3;
     bool daemon_mode = false;
@@ -4808,8 +4760,6 @@ int main(int argc, char **argv) {
         else if (a == "--no-think") enable_thinking = false;
         else if (a == "--bench-attn") bench_attn = true;
         else if (a == "--int8") force_int8 = true;
-        else if (a == "--tp2" || a == "--tp") requested_tp_degree = 2;
-        else if (a == "--pp2" || a == "--pp") requested_tp_degree = 1;
         else if (a == "--speculative-pld" || a == "--pld") enable_pld = true;
         else if (a == "--pld-k") { enable_pld = true; pld_max_k = std::stoi(next_arg()); }
         else if (a == "--per-subgraph-scales") use_shared_archetype_scales = false;
@@ -4822,19 +4772,15 @@ int main(int argc, char **argv) {
         }
         else if (a == "--help" || a == "-h") {
             std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--int8] [--pp2 | --tp2] [--speculative-pld | --pld] [--pld-k K]\n"
-                        "          [--per-subgraph-scales] [--weights-layer0]\n"
+                        "          [--speculative-pld | --pld] [--pld-k K]\n"
                         "          [--prompt TEXT | --prompt-file FILE | -f FILE]\n"
                         "          [--max-tokens N | -n N] [--max-ctx N] [--no-think]\n"
                         "          [--temp F] [--top-k K] [--repeat-penalty F]\n"
                         "          [--daemon [PORT]]\n"
-                        "  --pp2             Layer-Parallel (PP=2): Layers 0..11 on Die 0, Layers 12..23 on Die 1.\n"
-                        "  --tp2             Tensor-Parallel (TP=2): All 24 layers split across Die 0 and Die 1.\n"
+                        "  Dual-Die EP=2 Sparse MoE (Layers 2..23: 16 even experts on Die 0, 16 odd on Die 1;\n"
+                        "  Layers 0..1: TP=2 dense stem via 4 quarter-experts; Layers 0..11/12..23 operators).\n"
                         "  --speculative-pld Enable Prompt-Lookup Speculative Decoding with T=8 batch verification.\n"
-                        "  --pld-k K         Maximum speculative draft tokens per T=8 step (1..7, default 7).\n"
-                        "  --weights-layer0  Timing experiment: bind every layer of a die to one\n"
-                        "                    weight region per archetype to separate NPU streaming\n"
-                        "                    speed from per-submit overhead. Generated text is garbage.\n",
+                        "  --pld-k K         Maximum speculative draft tokens per T=8 step (1..7, default 3).\n",
                         argv[0]);
             return 0;
         }
@@ -4842,7 +4788,6 @@ int main(int argc, char **argv) {
 
     Lfm3Engine engine;
     engine.set_quant_options(force_int8, use_shared_archetype_scales);
-    engine.set_parallel_mode(requested_tp_degree);
     engine.set_speculative_pld(enable_pld, pld_max_k);
     engine.set_ab_shared_weights(ab_shared_weights);
     engine.set_extent_probe(std::getenv("LFM3_MEASURE_EXTENT") != nullptr, 2u << 20);
