@@ -102,6 +102,14 @@ target_link_libraries(test_moe_router PRIVATE es_runtime ${CMAKE_DL_LIBS} pthrea
 add_executable(test_buffer_slice tests/test_buffer_slice.cpp)
 target_link_libraries(test_buffer_slice PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
 
+# Milestone 17A Hybrid Prefix Cache (LFMKVB01 + RadixCache) Test Executable
+add_executable(test_prefix_cache tests/test_prefix_cache.cpp)
+target_link_libraries(test_prefix_cache PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_prefix_cache PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_options(test_prefix_cache PRIVATE ${OpenMP_CXX_FLAGS})
+endif()
+
 # Milestone 6 Interactive Chat Tool Executable
 add_executable(eswin-chat tools/eswin_chat.cpp)
 target_link_libraries(eswin-chat PRIVATE es_runtime ${CMAKE_DL_LIBS} pthread)
@@ -125,4 +133,5 @@ add_test(NAME test_deepseek_e2e COMMAND test_deepseek_e2e)
 add_test(NAME test_direct_kernel_mode COMMAND test_direct_kernel_mode)
 add_test(NAME test_moe_router COMMAND test_moe_router)
 add_test(NAME test_buffer_slice COMMAND test_buffer_slice)
+add_test(NAME test_prefix_cache COMMAND test_prefix_cache)
 

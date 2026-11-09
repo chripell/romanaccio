@@ -52,12 +52,13 @@ TEST_E2E_DS    = $(BUILD_DIR)/test_deepseek_e2e
 TEST_DKMODE    = $(BUILD_DIR)/test_direct_kernel_mode
 TEST_MOE       = $(BUILD_DIR)/test_moe_router
 TEST_SLICE     = $(BUILD_DIR)/test_buffer_slice
+TEST_PCACHE    = $(BUILD_DIR)/test_prefix_cache
 TOOL_FETCH     = $(BUILD_DIR)/eswin-fetch
 TOOL_CHAT      = $(BUILD_DIR)/eswin-chat
 
 .PHONY: all test clean
 
-all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TEST_SLICE) $(TOOL_FETCH) $(TOOL_CHAT)
+all: $(TARGET_LIB) $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TEST_SLICE) $(TEST_PCACHE) $(TOOL_FETCH) $(TOOL_CHAT)
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -143,7 +144,12 @@ $(TEST_SLICE): $(TEST_DIR)/test_buffer_slice.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
-test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TEST_SLICE)
+$(TEST_PCACHE): $(TEST_DIR)/test_prefix_cache.cpp include/prefix_cache.hpp $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(TEST_E2E) $(TEST_CHAIN) $(TEST_EMBED) $(TEST_KVHW) $(TEST_E2E_DS) $(TEST_DKMODE) $(TEST_MOE) $(TEST_SLICE) $(TEST_PCACHE)
 	@echo "Running Milestone 1 DMA test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_DMA)
 	@echo "\nRunning Milestone 2 Dual-Die Concurrency test suite..."
@@ -170,6 +176,8 @@ test: $(TEST_DMA) $(TEST_CONCUR) $(TEST_MANIFEST) $(TEST_NLP) $(TEST_SESSION) $(
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_MOE)
 	@echo "\nRunning Milestone 13 BufferSlice marshalling test suite..."
 	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_SLICE)
+	@echo "\nRunning Milestone 17A Hybrid Prefix Cache test suite..."
+	@LD_LIBRARY_PATH=$(BUILD_DIR):/lib:/usr/lib:$$LD_LIBRARY_PATH $(TEST_PCACHE)
 
 clean:
 	rm -rf $(BUILD_DIR)

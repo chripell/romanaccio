@@ -1364,7 +1364,12 @@ public:
 
 ### 8.4 Detailed Implementation Plan (Milestones 17A, 17B, 17C)
 
-#### Milestone 17A (Host-Testable While `roma` Is Offline): `prefix_cache.hpp`, Journaled Radix Index & Unit Tests
+#### Milestone 17A (Host-Testable While `roma` Is Offline): `prefix_cache.hpp`, Journaled Radix Index & Unit Tests — **[COMPLETED & HOST-VERIFIED 2026-11-09]**
+
+- **Implementation & Verification Status** (2026-11-09):
+  - Created [`src/eswin_runtime/include/prefix_cache.hpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/include/prefix_cache.hpp) (`sizeof(KvbHeader) == 256`, 128-bit WyMix chained block hashing, per-section 64-bit integrity checksums, zero-latency in-flight blob hit path, atomic `.tmp` + `fdatasync` + `rename` background NVMe writer, `index.wal` + `index.snap` journal compaction, and Cherkasova pre-admission leaf-first GDSF eviction).
+  - Created [`src/eswin_runtime/tests/test_prefix_cache.cpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/tests/test_prefix_cache.cpp) and wired `test_prefix_cache` into `src/eswin_runtime/Makefile` and `src/eswin_runtime/CMakeLists.txt`.
+  - **Host & Cross-Compiler Gate**: Passed **4/4** unit tests in **`485.7 ms`** (`<= 2,000 ms` gate `[PASS]`) with zero warnings under both `g++ -O3 -std=c++17 -fopenmp -Wall -Wextra` and `riscv64-linux-gnu-g++ -Werror`.
 
 - **Goal**: Build and exhaustively unit-test the complete `.kvb` serializer, NUMA scatter/gather engine, crash-safe WAL journal, leaf-first GDSF eviction, and async writer on the x86_64 Arch Linux host **without needing SSH access to `roma`**.
 - **Files to Create**:

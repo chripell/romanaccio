@@ -273,9 +273,9 @@ Because `LFM2.5-8B-A1B` prefills at `34.15 tok/s` (`~240 s` for an 8,192-token a
 
 #### F.2 Detailed Step-by-Step Implementation Checklist
 
-1. **Step F.1 — Shared `prefix_cache.hpp` & Host Unit Tests (Host-Only, Zero `roma` Dependency; Cross-Ref `src/LFM3/PLAN.md` §8.3–§8.4)**:
-   - [ ] Implement [`src/eswin_runtime/include/prefix_cache.hpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/include/prefix_cache.hpp) with `KvbHeader` (`magic = "LFMKVB01"`, `sizeof == 256`), `ModelArchId::LFM2_5_8B_A1B = 2`, 128-bit chained `Hash128` block keys, crash-safe WAL index (`index.wal` + `index.snap`), leaf-first GDSF eviction (`num_children == 0`), `KVB_FLAG_PINNED` support, and background async NVMe writer thread.
-   - [ ] Build and run `src/eswin_runtime/tests/test_prefix_cache.cpp` on the local Arch Linux host, explicitly testing the `LFM2.5-8B-A1B` geometry (`kv_heads = 8`, `head_dim = 64`, `num_swa_layers = 0`, `num_conv_layers = 18`, `conv_state_taps = 2`).
+1. **Step F.1 — Shared `prefix_cache.hpp` & Host Unit Tests (Host-Only, Zero `roma` Dependency; Cross-Ref `src/LFM3/PLAN.md` §8.3–§8.4) — [COMPLETED & HOST-VERIFIED 2026-11-09]**:
+   - [x] Implement [`src/eswin_runtime/include/prefix_cache.hpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/include/prefix_cache.hpp) with `KvbHeader` (`magic = "LFMKVB01"`, `sizeof == 256`), `ModelArchId::LFM2_5_8B_A1B = 2`, 128-bit chained `Hash128` block keys, crash-safe WAL index (`index.wal` + `index.snap`), leaf-first GDSF eviction (`num_children == 0`), `KVB_FLAG_PINNED` support, and background async NVMe writer thread.
+   - [x] Build and run `src/eswin_runtime/tests/test_prefix_cache.cpp` on the local Arch Linux host, explicitly testing the `LFM2.5-8B-A1B` geometry (`kv_heads = 8`, `head_dim = 64`, `num_swa_layers = 0`, `num_conv_layers = 18`, `conv_state_taps = 2`) — **4/4 passed in `485.7 ms`**.
 
 2. **Step F.2 — Automatic Cache Invalidation Across 3-Chunk MMZ Weight Blobs & Phase E Re-Calibration**:
    - [ ] In [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) (`init()`, lines `1366–1382`), combine the 64-bit FNV-1a `head` and `tail` hashes already computed over `m_w_blob[d][0]` and `m_w_blob[d][2]` on Die 0 and Die 1 with a 64-bit hash of `m_chan_scales_buf` (`quant_chan_scales.bin`) and `m_cpu_weights_buf` into `ModelCacheGeometry::model_fingerprint`.
