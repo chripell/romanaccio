@@ -1090,4 +1090,373 @@ During interactive long-generation testing of `LFM2.5-8B-A1B` (`./lfm2_moe -n 40
    - `--verify-golden golden_ref.bin`: Min-layer cosine `>= 0.9690`, 128K logits cosine `>= 0.9965`, `4/4` greedy exact match.
    - Multi-turn & unseen chat/code prompt (`"Can you write a Python function that returns all the palindrome substrings of a given string."` with `<|im_start|>` chat template including `'\n\n'` tokens): Per-layer last-token cosine `>= 0.9750` across all 24 layers and clean, bug-free Python code output.
 
+---
+
+## 8. Milestones 17A–17C — Persistent 1 TB Hybrid Prefix Cache (`LFMKVB01` + `RadixCache`) & Standard OpenAI Telemetry
+
+### 8.1 Architectural Motivation & Hybrid State Causality Rules
+
+Currently, `run_daemon_server()` in `src/LFM3/lfm3_v2.cpp` (and `src/LFM2.5-8B-A1B/lfm2_moe.cpp`) calls `engine.reset_state()` unconditionally at the start of every HTTP request. For agentic coding harnesses (`50:1`–`100:1` prompt-to-output token ratios) and persistent roleplay sessions (character/world definitions + multi-thousand-token chat histories + swipe/regenerate branching), re-prefilling an 8K prompt at `55–74 tok/s` (`LFM3`) or `34 tok/s` (`LFM2.5`) burns **110–240 seconds per turn**.
+
+Because `LFM3-1.7B` is a **Tri-Hybrid** backbone (`6` Global Attention + `5` Sliding-Window Attention + `13` `ShortConv` layers) and `roma` has **1 TB of local NVMe storage** plus **~8.78 GiB of free Linux OS RAM**, persistent prefix caching must respect three distinct causality laws across `B = 64`-token chunks (matching `kPrefillBatch = 64`):
+
+| State Plane | `LFM3-1.7B` Geometry (`B = 64` tok) | Causality & Rewind Rule | NVMe Bytes Read on Hit at Chunk $k$ |
+| :--- | :--- | :--- | :--- |
+| **Plane 1: Global KV (`u8` + `sc` + `k_sum`)** | `6` layers × `4` KV heads × `128` dim = `408,576 B` (`409,600 B` 4K-aligned) | **Linear & Append-Only**: independent per slot $s \in [0, 64(k+1)-1]$ | Read Section 1 from **all** chunks `0 .. k` (`400 KiB × (k+1)`) |
+| **Plane 2: SWA KV (`FP32` 64-tok delta)** | `5` layers × `4` KV heads × `128` dim × `2` (`K,V`) = `1,310,720 B` (`1.25 MiB`) | **256-Token Ring (`4` chunks)**: tokens older than `pos - 256` are overwritten | Read Section 2 **only** from chunks `max(0, k-3) .. k` (`≤ 5.0 MiB` total) |
+| **Plane 3: `ShortConv` State (`FP32` snap)** | `13` layers × `2048` ch × `6` taps = `638,976 B` (`624 KiB`) | **Recurrent / Non-Invertible**: summarizes `0 .. 64k+63` into 6 taps | Read Section 3 **only** from terminal chunk `k` (`O(1)`, `624 KiB`) |
+| **Plane 1b: Short-Ctx Global `FP32` KV** | `6` layers × `4` KV heads × `128` dim × `2` (`K,V`) = `1,572,864 B` (`k < 4` only) | Used **only** when `m_pos < 256` (`lfm3_v2.cpp:2210`); unread for `m_pos ≥ 256` | Read Section 4 **only** when `matched_tokens < 256` (`0 B` for `≥ 256` tok!) |
+
+**8,192-Token (`128`-Chunk) Cold NVMe Restore Budget on `roma`:**
+- `128 × 409,600 B` (Plane 1) + `4 × 1,310,720 B` (Plane 2) + `1 × 638,976 B` (Plane 3) + `1 × 12,288 B` (Section 0 Header + `last_h`) = **`58,323,968 B` (`55.62 MiB`)** total read (`~28–40 ms` cold NVMe `pread`, `~5 ms` warm Linux VFS page cache), cutting 8K TTFT from **`~111 s` to `< 0.8 s`** (including tail suffix prefill).
+
+---
+
+### 8.2 Exact `.kvb` (`LFMKVB01`) 4 KiB-Aligned Binary Specification
+
+Every cached 64-token block is stored as an immutable, crash-safe file `/var/lib/romanaccio/kv_cache/<model_ns>/<h0..1>/<32_hex_block_key>.kvb` where **every section offset and size is an exact multiple of `4,096` bytes** (enabling zero-copy page-cache alignment and selective `pread()` of cold vs. hot planes):
+
+```text
++--------------------------------------------------------------------------------------------------+
+|                        .kvb ("LFMKVB01") CHUNK FILE LAYOUT (B = 64 TOKENS)                       |
++--------------------------------------------------------------------------------------------------+
+| Offset       | Size (LFM3)   | Size (LFM2.5) | Section Contents & Read Policy                    |
+|--------------+---------------+---------------+---------------------------------------------------|
+| 0x000000     |     12,288 B  |     12,288 B  | SECTION 0: Metadata + Tokens + Final Hidden State |
+|   +0x0000    |      (256 B)  |      (256 B)  |   • KvbHeader (magic "LFMKVB01", hashes, geom)    |
+|   +0x0100    |      (256 B)  |      (256 B)  |   • int32_t token_ids[64] (exact collision guard) |
+|   +0x0200    |    (8,192 B)  |    (8,192 B)  |   • float last_h[2048] (t=63 pre-emb_norm hidden) |
+|   +0x2200    |    (3,584 B)  |    (3,584 B)  |   • Zero pad to 12,288 B (3 x 4 KiB pages)        |
+|--------------+---------------+---------------+---------------------------------------------------|
+| 0x003000     |    409,600 B  |    425,984 B  | SECTION 1 (Plane 1): Global KV u8 + sc + k_sum    |
+|              |  (raw 408,576 |  (raw 423,936 |   • k_u8[6][H_kv][64][D_h]  (196,608 B)           |
+|              |   +1,024 pad) |   +2,048 pad) |   • v_u8[6][H_kv][64][D_h]  (196,608 B)           |
+|              |               |               |   • k_sc[6][H_kv][64]       (6,144 / 12,288 B)    |
+|              |               |               |   • v_sc[6][H_kv][64]       (6,144 / 12,288 B)    |
+|              |               |               |   • k_sum[6][H_kv][64]      (3,072 /  6,144 B)    |
+|              |               |               |   --> READ FOR ALL CHUNKS 0 .. k                  |
+|--------------+---------------+---------------+---------------------------------------------------|
+| 0x067000 /   |  1,310,720 B  |          0 B  | SECTION 2 (Plane 2): SWA KV FP32 64-Token Delta   |
+| 0x06B000     |  (320 x 4 KiB)|    (omitted)  |   • swa_k_f32[5][4][64][128] (655,360 B)          |
+|              |               |               |   • swa_v_f32[5][4][64][128] (655,360 B)          |
+|              |               |               |   --> READ ONLY FOR CHUNKS max(0, k-3) .. k       |
+|--------------+---------------+---------------+---------------------------------------------------|
+| 0x1A7000 /   |    638,976 B  |    294,912 B  | SECTION 3 (Plane 3): ShortConv Rolling State Snap |
+| 0x06B000     |  (156 x 4 KiB)|   (72 x 4 KiB)|   • LFM3:   float conv[13][2048][6] (638,976 B)   |
+|              |               |               |   • LFM2.5: float conv[18][2048][2] (294,912 B)   |
+|              |               |               |   --> READ ONLY FOR TERMINAL HIT CHUNK k          |
+|--------------+---------------+---------------+---------------------------------------------------|
+| 0x243000 /   |  1,572,864 B  |  1,572,864 B  | SECTION 4 (Plane 1b, OPTIONAL: block_idx < 4 only)|
+| 0x0B3000     |  (blocks 0..3 |  (blocks 0..3 |   • glob_k_f32[6][H_kv][64][D_h] (786,432 B)      |
+|              |   0 B for >=4)|   0 B for >=4)|   • glob_v_f32[6][H_kv][64][D_h] (786,432 B)      |
+|              |               |               |   --> READ ONLY WHEN matched_tokens < 256         |
++--------------+---------------+---------------+---------------------------------------------------+
+| TOTAL (>=4)  |  2,371,584 B  |    733,184 B  | 2.262 MiB/chunk (LFM3) | 716.0 KiB/chunk (LFM2.5) |
+| TOTAL (0..3) |  3,944,448 B  |  2,306,048 B  | 3.762 MiB/chunk (LFM3) | 2.199 MiB/chunk (LFM2.5) |
++--------------------------------------------------------------------------------------------------+
+```
+
+**Why `last_h[2048]` (`8 KiB`) in Section 0 Matters:**
+- When an incoming prompt's token length is an exact multiple of 64 (`N = 64 * (k + 1)`, `0` suffix tokens remaining — e.g., roleplay swipe/regenerate or `d1-2B` zero-decode classification), restoring chunks `0 .. k` leaves `0` tokens to feed into `forward_chunk()`. Reading `last_h[2048]` from chunk `k` lets the engine invoke `compute_logits_from_ptr(last_h)` directly on the Dual-Die LM Head in **`~7.0 ms`**, executing **zero** of the 24 backbone layers while producing bit-identical 128K logits.
+
+---
+
+### 8.3 Shared `RadixCache` C++17 Header Design (`src/eswin_runtime/include/prefix_cache.hpp`)
+
+Both `src/LFM3/lfm3_v2.cpp` and `src/LFM2.5-8B-A1B/lfm2_moe.cpp` share a single header-only / runtime-linked implementation in `src/eswin_runtime/include/prefix_cache.hpp`:
+
+```cpp
+#pragma once
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace eswin::prefix_cache {
+
+static constexpr uint32_t kKvbFormatVersion = 1;
+static constexpr uint32_t kBlockTokens      = 64;
+static constexpr size_t   kPageAlign        = 4096;
+
+enum KvbFlags : uint32_t {
+    KVB_FLAG_NONE          = 0,
+    KVB_FLAG_HAS_SWA       = 1u << 0, // Section 2 populated (LFM3 = 1, LFM2.5 = 0)
+    KVB_FLAG_HAS_GLOB_FP32 = 1u << 1, // Section 4 populated (block_idx < 4)
+    KVB_FLAG_HAS_VISION    = 1u << 2, // Multimodal visual_embeds mixed into block_key
+    KVB_FLAG_PINNED        = 1u << 3, // Immortal until explicit unpin/clear
+};
+
+enum class ModelArchId : uint32_t {
+    LFM3_1_7B     = 1,
+    LFM2_5_8B_A1B = 2,
+};
+
+struct Hash128 {
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    bool operator==(const Hash128 &o) const noexcept { return lo == o.lo && hi == o.hi; }
+    std::string to_hex() const; // 32-char lowercase hex
+};
+
+struct Hash128Hasher {
+    size_t operator()(const Hash128 &h) const noexcept {
+        return static_cast<size_t>(h.lo ^ (h.hi * 0x9e3779b97f4a7c15ULL));
+    }
+};
+
+// Exact 256-byte on-disk header at offset 0x0000 of every .kvb file
+struct alignas(64) KvbHeader {
+    char     magic[8];              // "LFMKVB01"
+    uint32_t format_version;        // 1
+    uint32_t header_bytes;          // 256
+    uint32_t flags;                 // KvbFlags bitmask
+    uint32_t arch_id;               // ModelArchId
+    uint32_t block_tokens;          // 64
+    uint32_t block_idx;             // k (covers token positions [64*k .. 64*k+63])
+
+    uint16_t hidden_dim;            // 2048
+    uint16_t num_glob_layers;       // 6
+    uint16_t num_swa_layers;        // 5 (LFM3) or 0 (LFM2.5)
+    uint16_t num_conv_layers;       // 13 (LFM3) or 18 (LFM2.5)
+    uint16_t kv_heads;              // 4 (LFM3) or 8 (LFM2.5)
+    uint16_t head_dim;              // 128 (LFM3) or 64 (LFM2.5)
+    uint16_t conv_state_taps;       // 6 (LFM3) or 2 (LFM2.5)
+    uint16_t reserved_u16;          // 0
+
+    Hash128  model_fingerprint;     // Hash(weights_die0/1 FNV + quant_chan_scales + tp/ep mode)
+    Hash128  parent_key;            // {0,0} for block_idx == 0, else block_key[k-1]
+    Hash128  block_key;             // Chained 128-bit key for this 64-token block
+    Hash128  vision_hash;           // Hash of visual_embeds spanning this block (0 if text-only)
+
+    uint64_t off_glob_u8;           // 12288 (0x3000)
+    uint64_t len_glob_u8_raw;       // 408576 (LFM3) or 423936 (LFM2.5)
+    uint64_t len_glob_u8_aligned;   // 409600 (LFM3) or 425984 (LFM2.5)
+    uint64_t off_swa_f32;           // 421888 (LFM3) or 438272 (LFM2.5)
+    uint64_t len_swa_f32;           // 1310720 (LFM3) or 0 (LFM2.5)
+    uint64_t off_conv_f32;          // 1732608 (LFM3) or 438272 (LFM2.5)
+    uint64_t len_conv_f32;          // 638976 (LFM3) or 294912 (LFM2.5)
+    uint64_t off_glob_f32;          // 2371584 (LFM3) or 733184 (LFM2.5) when block_idx < 4, else 0
+    uint64_t len_glob_f32;          // 1572864 when block_idx < 4, else 0
+
+    uint64_t payload_checksum_lo;   // 128-bit integrity hash over [0x0100 .. EOF)
+    uint64_t payload_checksum_hi;
+    uint64_t created_unix_ms;
+    uint8_t  reserved_pad[16];
+};
+static_assert(sizeof(KvbHeader) == 256, "KvbHeader must be exactly 256 bytes");
+
+struct ModelCacheGeometry {
+    ModelArchId arch_id;
+    std::string model_namespace;    // e.g. "lfm3-1.7b-int8-tp2" or "lfm2.5-8b-a1b-ep2"
+    Hash128     model_fingerprint;  // Invalidates stale .kvb files automatically on re-quantization
+    uint16_t    hidden_dim      = 2048;
+    uint16_t    num_glob_layers = 6;
+    uint16_t    num_swa_layers  = 5;
+    uint16_t    num_conv_layers = 13;
+    uint16_t    kv_heads        = 4;
+    uint16_t    head_dim        = 128;
+    uint16_t    conv_state_taps = 6;
+    uint32_t    swa_cap         = 320; // kSwaCap = 256 + 64
+    uint32_t    max_ctx         = 4096;
+};
+
+// Non-owning pointers into Lfm3Engine's live NUMA-pinned state buffers
+struct EngineStateView {
+    uint8_t  *glob_k_u8  = nullptr; // [6][kv_heads][max_ctx][head_dim]
+    uint8_t  *glob_v_u8  = nullptr;
+    float    *glob_k_sc  = nullptr; // [6][kv_heads][max_ctx]
+    float    *glob_v_sc  = nullptr;
+    uint16_t *glob_k_sum = nullptr; // [6][kv_heads][max_ctx]
+    float    *glob_k_f32 = nullptr; // [6][kv_heads][max_ctx][head_dim] (used when pos < 256)
+    float    *glob_v_f32 = nullptr;
+    float    *swa_k_f32  = nullptr; // [num_swa_layers][kv_heads][swa_cap][head_dim]
+    float    *swa_v_f32  = nullptr;
+    float    *conv_state = nullptr; // [num_conv_layers][hidden_dim][conv_state_taps]
+};
+
+struct PrefixLookupResult {
+    int                   matched_blocks = 0;   // Number of matched 64-token blocks (0 = miss)
+    int                   matched_tokens = 0;   // matched_blocks * 64
+    std::vector<Hash128>  chain_keys;           // Precomputed keys for ALL full blocks of prompt
+    std::vector<std::string> hit_paths;         // .kvb paths for blocks [0 .. matched_blocks-1]
+};
+
+struct CacheTelemetry {
+    int    prompt_tokens         = 0;
+    int    cached_tokens         = 0;  // OpenAI usage.prompt_tokens_details.cached_tokens
+    int    cached_tier0_tokens   = 0;  // Hot in-RAM sticky state hit
+    int    cached_disk_tokens    = 0;  // Restored from NVMe .kvb
+    int    computed_tokens       = 0;  // Actually evaluated on NPU this turn
+    double lookup_ms             = 0.0;
+    double restore_ms            = 0.0;
+    double async_enqueue_ms      = 0.0;
+    std::string cache_status;          // "HIT" | "PARTIAL" | "MISS" | "BYPASS"
+    std::string cache_tier;            // "ram_sticky" | "nvme_disk" | "mixed" | "none"
+};
+
+struct CacheStatsSnapshot {
+    uint64_t resident_blocks     = 0;
+    uint64_t pinned_blocks       = 0;
+    uint64_t disk_bytes_used     = 0;
+    uint64_t disk_bytes_quota    = 0;
+    uint64_t total_lookups       = 0;
+    uint64_t total_block_hits    = 0;
+    uint64_t total_tokens_saved  = 0;
+    uint64_t total_evictions     = 0;
+    uint64_t pending_writes      = 0;
+};
+
+class RadixCache {
+public:
+    RadixCache() = default;
+    ~RadixCache(); // Flushes async write queue and compacts index.wal -> index.snap
+
+    bool init(const std::filesystem::path &root_dir,
+              const ModelCacheGeometry &geom,
+              uint64_t max_disk_bytes = 256ULL * 1024 * 1024 * 1024);
+
+    // Computes chained 128-bit keys for all full 64-token blocks in `tokens` and walks the radix index.
+    // Mixes visual_embeds slices whenever token_id == image_token_id (125030).
+    PrefixLookupResult lookup(const int32_t *tokens, size_t n_tokens,
+                              const float *visual_embeds = nullptr,
+                              size_t num_visual_tokens = 0,
+                              int32_t image_token_id = 125030,
+                              const std::string &cache_namespace = "");
+
+    // Selective parallel pread() + NUMA-local OpenMP scatter into `view`; writes terminal chunk's
+    // last_h[2048] into `out_last_h` (so 0-suffix exact hits only run compute_logits_from_ptr).
+    bool restore_blocks(const PrefixLookupResult &hit,
+                        int blocks_to_restore,
+                        EngineStateView &view,
+                        float *out_last_h,
+                        double &out_restore_ms);
+
+    // Captures newly computed 64-token block `block_idx` into a staging buffer (< 0.4 ms memcpy)
+    // and enqueues atomic temp-file + rename write onto the background NVMe writer thread.
+    void enqueue_save_block(uint32_t block_idx,
+                            const Hash128 &parent_key,
+                            const Hash128 &block_key,
+                            const Hash128 &vision_hash,
+                            const int32_t token_ids[64],
+                            const float last_h[2048],
+                            const EngineStateView &view,
+                            bool pinned = false);
+
+    // Leaf-first GDSF eviction: evicts unpinned leaf nodes (num_children == 0) ordered by
+    // priority = (hit_count * cost_weight) / file_bytes + clock_age until usage <= max_disk_bytes.
+    size_t evict_to_quota();
+    bool   set_pinned(const std::vector<Hash128> &keys, bool pinned);
+    size_t clear(bool include_pinned = false);
+    void   flush_async_writes();
+    CacheStatsSnapshot stats() const;
+};
+
+} // namespace eswin::prefix_cache
+```
+
+---
+
+### 8.4 Detailed Implementation Plan (Milestones 17A, 17B, 17C)
+
+#### Milestone 17A (Host-Testable While `roma` Is Offline): `prefix_cache.hpp`, Journaled Radix Index & Unit Tests
+
+- **Goal**: Build and exhaustively unit-test the complete `.kvb` serializer, NUMA scatter/gather engine, crash-safe WAL journal, leaf-first GDSF eviction, and async writer on the x86_64 Arch Linux host **without needing SSH access to `roma`**.
+- **Files to Create**:
+  - `src/eswin_runtime/include/prefix_cache.hpp`
+  - `src/eswin_runtime/tests/test_prefix_cache.cpp`
+  - Update `src/eswin_runtime/CMakeLists.txt` & `src/eswin_runtime/Makefile`
+- **Step-by-Step Instructions**:
+  1. **128-Bit Chained Hashing (`XXH3_128` / `SplitMix-FNV128`)**:
+     - Compute `block_key[k] = Hash128(model_fingerprint || namespace_hash || parent_key || tokens[64*k .. 64*k+63] || vision_hash[k])`.
+     - If any token in `[64*k .. 64*k+63]` equals `<|image|>` (`125030`), hash the corresponding `[n_img_in_chunk, 2048]` FP32 `visual_embeds` slice into `vision_hash[k]` and set `KVB_FLAG_HAS_VISION`.
+  2. **Atomic Crash-Safe Persistence & WAL Index**:
+     - Background writer writes to `<key>.kvb.tmp.<tid>`, calls `fdatasync(fd)`, and atomically `rename()`s to `<h0..1>/<key>.kvb` (256-way fanout directory `00`..`ff` so ext4/xfs directory dentries stay tiny even at `200,000+` cached blocks on 1 TB).
+     - Append `PUT <key> <parent_key> <block_idx> <bytes> <flags> <ts>\n` (and `DEL <key>\n` / `PIN <key> <0|1>\n`) to `<model_ns>/index.wal`. On `init()`, replay `index.snap` + `index.wal`, verify file existence, unlink any orphaned `.tmp.*` files, and rebuild in-memory radix tree children counts (`num_children`).
+     - **Important Page-Cache Rule**: Unlike `weights_die0.bin` (which calls `POSIX_FADV_DONTNEED` to free 5.17 GiB after MMZ DMA copy), **do NOT evict `.kvb` pages** with `POSIX_FADV_DONTNEED` on read/write — let Linux's 8.78 GiB free RAM serve as an automatic warm L2 VFS cache (`POSIX_FADV_SEQUENTIAL` on `pread` only).
+  3. **Host Unit Test Suite (`test_prefix_cache.cpp`)**:
+     - Test **1 (Round-Trip Bit-Exactness)**: Synthesize deterministic pseudo-random `LFM3` (`4×128`, 5 SWA, 13×6 conv) and `LFM2.5` (`8×64`, 0 SWA, 18×2 conv) states across 10 chunks (`640` tokens), save to `/tmp/test_kvb`, clear buffers to `0xA5`, restore at `k = 2` (`192` tok, exercises Section 4 `glob_f32`) and `k = 9` (`640` tok, exercises SWA ring wrap-around across `kSwaCap = 320`), and assert `0` byte differences across active Global KV, active SWA window `[pos-256 .. pos-1]`, `conv_state`, and `last_h`.
+     - Test **2 (Divergent Branching & SWA Isolation)**: Branch sequence B from sequence A at chunk `4` (`256` tok), advance B to chunk `8`, then restore A at chunk `7` and verify B's SWA/Conv writes never alias A.
+     - Test **3 (Model Fingerprint Invalidation & Corruption Guard)**: Flip 1 bit in `model_fingerprint` (simulating Milestone 16 re-calibration) -> assert `0` false hits; flip 1 byte in `.kvb` Section 1 -> assert checksum rejects block cleanly and falls back to re-prefill without crashing.
+     - Test **4 (Leaf-First GDSF Eviction & Pinning)**: Set quota to `10 MiB`, pin root system-prompt blocks `0..1`, insert 20 leaf branches, and assert eviction strictly prunes unpinned leaves (`num_children == 0`) while pinned ancestors survive 100%.
+- **Acceptance Gate (Host Only)**:
+  - Compiles cleanly with `g++ -O3 -std=c++17 -fopenmp` (zero warnings under `-Wall -Wextra`) and passes all 4 unit tests in `< 2.0 s` on host.
+
+---
+
+#### Milestone 17B: `lfm3_v2.cpp` Tri-Hybrid Engine Integration (Tier-0 Sticky Turn State + Tier-1 NVMe `.kvb` + PLD Synergy)
+
+- **Goal**: Wire `RadixCache` and Tier-0 sticky session state into `Lfm3Engine` (`src/LFM3/lfm3_v2.cpp`) for both `--daemon` mode and interactive REPL / CLI benchmarks.
+- **Files to Modify**:
+  - `src/LFM3/lfm3_v2.cpp`
+  - `src/LFM3/Makefile` & `src/LFM3/CMakeLists.txt` (add `-I../eswin_runtime/include`)
+- **Step-by-Step Instructions**:
+  1. **Compute `model_fingerprint` at `Lfm3Engine::init()`**:
+     - Combine the existing 64-bit FNV-1a `head`/`tail` hashes of `weights_die0.bin` and `weights_die1.bin` (`lfm3_v2.cpp`) with a 64-bit hash of `quant_chan_scales.bin`, `m_cpu_weights_buf`, and `m_tp_degree`.
+  2. **Tier-0 Hot In-RAM Sticky State + Ephemeral Turn-End Slot (`0 ms` Consecutive Chat TTFT)**:
+     - Track `std::vector<int32_t> m_live_tokens` representing tokens `[0 .. m_pos - 1]` currently resident in `Lfm3Engine`'s RAM buffers, plus one unaligned turn-end snapshot (`m_turn_snap_pos`, `m_turn_snap_conv`, `m_turn_snap_last_h`).
+     - In `run_daemon_server()`, when generation finishes on `<|im_end|>` (`124900`), `m_live_tokens` already holds `prompt_ids + generated_assistant_ids` (excluding `<|im_end|>`). On the next HTTP request, compute Longest Common Prefix (`lcp`) between `new_prompt_ids` and `m_live_tokens`:
+       - If `lcp == m_turn_snap_pos` and `lcp >= disk_hit_tokens` (standard multi-turn chat continuation where the client appended `<|im_end|>\n<|im_start|>user\n...`), **do NOT call `reset_state()` and do NOT touch NVMe**! Rewind `m_pos = m_turn_snap_pos`, restore `m_conv_state = m_turn_snap_conv`, and prefill **only** the new turn's suffix tokens (`new_prompt_ids[lcp .. end]`)!
+  3. **Tier-1 NVMe `.kvb` Restore & Block Checkpointing (`prefill_cached()`)**:
+     - When Tier-0 LCP is shorter than `RadixCache::lookup()`, call `reset_state_fast()` (skipping `NumaKvBuffer::clear()` on regions about to be overwritten, clearing only `m_act`/`m_out` DMA buffers), then call `m_prefix_cache.restore_blocks(...)`:
+       - If `matched_tokens < prompt_ids.size()`: set `m_pos = matched_tokens` and run `forward_chunk` in `T=64` batches over `[matched_tokens .. prompt_ids.size() - 1]`.
+       - If `matched_tokens == prompt_ids.size()` (`0` suffix tokens): set `m_pos = matched_tokens` and call `compute_logits_from_ptr(restored_last_h, timers, nullptr)` (`~7 ms` Dual-Die LM Head!).
+     - At the end of every full `T=64` step in `prefill_cached()` (and whenever autoregressive decode / `T=8` PLD crosses a `64`-token boundary `(m_pos % 64) == 0`), call `m_prefix_cache.enqueue_save_block(...)` if that `block_key` is not already cached.
+  4. **Milestone 9 `--speculative-pld` Synergy**:
+     - Ensure `history` in `run_daemon_server()` is initialized with the **full** `prompt_ids` (including restored cached prefix tokens!), so `draft_pld()` immediately mines $n$-grams from cached code files and system prompts at `20–24 tok/s`.
+  5. **New CLI & Verification Flags**:
+     - `--cache-dir DIR` (default `/var/lib/romanaccio/kv_cache` or `~/.cache/romanaccio/kv_cache`), `--cache-max-gb N` (default `256`), `--no-prefix-cache` (disables cache for A/B benchmarks), and `--verify-prefix-cache` (runs automated on-silicon bit-exactness gate).
+- **Acceptance Gate (On `roma` Silicon When Connected)**:
+  - `./lfm3_v2 --tp2 --verify-prefix-cache`: Runs a `3,781`-token prompt (`bench_c_code_4k.c`) cold (populates `59` `.kvb` blocks), calls `reset_state()`, re-runs the same `3,781` tokens + `64`-token query from NVMe cache, and asserts **`Max Abs Logits Diff == 0.000000` (`Cosine == 1.00000000`)** and **`4/4` identical greedy tokens** vs. uncached execution, with **8K restore latency `<= 50 ms`**.
+
+---
+
+#### Milestone 17C: Unified Multi-Model OpenAI Server (`lfm3_openai_server.py`) & Standard OpenAI Prompt-Caching Telemetry
+
+- **Goal**: Upgrade `src/LFM3/lfm3_openai_server.py` into a unified OpenAI gateway serving **both** `LFM3` (`lfm3_v2 --daemon 8088`) and `LFM2.5-8B-A1B` (`lfm2_moe --daemon 8089`) with 100% OpenAI-compliant `prompt_tokens_details.cached_tokens` telemetry, `stream_options.include_usage`, cache pinning, and management endpoints.
+- **Files to Modify / Create**:
+  - `src/LFM3/lfm3_openai_server.py`
+  - `src/LFM3/test_openai_prefix_telemetry.py` (mock-daemon FastAPI test suite runnable on host while `roma` is offline)
+- **Step-by-Step Instructions**:
+  1. **Multi-Backend Model Routing**:
+     - Support `--backend-map` CLI flag (e.g. `lfm3-1.7b=roma:8088,lfm2.5-8b-a1b=roma:8089`, defaulting all `lfm3-*`/`d1-2b` models to `:8088` and `lfm2.5-8b-a1b` to `:8089`).
+     - Register `"lfm2.5-8b-a1b"` in `/v1/models` and route `POST /v1/chat/completions` and `POST /v1/completions` by `request.model`.
+  2. **Canonical Prompt Prefix Stability (Critical for Hit Rate)**:
+     - Audit `format_messages_to_lfm3_prompt()` to guarantee **deterministic, append-only serialization**:
+       - Never inject dynamic timestamps or request IDs into the default system prompt.
+       - Preserve exact byte-for-byte formatting of `system`, `tool` schemas, `user`, and `assistant` turns (stripping historic `<think>...</think>` blocks from prior `assistant` messages if present, matching Liquid AI's multi-turn chat template so past reasoning traces neither bloat context nor break prefix hashes).
+       - Support Anthropic/OpenRouter-style `cache_control: {"type": "ephemeral" | "pinned"}` on `ChatMessage` or `ContentPart`, computing `pin_prefix_tokens` up to the marked message and passing `"pin_blocks_up_to": pin_block_count` to the C++ daemon.
+  3. **Standard OpenAI Telemetry Schema (Non-Streaming & Streaming SSE)**:
+     - Extend `ChatCompletionRequest` and `CompletionRequest` with:
+       - `stream_options: Optional[Dict[str, Any]] = None` (supporting `{"include_usage": true}`)
+       - `prompt_cache_key: Optional[str] = None` (OpenAI's official cache namespace/routing hint)
+       - `cache: Optional[bool] = True` (`false` bypasses prefix cache for clean benchmarking)
+     - Emit the **exact OpenAI standard `usage` object** on all non-streaming responses and on the final SSE usage chunk:
+       ```json
+       "usage": {
+         "prompt_tokens": 3845,
+         "completion_tokens": 128,
+         "total_tokens": 3973,
+         "prompt_tokens_details": {
+           "cached_tokens": 3776,
+           "audio_tokens": 0
+         },
+         "completion_tokens_details": {
+           "reasoning_tokens": 0
+         }
+       }
+       ```
+     - When `request.stream == True` and `request.stream_options.get("include_usage") == True`, follow the strict OpenAI SDK contract: emit the `finish_reason: "stop"` chunk with `"usage": null`, immediately followed by a final chunk with `"choices": []` and the populated `"usage"` object before `data: [DONE]\n\n` (so OpenAI Python/TypeScript SDKs, `aider`, `cline`, `OpenHands`, and `LiteLLM` parse `cached_tokens` automatically!).
+     - Also attach `timings` (`cache_n`, `prompt_n`, `prompt_ms`, `restore_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`, `predicted_per_second` — recognized natively by SillyTavern & `llama.cpp` frontends) and HTTP headers `X-Cache-Status`, `X-Cached-Tokens`, `X-Cache-Tier`, and `X-Cache-Restore-Ms`.
+  4. **Cache Management REST Endpoints**:
+     - `GET /v1/cache/stats`: Queries connected daemon(s) (`{"cmd": "cache_stats"}`) and returns resident blocks, pinned blocks, NVMe bytes used vs. quota, block hit rate, and total saved prompt tokens.
+     - `POST /v1/cache/clear`: Clears unpinned (or all, if `{"include_pinned": true}`) cache entries.
+- **Acceptance Gate (Host Mock Test + `roma` Live Test)**:
+  - Host offline gate: `pytest src/LFM3/test_openai_prefix_telemetry.py` spins up a lightweight mock TCP daemon speaking the updated JSON protocol and verifies `usage.prompt_tokens_details.cached_tokens`, `stream_options={"include_usage": True}` `choices: []` chunking, `X-Cache-Status` headers, and `/v1/cache/stats` across both non-streaming and streaming SSE.
+  - Silicon live gate (when `roma` is online): Two back-to-back 4K-token `/v1/chat/completions` requests report `cached_tokens: 0` (`X-Cache-Status: MISS`) on turn 1 and `cached_tokens >= 3776` (`X-Cache-Status: PARTIAL`/`HIT`, TTFT `< 1.2 s`) on turn 2.
 
