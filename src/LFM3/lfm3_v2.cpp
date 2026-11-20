@@ -4946,6 +4946,27 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             continue;
         }
 
+        {
+            std::ostringstream p_ss;
+            p_ss << "{\"type\":\"prefill_done\",\"prompt_tokens\":" << prompt_ids.size()
+                 << ",\"cached_tokens\":" << cache_tel.cached_tokens()
+                 << ",\"cached_tier0_tokens\":" << cache_tel.cached_tier0_tokens
+                 << ",\"cached_disk_tokens\":" << cache_tel.cached_disk_tokens
+                 << ",\"computed_prompt_tokens\":" << cache_tel.computed_prompt_tokens
+                 << ",\"cache_lookup_ms\":" << cache_tel.lookup_ms
+                 << ",\"cache_restore_ms\":" << cache_tel.restore_ms
+                 << ",\"cache_status\":\"" << cache_tel.status << "\""
+                 << ",\"cache_tier\":\"" << cache_tel.tier << "\""
+                 << ",\"prefill_ms\":" << prefill_t.total_ms()
+                 << "}\n";
+            std::string p_ev = p_ss.str();
+#if defined(MSG_NOSIGNAL)
+            send(client_fd, p_ev.data(), p_ev.size(), MSG_NOSIGNAL);
+#else
+            send(client_fd, p_ev.data(), p_ev.size(), 0);
+#endif
+        }
+
         int step = 0;
         int reasoning_tokens = 0;
         bool in_think = !no_think;

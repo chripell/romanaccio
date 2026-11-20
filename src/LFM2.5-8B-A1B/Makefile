@@ -14,7 +14,7 @@ TARGET         = lfm2_moe
 
 all: $(TARGET)
 
-$(TARGET): lfm2_moe.cpp
+$(TARGET): lfm2_moe.cpp $(RUNTIME_DIR)/include/prefix_cache.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 

@@ -1415,13 +1415,22 @@ public:
 
 ---
 
-#### Milestone 17C: Unified Multi-Model OpenAI Server (`lfm3_openai_server.py`) & Standard OpenAI Prompt-Caching Telemetry
+#### Milestone 17C: Unified Multi-Model OpenAI Server (`lfm3_openai_server.py`) & Standard OpenAI Prompt-Caching Telemetry — **COMPLETE (Host Mock & `roma` Silicon Verified — 2026-11-20)**
 
 - **Goal**: Upgrade `src/LFM3/lfm3_openai_server.py` into a unified OpenAI gateway serving **both** `LFM3` (`lfm3_v2 --daemon 8088`) and `LFM2.5-8B-A1B` (`lfm2_moe --daemon 8089`) with 100% OpenAI-compliant `prompt_tokens_details.cached_tokens` telemetry, `stream_options.include_usage`, cache pinning, and management endpoints.
-- **Files to Modify / Create**:
-  - `src/LFM3/lfm3_openai_server.py`
-  - `src/LFM3/test_openai_prefix_telemetry.py` (mock-daemon FastAPI test suite runnable on host while `roma` is offline)
-- **Step-by-Step Instructions**:
+- **Files Modified / Created**:
+  - [`src/LFM3/lfm3_openai_server.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_openai_server.py) (multi-backend routing `--backend-port 8088` / `--moe-port 8089` / `--backend-map`, `"lfm2.5-8b-a1b"` registration, prefix-stable ChatML serialization, `cache_control` pinning, OpenAI `usage` + SSE `stream_options.include_usage` + `X-Cache-*` headers + `timings`, `/v1/cache/stats` & `/v1/cache/clear`)
+  - [`src/LFM3/lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp) & [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) (early `"prefill_done"` daemon JSON event emitting cache status/tier/restore latency before first decoded token)
+  - [`src/LFM3/test_openai_prefix_telemetry.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/test_openai_prefix_telemetry.py) (mock-daemon FastAPI test suite runnable on host while `roma` is offline)
+- **Measured Acceptance Results (`FINDINGS.md` §52.8)**:
+  - **Host Offline Gate**: `pytest -v src/LFM3/test_openai_prefix_telemetry.py` passed **`5/5` in `0.43 s`** (`test_models_and_backend_routing`, `test_prefix_stable_chatml_thinking_and_pinning`, `test_non_streaming_telemetry_headers_and_bypass`, `test_sse_streaming_include_usage_and_legacy_fallback`, `test_cache_stats_and_clear_endpoints`).
+  - **Live Silicon Gate (`roma:8089`, `lfm2_moe --speculative-pld --daemon 8089`)**:
+    - `GET /v1/models` (`200`, lists `lfm2.5-8b-a1b` and `LFM3` models).
+    - Turn 1 non-stream -> `X-Cache-Status: MISS`, `X-Cached-Tokens: 0`, `tier=none`.
+    - Turn 2 SSE (`stream_options={"include_usage": True}`) -> `X-Cache-Status: PARTIAL`, `X-Cached-Tokens: 64`, `X-Cache-Tier: tier1_nvme`, `X-Cache-Restore-Ms: 8.13`, `finish_reason=stop`, trailing `choices: []` usage chunk (`prompt_tokens_details.cached_tokens=64`), `[DONE]`.
+    - Turn 3 repeat -> `X-Cache-Status: HIT`, `X-Cached-Tokens: 125`, `X-Cache-Tier: tier0_ram`, `cached_tokens=125`.
+    - `GET /v1/cache/stats?model=lfm2.5-8b-a1b` (`resident_blocks=3`, `tier0_hits=1`, `total_saved_tokens=189`, `block_hit_rate=0.5`) and `POST /v1/cache/clear` (`include_pinned: true` -> `removed_blocks=3`, `resident_blocks=0`).
+- **Implementation Architecture**:
   1. **Multi-Backend Model Routing**:
      - Support `--backend-map` CLI flag (e.g. `lfm3-1.7b=roma:8088,lfm2.5-8b-a1b=roma:8089`, defaulting all `lfm3-*`/`d1-2b` models to `:8088` and `lfm2.5-8b-a1b` to `:8089`).
      - Register `"lfm2.5-8b-a1b"` in `/v1/models` and route `POST /v1/chat/completions` and `POST /v1/completions` by `request.model`.
@@ -1455,7 +1464,4 @@ public:
   4. **Cache Management REST Endpoints**:
      - `GET /v1/cache/stats`: Queries connected daemon(s) (`{"cmd": "cache_stats"}`) and returns resident blocks, pinned blocks, NVMe bytes used vs. quota, block hit rate, and total saved prompt tokens.
      - `POST /v1/cache/clear`: Clears unpinned (or all, if `{"include_pinned": true}`) cache entries.
-- **Acceptance Gate (Host Mock Test + `roma` Live Test)**:
-  - Host offline gate: `pytest src/LFM3/test_openai_prefix_telemetry.py` spins up a lightweight mock TCP daemon speaking the updated JSON protocol and verifies `usage.prompt_tokens_details.cached_tokens`, `stream_options={"include_usage": True}` `choices: []` chunking, `X-Cache-Status` headers, and `/v1/cache/stats` across both non-streaming and streaming SSE.
-  - Silicon live gate (when `roma` is online): Two back-to-back 4K-token `/v1/chat/completions` requests report `cached_tokens: 0` (`X-Cache-Status: MISS`) on turn 1 and `cached_tokens >= 3776` (`X-Cache-Status: PARTIAL`/`HIT`, TTFT `< 1.2 s`) on turn 2.
 

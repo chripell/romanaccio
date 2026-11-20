@@ -217,19 +217,29 @@ The daemon keeps all weights resident in dual-die MMZ, maintains a Tier-0 RAM st
 - **Response telemetry** (`logits` and `done` events): `cached_tokens`, `cached_tier0_tokens`, `cached_disk_tokens`, `computed_prompt_tokens`, `reasoning_tokens`, `cache_lookup_ms`, `cache_restore_ms`, `cache_status` (`HIT_TIER0` | `HIT_DISK` | `MISS` | `BYPASS`), `cache_tier` (`tier0_ram` | `tier1_nvme` | `none`), `pld_accepted`, `pld_drafted`, `pld_steps`.
 - **Control commands**: `{"cmd":"cache_stats"}` and `{"cmd":"cache_clear","include_pinned":false}`.
 
-### 5.2 Start the OpenAI API Server (on host or board)
+### 5.2 Start the Unified Multi-Model OpenAI API Server (on host or board)
 
 ```bash
 cd /home/chri/aixigua/romanaccio/src/LFM3
-/home/chri/aixigua/venv/bin/python lfm3_openai_server.py --host 0.0.0.0 --port 8000 --backend-host roma --backend-port 8088
+/home/chri/aixigua/venv/bin/python lfm3_openai_server.py \
+  --host 0.0.0.0 --port 8000 --backend-host roma --backend-port 8088 --moe-port 8089
+# Or override specific model routes via --backend-map:
+# --backend-map lfm3-1.7b=roma:8088,lfm2.5-8b-a1b=roma:8089
 ```
 
-Endpoints available:
-- `GET  /v1/models` - Lists available models (`lfm3-1.7b`, `lfm3-1.7b-heretic`, `lfm3-vl-2b`, `d1-2b`).
-- `POST /v1/chat/completions` - Full chat completion spec, streaming Server-Sent Events (SSE) at ~9 tok/s, and multimodal `image_url` payloads.
-- `POST /v1/completions` - Raw prompt completions.
+Endpoints & features available:
+- `GET  /v1/models` - Lists available models (`lfm3-1.7b`, `lfm3-1.7b-int8`, `lfm3-1.7b-heretic`, `lfm3-vl-2b`, `d1-2b`, `lfm2.5-8b-a1b`).
+- `POST /v1/chat/completions` - OpenAI chat completions, SSE streaming (`stream: true`, `stream_options: {"include_usage": true}` trailing `choices: []` usage chunk), multimodal `image_url`, `prompt_cache_key`, `cache: false` bypass, `cache_control: {"type": "ephemeral" | "pinned"}` pinning, `usage.prompt_tokens_details.cached_tokens`, `X-Cache-{Status,Tokens,Tier,Restore-Ms}` headers, and `timings`.
+- `POST /v1/completions` - Raw prompt completions with full prefix-cache telemetry.
 - `POST /v1/decisions` - Single-pass zero-decode typed decisions (`d1-2b`).
+- `GET  /v1/cache/stats` - Query RadixCache + Tier-0 RAM stats (optional `?model=...`).
+- `POST /v1/cache/clear` - Clear unpinned (or all with `{"include_pinned": true}`) prefix cache entries.
 - `GET  /healthz` - Health probe.
+
+Offline mock-daemon telemetry test suite (`pytest`):
+```bash
+/home/chri/aixigua/venv/bin/pytest -v /home/chri/aixigua/romanaccio/src/LFM3/test_openai_prefix_telemetry.py
+```
 
 ---
 
@@ -473,7 +483,7 @@ During execution:
 
 ## 10. Sparse Mixture-of-Experts (`LiquidAI/LFM2.5-8B-A1B`, `8.47B` Total / `~1.42B` Active)
 
-The companion `LFM2.5-8B-A1B` Sparse MoE engine (`lfm2_moe`, full documentation in [`../LFM2.5-8B-A1B/README.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/README.md) and `FINDINGS.md` §52) runs all `8.47B` parameters across both NPU dies (`EP=2`, 16 even experts on Die 0 and 16 odd experts on Die 1 across Layers 2–23; `TP=2` dense stem on Layers 0–1) at **`11.30 tok/s` decode** and **`34.15 tok/s` prefill** while keeping **`8.78 GiB` of Linux OS RAM free**:
+The companion `LFM2.5-8B-A1B` Sparse MoE engine (`lfm2_moe`, full documentation in [`../LFM2.5-8B-A1B/README.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/README.md) and `FINDINGS.md` §52) runs all `8.47B` parameters across both NPU dies (`EP=2`, 16 even experts on Die 0 and 16 odd experts on Die 1 across Layers 2–23; `TP=2` dense stem on Layers 0–1) at **`11.38–12.67 tok/s` decode** and **`34.15–35.9 tok/s` prefill** (plus **`71.7×` warm 4K prefill speedup** via Tier-0 RAM + Tier-1 NVMe `.kvb` prefix caching) while keeping **`8.78 GiB` of Linux OS RAM free**:
 
 ```bash
 ssh roma
@@ -486,11 +496,13 @@ sudo LD_LIBRARY_PATH=. ./lfm2_moe --no-think -n 64 --temp 0 \
 # 2. Prompt from file (e.g., C code refactoring)
 sudo LD_LIBRARY_PATH=. ./lfm2_moe --no-think -n 160 --temp 0 --prompt-file /tmp/prompt_c.txt
 
-# 3. Interactive terminal chat REPL
+# 3. Interactive terminal chat REPL or resident daemon (listening on port 8089 for OpenAI server)
 sudo LD_LIBRARY_PATH=. ./lfm2_moe
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --speculative-pld --daemon 8089
 
-# 4. Golden Oracle verification & acceptance gate (0.9952 logits cosine, 0.9518 min-layer, 4/4 greedy, 11.30 tok/s)
+# 4. Golden Oracle & Prefix Cache verification gates (0.99837211 logits, 0.97924192 min-layer, 4/4 greedy, 11.38 tok/s, 5/5 bit-exact prefix cache)
 sudo LD_LIBRARY_PATH=. ./lfm2_moe --verify-golden golden_ref.bin
+sudo LD_LIBRARY_PATH=. ./lfm2_moe --verify-prefix-cache ../LFM3-1.7B_ENNP/bench_c_code_4k.c
 ```
 
 

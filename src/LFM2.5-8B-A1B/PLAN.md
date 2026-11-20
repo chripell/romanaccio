@@ -2,7 +2,7 @@
 
 > **Target Architecture**: LiquidAI `LFM2.5-8B-A1B` (8.47 Billion Total Parameters, ~1.22 Billion Active Parameters / Token).  
 > **Target Silicon**: ESWIN EIC7700X / EIC7702 Dual-Die RISC-V SoC (Board `roma` FML13V03, 64-bit SiFive P550 cores + Dual NPU cores + 27 GiB MMZ VRAM).  
-> **Status**: **Phases A, B, C & D Complete — Verified on `roma` Silicon at `11.30 tok/s` (`88.50 ms/tok`), `34.15 tok/s` Prefill, `0.99521100` Logits Cosine, `0.95180935` Min Layer Cosine, `4/4` Exact Greedy Match, and `8.78 GiB` Free OS RAM**.  
+> **Status**: **Phases A–F Complete — Verified on `roma` Silicon at `11.38–12.67 tok/s` (`0.99837211` Logits Cosine, `0.97924192` Min Layer Cosine, `4/4` Exact Greedy Match, `5/5` Bit-Exact Prefix Cache `max_abs=0.000000` with `71.7x` 4K TTFT Speedup & `19.14 ms` NVMe Restore, Live OpenAI Gateway `:8089`, and `8.78 GiB` Free OS RAM)**.  
 
 ---
 
@@ -256,10 +256,10 @@ With only **7 resident loadables per die**, the runtime consumes only **11.3% of
 
 ---
 
-### Phase F: Persistent 1 TB Hybrid Prefix Cache (`LFMKVB01` + `RadixCache`) & OpenAI Standard Telemetry — [PLANNED — HOST-TESTABLE NOW]
+### Phase F: Persistent 1 TB Hybrid Prefix Cache (`LFMKVB01` + `RadixCache`) & OpenAI Standard Telemetry — [COMPLETED & VERIFIED ON SILICON — 2026-11-20]
 
 #### F.1 Why `LFM2.5-8B-A1B` Is Even Lighter to Cache Than `LFM3-1.7B`
-Because `LFM2.5-8B-A1B` prefills at `34.15 tok/s` (`~240 s` for an 8,192-token agentic coding or roleplay prompt) and has **zero Sliding-Window Attention (`SWA`) layers** (`18` `ShortConv` layers with `K=3` $\implies$ only `2` rolling taps + `6` Global Attention layers with `8 × 64` KV heads), its persistent prefix cache footprint is extraordinarily compact:
+Because `LFM2.5-8B-A1B` prefills at `34.15–35.9 tok/s` (`~101 s` cold at `3,818` tokens) and has **zero Sliding-Window Attention (`SWA`) layers** (`18` `ShortConv` layers with `K=3` $\implies$ only `2` rolling taps + `6` Global Attention layers with `8 × 64` KV heads), its persistent prefix cache footprint is extraordinarily compact:
 
 | State Plane (`B = 64` tokens, matching `kPrefillBatch = 64`) | `LFM2.5-8B-A1B` Exact Tensor Geometry | Raw Bytes | 4 KiB-Aligned `.kvb` Size | Restore Read Policy at Hit Chunk $k$ |
 | :--- | :--- | :--- | :--- | :--- |
@@ -270,35 +270,31 @@ Because `LFM2.5-8B-A1B` prefills at `34.15 tok/s` (`~240 s` for an 8,192-token a
 | **Section 4 (Plane 1b): Short-Ctx `FP32` Global KV** | `6` layers × `8` KV heads × `64` tok × `64` dim × `2` × `4 B` (`k < 4` only) | `1,572,864 B` | **`1,572,864 B`** (`k < 4`; `0 B` for `k >= 4`) | Read **only** when `matched_tokens < 256` |
 | **Total `.kvb` File Size (`block_idx >= 4`)** | — | — | **`733,184 B` (`716.0 KiB`)** | **1 TB NVMe holds `~1,400,000` blocks (`~90M` tokens / `~11,000` 8K sessions!)** |
 
-- **8,192-Token (`128`-Chunk) Cold NVMe Restore Volume**: `128 × 425,984 B` (Section 1) + `1 × 294,912 B` (Section 3) + `1 × 12,288 B` (Section 0) = **`54,833,152 B` (`52.29 MiB`)**, streaming from `roma`'s NVMe SSD in **`~25–35 ms`** (`~4 ms` from warm Linux VFS page cache) — a **`> 200×` end-to-end TTFT speedup** when `1` suffix chunk remains (`~1.9 s` vs. `~240 s`), and a **`> 6,000×` TTFT speedup** (`~42 ms` total, running `compute_logits_from_ptr(last_h)` on the Dual-Die LM Head in `~7 ms` with zero MoE layer submits!) on exact 64-token-aligned full hits (e.g., roleplay swipe/regenerate).
+- **Measured `3,818`-Token (`59`-Chunk) Silicon NVMe Restore**: `19.14 ms` (`8K`-scaled `41.53 ms <= 45 ms`), `cold = 101,033.7 ms -> warm = 1,408.7 ms` (**`71.7×` speedup**) with `42` suffix tokens, and `18.79 ms` restore / `6.01 ms` total on an exact 64-token-aligned `0`-suffix hit (`3,776` tok).
 
 #### F.2 Detailed Step-by-Step Implementation Checklist
 
-1. **Step F.1 — Shared `prefix_cache.hpp` & Host Unit Tests (Host-Only, Zero `roma` Dependency; Cross-Ref `src/LFM3/PLAN.md` §8.3–§8.4) — [COMPLETED & HOST-VERIFIED 2026-11-09]**:
+1. **Step F.1 — Shared `prefix_cache.hpp` & Host Unit Tests (Cross-Ref `src/LFM3/PLAN.md` §8.3–§8.4) — [COMPLETED & HOST-VERIFIED 2026-11-09]**:
    - [x] Implement [`src/eswin_runtime/include/prefix_cache.hpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/include/prefix_cache.hpp) with `KvbHeader` (`magic = "LFMKVB01"`, `sizeof == 256`), `ModelArchId::LFM2_5_8B_A1B = 2`, 128-bit chained `Hash128` block keys, crash-safe WAL index (`index.wal` + `index.snap`), leaf-first GDSF eviction (`num_children == 0`), `KVB_FLAG_PINNED` support, and background async NVMe writer thread.
    - [x] Build and run `src/eswin_runtime/tests/test_prefix_cache.cpp` on the local Arch Linux host, explicitly testing the `LFM2.5-8B-A1B` geometry (`kv_heads = 8`, `head_dim = 64`, `num_swa_layers = 0`, `num_conv_layers = 18`, `conv_state_taps = 2`) — **4/4 passed in `485.7 ms`**.
 
-2. **Step F.2 — Automatic Cache Invalidation Across 3-Chunk MMZ Weight Blobs & Phase E Re-Calibration**:
-   - [ ] In [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) (`init()`, lines `1366–1382`), combine the 64-bit FNV-1a `head` and `tail` hashes already computed over `m_w_blob[d][0]` and `m_w_blob[d][2]` on Die 0 and Die 1 with a 64-bit hash of `m_chan_scales_buf` (`quant_chan_scales.bin`) and `m_cpu_weights_buf` into `ModelCacheGeometry::model_fingerprint`.
-   - [ ] This guarantees that applying Phase E (`dyntok` `QuantM` / `out_step_chan` update) automatically namespaces/invalidates old `.kvb` blocks with **zero risk of stale KV/ShortConv state corruption**.
+2. **Step F.2 — Automatic Cache Invalidation Across 3-Chunk MMZ Weight Blobs & Phase E Re-Calibration — [COMPLETED]**:
+   - [x] In [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) (`init()`), combined 64-bit FNV-1a `head`/`mid`/`tail` hashes across the 3 MMZ weight chunks per die with `cpu_weights.bin`, `quant_chan_scales.bin`, `embedding.bin`, and scale tables into `ModelCacheGeometry::model_fingerprint` (`b608f88372c074619b116881579772f1`), preventing any stale `.kvb` hits after Phase E updates.
+   - [x] Pinned the main thread to `Core 0` (Die 0) and `Core 4` (Die 1) during weight loading and `flush_cache()` in `init()` before `pin_openmp_threads_numa()`, avoiding remote-die cache coherency misses under `ES_SYS_MemFlushCache` (`> 1 MiB` -> `SYS_MemFlushCacheAllByNid`, `FINDINGS.md` §52.8).
 
-3. **Step F.3 — NUMA-Aware `8`-Head Scatter/Gather & Tier-0 Sticky Session State in `lfm2_moe.cpp`**:
-   - [ ] **NUMA Local Scatter (`NumaKvBuffer`)**: In `lfm2_moe.cpp`, `m_glob_k_u8` (`[6][8][m_max_ctx][64]`) binds KV heads `0..3` to **NUMA Node 0 (Die 0, Cores `0..3`)** and KV heads `4..7` to **NUMA Node 1 (Die 1, Cores `4..7`)**. During `RadixCache::restore_blocks()`, OpenMP threads `0..3` scatter `kh in [0..3]` and threads `4..7` scatter `kh in [4..7]` strictly into local LPDDR5 channels.
-   - [ ] **Page-Cache Preservation Rule**: Keep `POSIX_FADV_DONTNEED` strictly on `weights_die{0,1}.bin` (`lfm2_moe.cpp:1356`); **never** call `POSIX_FADV_DONTNEED` on `.kvb` descriptors so `roma`'s `8.78 GiB` of free OS RAM caches active roleplay/coding sessions in memory automatically.
-   - [ ] **Tier-0 Sticky Turn State (`0 ms` TTFT)**: Maintain `m_live_tokens` + `m_turn_snap_pos` + `m_turn_snap_conv` (`288 KiB`) + `m_turn_snap_last_h` (`8 KiB`) across consecutive `run_daemon_server()` requests (`lfm2_moe.cpp:4462`), avoiding both `engine.reset_state()` and NVMe reads when an incoming multi-turn request extends the immediately preceding conversation (even at unaligned token counts `pos % 64 != 0`).
-   - [ ] **Tier-1 NVMe `.kvb` Restore, Async Save & PLD History Seeding**:
-     - On Tier-0 miss or branch switch (e.g., SillyTavern swipe or multi-agent parallel tool call), restore longest matching `.kvb` chain from NVMe, run `forward_chunk` only on the uncached suffix `[matched_tokens .. N-1]` (or `compute_logits_from_ptr(last_h)` when `matched_tokens == N`), enqueue newly completed 64-token blocks asynchronously, and seed `history = prompt_ids` (`lfm2_moe.cpp:4517`) so `--speculative-pld` (`T=8` batch verification) drafts directly from cached context.
-   - [ ] Add CLI flags `--cache-dir DIR`, `--cache-max-gb N`, `--no-prefix-cache`, and `--verify-prefix-cache` to `lfm2_moe.cpp`, and set default MoE daemon port to `8089` (or configurable `--daemon [PORT]`) so `lfm3_v2` (`:8088`) and `lfm2_moe` (`:8089`) can coexist or run independently.
+3. **Step F.3 — NUMA-Aware `8`-Head Scatter/Gather, Tier-0 Sticky Session State & Full-Clock `1.50 GHz` Determinism in `lfm2_moe.cpp` — [COMPLETED]**:
+   - [x] **NUMA Local Scatter (`NumaKvBuffer`)** & **Page-Cache Preservation Rule** (`POSIX_FADV_DONTNEED` restricted strictly to `weights_die{0,1}.bin`, never `.kvb`).
+   - [x] **Tier-0 Sticky Turn State (`0.00 ms` restore)**: Tracks `m_live_tokens`, `m_turn_snap_pos`, `m_turn_snap_conv`, and `m_turn_snap_last_h` across consecutive `--daemon` requests (`HIT_TIER0` continuation & snapshot rewind).
+   - [x] **Tier-1 NVMe `.kvb` Restore, Async Save, `T=8` PLD History Seeding & CLI**: Added `prefill_cached()`, `append_tokens()`, `commit_verify_t8()` 64-token checkpointing, `--cache-dir`, `--cache-max-gb`, `--no-prefix-cache`, `--verify-prefix-cache [FILE]`, REPL `/cache` & `/cache-clear`, and default `--daemon [PORT]` `8089`.
+   - [x] **Full-Clock `1.50 GHz` PEC Column #2 Workaround (`kT8SafeSlots`)**: Isolated a Die 0 NPU `1.50 GHz` timing margin hazard on `W16A16` `down_proj` in `mlp_t8` PEC column #2 (`t % 8 in {4, 5}`, `0/2000` errors at `1.04 GHz`; `FINDINGS.md` §52.8). Updated `pack_gathered_int8_t8()` and `run_die_experts()` to map `<= 6` gathered tokens onto `kT8SafeSlots[6] = {0, 1, 2, 3, 6, 7}` while zero-padding slots `{4, 5}` for bit-exact full `1.50 GHz` execution.
 
-4. **Step F.4 — Unified OpenAI Endpoint & Standard Prompt-Caching Telemetry (`src/LFM3/lfm3_openai_server.py`)**:
-   - [ ] Extend `run_daemon_server()`'s `"done"` and `"logits"` JSON events in `lfm2_moe.cpp` to emit `"cached_tokens"`, `"cached_tier0_tokens"`, `"cached_disk_tokens"`, `"computed_prompt_tokens"`, `"reasoning_tokens"`, `"cache_lookup_ms"`, `"cache_restore_ms"`, `"prefill_ms"`, and `"decode_ms"`, plus control commands `{"cmd": "cache_stats"}` and `{"cmd": "cache_clear"}`.
-   - [ ] Register `"lfm2.5-8b-a1b"` in [`src/LFM3/lfm3_openai_server.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_openai_server.py) (`/v1/models` and multi-backend router) and return **OpenAI's standard prompt-caching telemetry** on both non-streaming JSON responses and streaming SSE (`stream_options: {"include_usage": true}` trailing `choices: []` chunk):
-     - `usage.prompt_tokens_details.cached_tokens` (`int`)
-     - `usage.completion_tokens_details.reasoning_tokens` (`int`, counting `<think>...</think>` tokens)
-     - Request support for `prompt_cache_key: Optional[str]`, `cache: Optional[bool] = True`, and message-level `cache_control: {"type": "ephemeral" | "pinned"}` (pinning character definitions, lorebooks, or repo maps in `RadixCache`).
-     - Response headers `X-Cache-Status` (`HIT` | `PARTIAL` | `MISS` | `BYPASS`), `X-Cached-Tokens`, `X-Cache-Tier`, `X-Cache-Restore-Ms`, plus `timings` (`cache_n`, `prompt_n`, `prompt_ms`, `restore_ms`, `predicted_n`, `predicted_ms`) and REST endpoints `GET /v1/cache/stats` & `POST /v1/cache/clear`.
+4. **Step F.4 — Unified OpenAI Endpoint & Standard Prompt-Caching Telemetry (`src/LFM3/lfm3_openai_server.py`) — [COMPLETED]**:
+   - [x] Extended `run_daemon_server()` in `lfm2_moe.cpp` with early `"prefill_done"` event, full cache telemetry on `"done"`/`"logits"`, and `cache_stats` / `cache_clear` JSON commands.
+   - [x] Registered `"lfm2.5-8b-a1b"` (`--moe-port 8089`, `--backend-map`) in [`src/LFM3/lfm3_openai_server.py`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_openai_server.py) with `usage.prompt_tokens_details.cached_tokens`, `stream_options.include_usage` trailing `choices: []` chunk, `cache_control` pinning, `prompt_cache_key`, `cache: false`, `X-Cache-*` headers, `GET /v1/cache/stats`, and `POST /v1/cache/clear`.
 
-5. **Step F.5 — Acceptance Gates**:
-   - [ ] **Host Offline Gate**: `test_prefix_cache` (C++17) + `pytest src/LFM3/test_openai_prefix_telemetry.py` pass 100% locally without `roma`.
-   - [ ] **Silicon Bit-Exactness & Latency Gate (`roma`)**: `./lfm2_moe --verify-prefix-cache` on a 4K C/Python prompt achieves **`Max Abs Logits Diff == 0.000000` (`Cosine == 1.00000000`)** and **`4/4` exact greedy match** between cold prefill and `reset_state()` + `.kvb` NVMe restore, with **8K NVMe restore time `<= 45 ms`** and OpenAI SSE streaming reporting exact `usage.prompt_tokens_details.cached_tokens`.
+5. **Step F.5 — Acceptance Gates — [ALL PASSED — 2026-11-20]**:
+   - [x] **Host Offline Gate**: `test_prefix_cache` (`4/4` in `485.7 ms`) + `pytest -v src/LFM3/test_openai_prefix_telemetry.py` (`5/5` in `0.43 s`).
+   - [x] **Gate 1 (`--verify-prefix-cache bench_c_code_4k.c`, `3,818` tok on `roma`)**: **ALL 5/5 SUB-TESTS PASS** (`max_abs=0.000000`, `cos=1.00000000`, Test 2 `restore=19.14 ms`, `8K=41.53 ms <= 45 ms`, `cold=101,033.7 ms -> warm=1,408.7 ms` = `71.7x`, `greedy=4/4`, Test 3 `6.01 ms`, Test 4a/4b `0.00 ms`).
+   - [x] **Gate 2 (`--verify-golden golden_ref.bin` on `roma`)**: **PASS** (`Min Layer Cos = 0.97924192`, `128K Logits Cos = 0.99837211`, `DETERMINISM`/`SENSITIVITY`/`RESTORE` PASS, `4/4` greedy exact, **`11.38 tok/s`** decode).
+   - [x] **Gate 3 (Live OpenAI Gateway -> `roma:8089`)**: **PASS** (`GET /v1/models`, Turn 1 `MISS`, Turn 2 SSE `PARTIAL` `tier1_nvme` `restore_ms=8.13` `cached_tokens=64` trailing `choices: []` chunk, Turn 3 repeat `HIT` `tier0_ram` `cached_tokens=125`, `/v1/cache/stats`, `/v1/cache/clear`, clean `dmesg`).
 

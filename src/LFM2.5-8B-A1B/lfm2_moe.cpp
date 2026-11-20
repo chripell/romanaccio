@@ -24,6 +24,7 @@
 #include "model/simple_json.hpp"
 #include "nlp/tokenizer.hpp"
 #include "nlp/sampler.hpp"
+#include "prefix_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -89,6 +90,25 @@ static void sigint_handler(int sig) {
 static bool file_exists(const std::string &path) {
     std::ifstream f(path);
     return f.good();
+}
+
+static std::string resolve_default_cache_dir() {
+    if (const char *env_dir = std::getenv("LFM3_CACHE_DIR")) {
+        if (*env_dir != '\0') return std::string(env_dir);
+    }
+    if (const char *sudo_user = std::getenv("SUDO_USER")) {
+        if (*sudo_user != '\0' && std::string(sudo_user) != "root") {
+            std::string uhome = std::string("/home/") + sudo_user;
+            std::error_code ec;
+            if (std::filesystem::is_directory(uhome, ec)) {
+                return uhome + "/.cache/romanaccio/kvcache";
+            }
+        }
+    }
+    if (const char *home = std::getenv("HOME")) {
+        if (*home != '\0') return std::string(home) + "/.cache/romanaccio/kvcache";
+    }
+    return "/tmp/romanaccio_kvcache";
 }
 
 // Fast LUT-based FP16 <-> FP32 conversion
@@ -803,6 +823,26 @@ static void pack_npu_input_int8(const float *src_tc, int8_t *dst_npu, int T, int
     }
 }
 
+// Safe token slots within an NVDLA T=8 mlp_t8 batch: slots {4, 5} (PEC column #2, t % 8 in {4, 5})
+// suffer a Die 0 timing margin glitch at 1.50 GHz on W16A16 down_proj and are kept zero-padded.
+static constexpr int kT8SafeSlots[6] = {0, 1, 2, 3, 6, 7};
+
+// Pack up to 6 gathered tokens (from row-major quantized [T_valid, C] int8 array)
+// into NVDLA T=8 INT8 FEATURE layout ([C/32, 8, 32]), mapping into kT8SafeSlots and zeroing unused slots.
+static void pack_gathered_int8_t8(const int8_t *src_q8_tc, const int *tok_indices, int b_cnt,
+                                  int8_t *dst_npu, int C) {
+    const int safe_cnt = std::min(b_cnt, 6);
+    const int c_blocks = C / 32;
+    for (int cb = 0; cb < c_blocks; ++cb) {
+        int8_t *dst_cb = dst_npu + static_cast<size_t>(cb) * 8 * 32;
+        std::memset(dst_cb, 0, 8 * 32);
+        for (int j = 0; j < safe_cnt; ++j) {
+            const int8_t *src_row = src_q8_tc + static_cast<size_t>(tok_indices[j]) * C + cb * 32;
+            std::memcpy(dst_cb + static_cast<size_t>(kT8SafeSlots[j]) * 32, src_row, 32);
+        }
+    }
+}
+
 // Pack [T, C] FP32 into NPU INT16 input buffer (in_step = threshold / 32767.0f, clamped to [-32767, 32767])
 static void pack_npu_input_int16(const float *src_tc, int16_t *dst_npu, int T, int C, float in_step, int T_valid = -1) {
     if (T_valid < 0 || T_valid > T) T_valid = T;
@@ -1153,8 +1193,71 @@ public:
     static constexpr int kNumConvLayers = 18;
     static constexpr int kConvStateLen = 2;
 
+    struct PrefixCacheOptions {
+        bool enabled = true;
+        std::string cache_namespace;
+        int pin_blocks_up_to = 0; // pin blocks b where b < pin_blocks_up_to
+    };
+
+    struct PrefixCacheTelemetry {
+        int cached_tier0_tokens = 0;
+        int cached_disk_tokens = 0;
+        int computed_prompt_tokens = 0;
+        double lookup_ms = 0.0;
+        double restore_ms = 0.0;
+        std::string status = "MISS"; // HIT_TIER0 | HIT_DISK | MISS | BYPASS
+        std::string tier = "none";   // tier0_ram | tier1_nvme | none
+        int cached_tokens() const { return cached_tier0_tokens + cached_disk_tokens; }
+    };
+
     Lfm3Engine() = default;
-    ~Lfm3Engine() { stop_tp_worker(); }
+    ~Lfm3Engine() {
+        m_prefix_cache.shutdown();
+        stop_tp_worker();
+    }
+
+    void set_prefix_cache_options(bool enabled, const std::string &cache_dir, uint64_t max_disk_bytes) {
+        m_prefix_cache_enabled = enabled;
+        m_cache_dir = cache_dir;
+        m_cache_max_disk_bytes = max_disk_bytes;
+    }
+
+    bool is_prefix_cache_enabled() const { return m_prefix_cache_enabled; }
+    const std::string &cache_dir() const { return m_cache_dir; }
+    const eswin::prefix_cache::Hash128 &model_fingerprint() const { return m_model_fingerprint; }
+    uint64_t tier0_hits() const { return m_tier0_hits; }
+    uint64_t tier0_tokens_saved() const { return m_tier0_tokens_saved; }
+    size_t live_tokens_count() const { return m_live_tokens.size(); }
+
+    eswin::prefix_cache::CacheStatsSnapshot prefix_cache_stats() const {
+        if (!m_prefix_cache_enabled) return eswin::prefix_cache::CacheStatsSnapshot{};
+        return m_prefix_cache.stats();
+    }
+
+    void invalidate_tier0() {
+        m_live_tokens.clear();
+        m_live_block_keys.clear();
+        m_live_vision_fp = eswin::prefix_cache::Hash128{};
+        m_turn_snap_valid = false;
+        m_turn_snap_pos = 0;
+        m_tier0_eligible = false;
+    }
+
+    size_t clear_prefix_cache(bool include_pinned = false) {
+        invalidate_tier0();
+        if (!m_prefix_cache_enabled) return 0;
+        return m_prefix_cache.clear(include_pinned);
+    }
+
+    void flush_prefix_cache() {
+        if (m_prefix_cache_enabled) {
+            m_prefix_cache.flush_async_writes();
+        }
+    }
+
+    void shutdown_prefix_cache() {
+        m_prefix_cache.shutdown();
+    }
 
     void start_tp_worker() {
         if (m_tp_worker_running || m_num_dies < 2) return;
@@ -1358,9 +1461,19 @@ public:
         std::printf("[+] Started WorkerPool with %u isolated NPU die worker(s)\n", m_num_dies);
         start_tp_worker();
 
+        size_t w_sizes[2][3] = {};
+        uint64_t w_heads[2][3] = {}, w_mids[2][3] = {}, w_tails[2][3] = {};
         for (uint16_t d = 0; d < 2; ++d) {
             uint16_t phys_die = (d < m_num_dies) ? d : 0;
             const char *zone = (phys_die == 0) ? "mmz_nid_0_part_0" : "mmz_nid_1_part_0";
+            // Pin weight + buffer allocation/flush strictly to the owning die's NUMA node so
+            // SYS_MemFlushCacheAllByNid(phys_die) never misses dirty lines on the remote die's L2/L3.
+            {
+                cpu_set_t load_set;
+                CPU_ZERO(&load_set);
+                CPU_SET((phys_die == 0) ? 0 : 4, &load_set);
+                sched_setaffinity(0, sizeof(cpu_set_t), &load_set);
+            }
 
             // Load per-die weight blob into 3 <2.0 GiB MMZ chunks (layers 0..7, 8..15, 16..23)
             // to avoid the 32-bit vma_size truncation bug at 4.0 GiB in eswin_rsvmem_heap_mmap
@@ -1412,23 +1525,28 @@ public:
             }
             std::fclose(wf);
 
-            // Identify the weights actually loaded.
+            // Identify the weights actually loaded across all 3 chunks.
             {
-                const uint8_t *bp0 = static_cast<const uint8_t *>(m_w_blob[d][0]->data());
-                const uint8_t *bp2 = static_cast<const uint8_t *>(m_w_blob[d][2]->data());
-                const size_t n0 = m_w_blob[d][0]->size();
-                const size_t n2 = m_w_blob[d][2]->size();
-                uint64_t head = 1469598103934665603ULL, tail = 1469598103934665603ULL;
-                const size_t span0 = std::min<size_t>(65536, n0);
-                const size_t span2 = std::min<size_t>(65536, n2);
-                for (size_t i = 0; i < span0; ++i) { head ^= bp0[i]; head *= 1099511628211ULL; }
-                for (size_t i = n2 - span2; i < n2; ++i) { tail ^= bp2[i]; tail *= 1099511628211ULL; }
+                for (int c = 0; c < 3; ++c) {
+                    const uint8_t *bp = static_cast<const uint8_t *>(m_w_blob[d][c]->data());
+                    const size_t cn = m_w_blob[d][c]->size();
+                    const size_t span = std::min<size_t>(65536, cn);
+                    const size_t mid_off = (cn > span) ? ((cn - span) / 2) : 0;
+                    uint64_t h0 = 1469598103934665603ULL, hm = 1469598103934665603ULL, ht = 1469598103934665603ULL;
+                    for (size_t i = 0; i < span; ++i) { h0 ^= bp[i]; h0 *= 1099511628211ULL; }
+                    for (size_t i = 0; i < span; ++i) { hm ^= bp[mid_off + i]; hm *= 1099511628211ULL; }
+                    for (size_t i = cn - span; i < cn; ++i) { ht ^= bp[i]; ht *= 1099511628211ULL; }
+                    w_sizes[d][c] = cn;
+                    w_heads[d][c] = h0;
+                    w_mids[d][c]  = hm;
+                    w_tails[d][c] = ht;
+                }
                 std::printf("[+] Die %u weight blobs: %s (%zu B across 3 chunks: %.2f + %.2f + %.2f GiB) fnv head=%016llx tail=%016llx\n",
                             d, w_file.c_str(), w_sz,
                             m_w_blob[d][0]->size() / (1024.0 * 1024.0 * 1024.0),
                             m_w_blob[d][1]->size() / (1024.0 * 1024.0 * 1024.0),
                             m_w_blob[d][2]->size() / (1024.0 * 1024.0 * 1024.0),
-                            (unsigned long long)head, (unsigned long long)tail);
+                            (unsigned long long)w_heads[d][0], (unsigned long long)w_tails[d][2]);
             }
 
             // Buffers are allocated *after* the archetypes are loaded (see below), because their
@@ -1476,6 +1594,7 @@ public:
                 !load_m("models/lfm2_proj2048_t1_classb.model",   m_die_models[d].proj2048_t1) ||
                 !load_m("models/lfm2_attn_qkv_t1_classb.model",   m_die_models[d].attn_qkv_t1) ||
                 !load_m("models/lfm2_expert_mlp_t1_classb.model", m_die_models[d].mlp_t1) ||
+                !load_m("models/lfm2_expert_mlp_t8_classb.model", m_die_models[d].mlp_t8) ||
                 !load_m("models/lfm2_conv_in_t64_classb.model",   m_die_models[d].conv_in_t64) ||
                 !load_m("models/lfm2_proj2048_t64_classb.model",  m_die_models[d].proj2048_t64) ||
                 !load_m("models/lfm2_attn_qkv_t64_classb.model",  m_die_models[d].attn_qkv_t64) ||
@@ -1486,8 +1605,7 @@ public:
             if (m_enable_pld) {
                 if (!load_m("models/lfm2_conv_in_t8_classb.model",    m_die_models[d].conv_in_t8) ||
                     !load_m("models/lfm2_proj2048_t8_classb.model",   m_die_models[d].proj2048_t8) ||
-                    !load_m("models/lfm2_attn_qkv_t8_classb.model",   m_die_models[d].attn_qkv_t8) ||
-                    !load_m("models/lfm2_expert_mlp_t8_classb.model", m_die_models[d].mlp_t8)) {
+                    !load_m("models/lfm2_attn_qkv_t8_classb.model",   m_die_models[d].attn_qkv_t8)) {
                     return false;
                 }
             }
@@ -1514,7 +1632,7 @@ public:
             DieModels &dm = m_die_models[d];
             size_t max_entry = 0;
             for (const LoadedArchetype *a : {&dm.conv_in_t1, &dm.proj2048_t1, &dm.attn_qkv_t1,
-                                             &dm.mlp_t1, &dm.conv_in_t64, &dm.proj2048_t64,
+                                             &dm.mlp_t1, &dm.mlp_t8, &dm.conv_in_t64, &dm.proj2048_t64,
                                              &dm.attn_qkv_t64, &dm.mlp_t64, &dm.lm_head[0],
                                              &dm.lm_head[1], &dm.lm_head[2], &dm.lm_head[3]})
                 max_entry = std::max({max_entry, a->in_surface_bytes, a->out_surface_bytes});
@@ -1544,9 +1662,11 @@ public:
                 for (const LoadedArchetype *a : {&dm.conv_in_t1, &dm.proj2048_t1, &dm.attn_qkv_t1,
                                                  &dm.mlp_t1})
                     s_out1 = std::max(s_out1, a->out_surface_bytes);
+                s_act8 = std::max(s_act8, dm.mlp_t8.in_surface_bytes);
+                s_out8 = std::max(s_out8, dm.mlp_t8.out_surface_bytes);
                 if (m_enable_pld) {
                     for (const LoadedArchetype *a : {&dm.conv_in_t8, &dm.proj2048_t8,
-                                                     &dm.attn_qkv_t8, &dm.mlp_t8}) {
+                                                     &dm.attn_qkv_t8}) {
                         s_act8 = std::max(s_act8, a->in_surface_bytes);
                         s_out8 = std::max(s_out8, a->out_surface_bytes);
                     }
@@ -1564,12 +1684,10 @@ public:
             const size_t g = m_guard_bytes;
             m_act_t1[d]  = std::make_unique<DmaBuffer>(s_act1 + g,  CacheMode::Cached, zone);
             m_out_t1[d]  = std::make_unique<DmaBuffer>(s_out1 + g,  CacheMode::Cached, zone);
-            if (m_enable_pld) {
-                m_act_t8[d] = std::make_unique<DmaBuffer>(s_act8 + g, CacheMode::Cached, zone);
-                m_out_t8[d] = std::make_unique<DmaBuffer>(s_out8 + g, CacheMode::Cached, zone);
-                note_prod_cap(m_act_t8[d].get(), s_act8);
-                note_prod_cap(m_out_t8[d].get(), s_out8);
-            }
+            m_act_t8[d] = std::make_unique<DmaBuffer>(s_act8 + g, CacheMode::Cached, zone);
+            m_out_t8[d] = std::make_unique<DmaBuffer>(s_out8 + g, CacheMode::Cached, zone);
+            note_prod_cap(m_act_t8[d].get(), s_act8);
+            note_prod_cap(m_out_t8[d].get(), s_out8);
             m_act_t64[d] = std::make_unique<DmaBuffer>(s_act64 + g, CacheMode::Cached, zone);
             m_out_t64[d] = std::make_unique<DmaBuffer>(s_out64 + g, CacheMode::Cached, zone);
             for (int s = 0; s < 4; ++s) {
@@ -1656,7 +1774,104 @@ public:
         m_buf_mlp_out_d1.assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_exp_tmp[0].assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
         m_buf_exp_tmp[1].assign(static_cast<size_t>(kChunk) * kHidden, 0.0f);
+        m_buf_exp_q8.assign(static_cast<size_t>(kChunk) * kHidden, 0);
         m_buf_gates.assign(static_cast<size_t>(kChunk) * kQHeads, 0.0f);
+        m_last_h.assign(kHidden, 0.0f);
+
+        // 8. Compute unique 128-bit model fingerprint & initialize Phase F persistent prefix cache
+        {
+            using namespace eswin::prefix_cache;
+            detail::Hasher128 fp;
+            static constexpr char kModelTag[] = "LFM2.5-8B-A1B-v1";
+            fp.update(kModelTag, sizeof(kModelTag) - 1);
+            uint8_t q_tag  = is_quant_active() ? 1 : 0;
+            uint8_t sh_tag = m_use_shared_archetype_scales ? 1 : 0;
+            uint8_t ab_tag = m_ab_shared_weights ? 1 : 0;
+            fp.update_pod(q_tag);
+            fp.update_pod(sh_tag);
+            fp.update_pod(ab_tag);
+            for (int d = 0; d < 2; ++d) {
+                for (int c = 0; c < 3; ++c) {
+                    uint64_t sz64 = static_cast<uint64_t>(w_sizes[d][c]);
+                    fp.update_pod(sz64);
+                    fp.update_pod(w_heads[d][c]);
+                    fp.update_pod(w_mids[d][c]);
+                    fp.update_pod(w_tails[d][c]);
+                }
+            }
+            if (!m_cpu_weights_buf.empty()) {
+                fp.update(m_cpu_weights_buf.data(), m_cpu_weights_buf.size() * sizeof(float));
+            }
+            if (!m_chan_scales_buf.empty()) {
+                fp.update(m_chan_scales_buf.data(), m_chan_scales_buf.size() * sizeof(float));
+            }
+            if (!m_emb_norm_smooth.empty()) {
+                fp.update(m_emb_norm_smooth.data(), m_emb_norm_smooth.size() * sizeof(float));
+            }
+            if (!m_emb_norm_scaled.empty()) {
+                fp.update(m_emb_norm_scaled.data(), m_emb_norm_scaled.size() * sizeof(float));
+            }
+            auto hash_sc = [&](const SubgraphScaleInfo &sc) {
+                fp.update_pod(sc.in_dtype);
+                fp.update_pod(sc.out_dtype);
+                fp.update_pod(sc.in_thresh);
+                fp.update_pod(sc.in_step);
+                fp.update_pod(sc.out_thresh);
+                fp.update_pod(sc.out_step);
+            };
+            for (int l = 0; l < kNumLayers; ++l) {
+                fp.update_pod(m_layer_npu[l].op_in_tp);
+                fp.update_pod(m_layer_npu[l].op_out_tp);
+                fp.update_pod(m_layer_npu[l].mlp_tp);
+                fp.update_pod(m_layer_npu[l].die_id);
+                fp.update_pod(m_layer_npu[l].num_experts);
+                hash_sc(m_layer_npu[l].op_in_scale);
+                hash_sc(m_layer_npu[l].op_out_scale);
+                hash_sc(m_layer_npu[l].op_in_scale_d1);
+                hash_sc(m_layer_npu[l].op_out_scale_d1);
+                for (int e = 0; e < m_layer_npu[l].num_experts && e < 32; ++e) {
+                    hash_sc(m_layer_npu[l].exp_scale[e]);
+                }
+            }
+            for (int d = 0; d < 2; ++d) {
+                for (int s = 0; s < 4; ++s) {
+                    hash_sc(m_die_models[d].lm_head_scale[s]);
+                    uint64_t lmb = static_cast<uint64_t>(m_die_models[d].lm_head[s].weight_bytes);
+                    fp.update_pod(lmb);
+                }
+            }
+            uint64_t emb_bytes = static_cast<uint64_t>(m_embedding.mapped_bytes());
+            fp.update_pod(emb_bytes);
+            static constexpr int32_t kEmbSampleIds[5] = {0, 1, 1000, 124900, 127999};
+            std::vector<float> emb_sample(5 * kHidden, 0.0f);
+            m_embedding.gather(kEmbSampleIds, 5, emb_sample.data(), emb_sample.size());
+            fp.update(emb_sample.data(), emb_sample.size() * sizeof(float));
+            m_model_fingerprint = fp.finalize();
+        }
+
+        if (m_prefix_cache_enabled) {
+            if (m_cache_dir.empty()) {
+                m_cache_dir = resolve_default_cache_dir();
+            }
+            std::string ns = "lfm2.5_8b_a1b_" + m_model_fingerprint.to_hex().substr(0, 12);
+            auto geom = eswin::prefix_cache::ModelCacheGeometry::make_lfm2_moe(
+                ns, m_model_fingerprint, static_cast<uint32_t>(m_max_ctx));
+            if (!m_prefix_cache.init(m_cache_dir, geom, m_cache_max_disk_bytes)) {
+                std::printf("[!] WARN: Failed to initialize prefix cache at %s/%s; continuing uncached\n",
+                            m_cache_dir.c_str(), ns.c_str());
+                m_prefix_cache_enabled = false;
+            } else {
+                auto st = m_prefix_cache.stats();
+                std::printf("[+] Prefix Cache: %s/%s (fp=%s, quota=%.1f GiB, resident=%llu blocks, %.1f MiB)\n",
+                            m_cache_dir.c_str(), ns.c_str(),
+                            m_model_fingerprint.to_hex().substr(0, 12).c_str(),
+                            static_cast<double>(m_cache_max_disk_bytes) / (1024.0 * 1024.0 * 1024.0),
+                            (unsigned long long)st.resident_blocks,
+                            static_cast<double>(st.disk_bytes_used) / (1024.0 * 1024.0));
+            }
+        } else {
+            std::printf("[+] Prefix Cache: DISABLED (--no-prefix-cache)\n");
+        }
 
         auto t_init1 = std::chrono::steady_clock::now();
         std::printf("[+] Engine initialized in %.2f s.\n\n",
@@ -1664,27 +1879,22 @@ public:
         return true;
     }
 
-    /**
-     * @brief Returns every piece of per-conversation state to its post-init value.
-     *
-     * This used to clear only the conv rings, the SWA caches and m_pos, leaving the global KV,
-     * its INT8 side-cars and the logits buffer holding the previous conversation. A 6-token
-     * prefill cannot expose that (n_valid = pos+1 never reaches the stale slots), but a second
-     * conversation in one process -- or any test that reuses the engine -- reads it. "Reset"
-     * should mean reset, even where today's callers happen not to notice.
-     */
-    void reset_state() {
-        std::fill(m_conv_state.begin(), m_conv_state.end(), 0.0f);
-        m_swa_k.clear();
-        m_swa_v.clear();
-        m_glob_k.clear();
-        m_glob_v.clear();
-        m_glob_k_u8.clear();
-        m_glob_v_u8.clear();
-        m_glob_k_sc.clear();
-        m_glob_v_sc.clear();
-        m_glob_k_sum.clear();
-        std::fill(m_logits.begin(), m_logits.end(), 0.0f);
+    eswin::prefix_cache::EngineStateView make_state_view(const float *conv_override = nullptr) {
+        eswin::prefix_cache::EngineStateView v{};
+        v.glob_k_u8  = m_glob_k_u8.data();
+        v.glob_v_u8  = m_glob_v_u8.data();
+        v.glob_k_sc  = m_glob_k_sc.data();
+        v.glob_v_sc  = m_glob_v_sc.data();
+        v.glob_k_sum = m_glob_k_sum.data();
+        v.glob_k_f32 = m_glob_k.data();
+        v.glob_v_f32 = m_glob_v.data();
+        v.swa_k_f32  = nullptr; // LFM2.5-8B-A1B has zero SWA layers
+        v.swa_v_f32  = nullptr;
+        v.conv_state = conv_override ? const_cast<float *>(conv_override) : m_conv_state.data();
+        return v;
+    }
+
+    void reset_dma_surfaces() {
         for (uint16_t d = 0; d < 2; ++d) {
             for (DmaBuffer *b : {m_act_t1[d].get(), m_out_t1[d].get(), m_act_t8[d].get(),
                                  m_out_t8[d].get(), m_act_t64[d].get(),
@@ -1698,7 +1908,70 @@ public:
                 }
             }
         }
+    }
+
+    void reset_state_fast(bool zero_conv) {
+        if (zero_conv) {
+            std::fill(m_conv_state.begin(), m_conv_state.end(), 0.0f);
+        }
+        std::fill(m_logits.begin(), m_logits.end(), 0.0f);
+        std::fill(m_last_h.begin(), m_last_h.end(), 0.0f);
+        reset_dma_surfaces();
         m_pos = 0;
+        invalidate_tier0();
+    }
+
+    void checkpoint_live_block(uint32_t block_idx, const float *last_h,
+                               const float *conv_override = nullptr,
+                               const eswin::prefix_cache::Hash128 *known_key = nullptr,
+                               const eswin::prefix_cache::Hash128 *known_vhash = nullptr) {
+        if (!m_prefix_cache_enabled || !m_active_cache_write || !last_h) return;
+        const size_t end_tok = static_cast<size_t>(block_idx + 1) * kChunk;
+        if (end_tok > m_live_tokens.size() || end_tok > static_cast<size_t>(m_max_ctx)) return;
+        if (block_idx > 0 && m_live_block_keys.size() < block_idx) return;
+
+        using namespace eswin::prefix_cache;
+        const Hash128 parent_key = (block_idx == 0) ? Hash128{} : m_live_block_keys[block_idx - 1];
+        const Hash128 vhash      = known_vhash ? *known_vhash : Hash128{};
+        const int32_t *blk_toks  = m_live_tokens.data() + static_cast<size_t>(block_idx) * kChunk;
+        const Hash128 bkey       = known_key
+                                   ? *known_key
+                                   : m_prefix_cache.compute_block_key(block_idx, parent_key, blk_toks,
+                                                                      vhash, m_active_cache_namespace);
+        const bool pinned = (m_active_pin_blocks_up_to > 0) &&
+                            (static_cast<int>(block_idx) < m_active_pin_blocks_up_to);
+        EngineStateView view = make_state_view(conv_override);
+        m_prefix_cache.enqueue_save_block(block_idx, parent_key, bkey, vhash, blk_toks,
+                                          last_h, view, pinned);
+        if (m_live_block_keys.size() == block_idx) {
+            m_live_block_keys.push_back(bkey);
+        } else if (m_live_block_keys.size() > block_idx) {
+            m_live_block_keys[block_idx] = bkey;
+        }
+    }
+
+    /**
+     * @brief Returns every piece of per-conversation state to its post-init value.
+     */
+    void reset_state() {
+        std::fill(m_conv_state.begin(), m_conv_state.end(), 0.0f);
+        m_swa_k.clear();
+        m_swa_v.clear();
+        m_glob_k.clear();
+        m_glob_v.clear();
+        m_glob_k_u8.clear();
+        m_glob_v_u8.clear();
+        m_glob_k_sc.clear();
+        m_glob_v_sc.clear();
+        m_glob_k_sum.clear();
+        std::fill(m_logits.begin(), m_logits.end(), 0.0f);
+        std::fill(m_last_h.begin(), m_last_h.end(), 0.0f);
+        reset_dma_surfaces();
+        m_pos = 0;
+        invalidate_tier0();
+        m_active_cache_write = false;
+        m_active_cache_namespace.clear();
+        m_active_pin_blocks_up_to = 0;
     }
 
     // Execute T_valid tokens (1 <= T_valid <= 64) across all 24 layers; uses T_npu=1 for single-token
@@ -1752,6 +2025,7 @@ public:
         }
         auto t1 = std::chrono::steady_clock::now();
         timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
 
         int conv_idx = 0, swa_idx = 0, glob_idx = 0;
         bool surface_overflow = false;
@@ -2221,11 +2495,33 @@ public:
                 if (l >= 2) {
                     rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
                 }
-                if (!cw.ffn_norm_smooth.empty() && no.exp_scale[0].in_dtype == BoundaryDtype::Int8) {
-                    rms_norm_f32(h_mid, cw.ffn_norm_smooth.data(), u_smooth, T_valid, kHidden);
-                    pack_npu_input_int8(u_smooth, act_buf_d0->as<int8_t>(), T, kHidden, no.exp_scale[0].in_step, nullptr, T_valid);
-                    const size_t copy_bytes = static_cast<size_t>(T) * kHidden * sizeof(int8_t);
-                    std::memcpy(act_buf_d1->data(), act_buf_d0->data(), copy_bytes);
+                if (no.exp_scale[0].in_dtype == BoundaryDtype::Int8) {
+                    const bool has_sm_norm = !cw.ffn_norm_smooth.empty();
+                    if (has_sm_norm) {
+                        rms_norm_f32(h_mid, cw.ffn_norm_smooth.data(), u_smooth, T_valid, kHidden);
+                    } else if (l < 2) {
+                        rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
+                    }
+                    const float *src_f32 = has_sm_norm ? u_smooth : v;
+                    const float *sm = has_sm_norm ? nullptr : no.exp_scale[0].in_inv_smooth;
+                    const float inv_step = (no.exp_scale[0].in_step > 1e-12f) ? (1.0f / no.exp_scale[0].in_step) : 0.0f;
+                    int8_t *q8_dst = m_buf_exp_q8.data();
+                    #pragma omp parallel for schedule(static)
+                    for (int t = 0; t < T_valid; ++t) {
+                        const float *sr = src_f32 + static_cast<size_t>(t) * kHidden;
+                        int8_t *dr      = q8_dst + static_cast<size_t>(t) * kHidden;
+                        if (sm) {
+                            #pragma omp simd
+                            for (int c = 0; c < kHidden; ++c) {
+                                dr[c] = static_cast<int8_t>(round_clamp_f32(sr[c] * (sm[c] * inv_step), 127.0f));
+                            }
+                        } else {
+                            #pragma omp simd
+                            for (int c = 0; c < kHidden; ++c) {
+                                dr[c] = static_cast<int8_t>(round_clamp_f32(sr[c] * inv_step, 127.0f));
+                            }
+                        }
+                    }
                 } else {
                     if (l < 2) rms_norm_f32(h_mid, cw.ffn_norm, v, T_valid, kHidden);
                     pack_npu_input(v, act_buf_d0, T, kHidden, no.exp_scale[0], nullptr, T_valid);
@@ -2312,12 +2608,26 @@ public:
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn5 - tn4).count();
 
             // 3. Dual-Die EP=2 Expert MLP Execution (even experts on Die 0 || odd experts on Die 1)
-            const LoadedArchetype &m_mlp_0  = (T == 1) ? dm_d0.mlp_t1 : ((T == 8) ? dm_d0.mlp_t8 : dm_d0.mlp_t64);
-            const LoadedArchetype &m_mlp_d1 = (T == 1) ? dm_d1.mlp_t1 : ((T == 8) ? dm_d1.mlp_t8 : dm_d1.mlp_t64);
-            size_t in_b0  = surf_or(act_buf_d0, m_mlp_0.in_surface_bytes,   T, 2048, no.exp_scale[0].in_dtype,  "moe act0");
-            size_t out_b0 = surf_or(out_buf_d0, m_mlp_0.out_surface_bytes,  T, 2048, no.exp_scale[0].out_dtype, "moe out0");
-            size_t in_b1  = surf_or(act_buf_d1, m_mlp_d1.in_surface_bytes,  T, 2048, no.exp_scale[0].in_dtype,  "moe act1");
-            size_t out_b1 = surf_or(act_buf_d1 ? out_buf_d1 : out_buf_d0, m_mlp_d1.out_surface_bytes, T, 2048, no.exp_scale[0].out_dtype, "moe out1");
+            const bool use_gathered_t8 = (T > 1 && no.exp_scale[0].in_dtype == BoundaryDtype::Int8);
+            const int exp_T = use_gathered_t8 ? 8 : T;
+            DmaBuffer *exp_act0 = use_gathered_t8 ? m_act_t8[0].get() : act_buf_d0;
+            DmaBuffer *exp_out0 = use_gathered_t8 ? m_out_t8[0].get() : out_buf_d0;
+            DmaBuffer *exp_act1 = use_gathered_t8
+                ? ((m_num_dies >= 2 && m_act_t8[1]) ? m_act_t8[1].get() : exp_act0)
+                : act_buf_d1;
+            DmaBuffer *exp_out1 = use_gathered_t8
+                ? ((m_num_dies >= 2 && m_out_t8[1]) ? m_out_t8[1].get() : exp_out0)
+                : out_buf_d1;
+            const LoadedArchetype &m_mlp_0  = use_gathered_t8
+                ? dm_d0.mlp_t8
+                : ((T == 1) ? dm_d0.mlp_t1 : ((T == 8) ? dm_d0.mlp_t8 : dm_d0.mlp_t64));
+            const LoadedArchetype &m_mlp_d1 = use_gathered_t8
+                ? dm_d1.mlp_t8
+                : ((T == 1) ? dm_d1.mlp_t1 : ((T == 8) ? dm_d1.mlp_t8 : dm_d1.mlp_t64));
+            size_t in_b0  = surf_or(exp_act0, m_mlp_0.in_surface_bytes,   exp_T, 2048, no.exp_scale[0].in_dtype,  "moe act0");
+            size_t out_b0 = surf_or(exp_out0, m_mlp_0.out_surface_bytes,  exp_T, 2048, no.exp_scale[0].out_dtype, "moe out0");
+            size_t in_b1  = surf_or(exp_act1, m_mlp_d1.in_surface_bytes,  exp_T, 2048, no.exp_scale[0].in_dtype,  "moe act1");
+            size_t out_b1 = surf_or(exp_out1 ? exp_out1 : exp_out0, m_mlp_d1.out_surface_bytes, exp_T, 2048, no.exp_scale[0].out_dtype, "moe out1");
             if (surface_overflow) return false;
 
             std::memset(mlp_out,    0, static_cast<size_t>(T_valid) * kHidden * sizeof(float));
@@ -2329,149 +2639,140 @@ public:
             const uint16_t phys1 = (1 < m_num_dies) ? 1 : 0;
             const auto s_moe0 = std::chrono::steady_clock::now();
 
+            auto run_die_experts = [&](int d_idx, uint16_t phys_d, uint32_t model_id,
+                                       DmaBuffer *e_act, DmaBuffer *e_out, DmaBuffer *w_buf,
+                                       const int *exps, int n_exps, size_t in_b, size_t out_b,
+                                       float *tmp_buf, float *dst_mlp, bool &ok_flag, uint64_t &drv_ns) {
+                if (n_exps == 0) return;
+                if (T == 1 && n_exps <= 4 && no.exp_scale[exps[0]].out_dtype == BoundaryDtype::Int16) {
+                    e_act->flush_cache();
+                    std::vector<DmaBufferSlice> w_slices, out_slices;
+                    w_slices.reserve(n_exps);
+                    out_slices.reserve(n_exps);
+                    for (int idx = 0; idx < n_exps; ++idx) {
+                        int e = exps[idx];
+                        size_t w_off = m_ab_shared_weights ? (d_idx == 0 ? ab[3].off : ab[3].off_d1) : no.exp_offset[e];
+                        w_slices.push_back(DmaBufferSlice{w_buf, w_off, no.exp_size[e]});
+                        out_slices.push_back(DmaBufferSlice{m_exp_out_t1[d_idx][idx].get(), 0, 4096});
+                    }
+                    if (!m_pool.submit_expert_batch(phys_d, model_id,
+                            DmaBufferSlice{e_act, 0, in_b}, w_slices, out_slices, &drv_ns)) {
+                        ok_flag = false;
+                        return;
+                    }
+                    for (int idx = 0; idx < n_exps; ++idx) {
+                        int e = exps[idx];
+                        m_exp_out_t1[d_idx][idx]->flush_cache();
+                        const int16_t *src_i16 = m_exp_out_t1[d_idx][idx]->as<int16_t>();
+                        const float wk = exp_toks[e][0].w;
+                        const float *sc_ch = no.exp_scale[e].out_step_chan;
+                        if (sc_ch) {
+                            #pragma omp simd
+                            for (int c = 0; c < kHidden; ++c) {
+                                dst_mlp[c] += static_cast<float>(src_i16[c]) * (wk * sc_ch[c]);
+                            }
+                        } else {
+                            const float w_step = wk * no.exp_scale[e].out_step;
+                            #pragma omp simd
+                            for (int c = 0; c < kHidden; ++c) {
+                                dst_mlp[c] += static_cast<float>(src_i16[c]) * w_step;
+                            }
+                        }
+                    }
+                    return;
+                }
+                if (use_gathered_t8) {
+                    const int8_t *q8_src = m_buf_exp_q8.data();
+                    for (int idx = 0; idx < n_exps; ++idx) {
+                        const int e = exps[idx];
+                        const size_t w_off = m_ab_shared_weights ? (d_idx == 0 ? ab[3].off : ab[3].off_d1) : no.exp_offset[e];
+                        const size_t w_sz  = no.exp_size[e];
+                        const int cnt = exp_tok_cnt[e];
+                        for (int base = 0; base < cnt; base += 6) {
+                            const int b_cnt = std::min(6, cnt - base);
+                            int tok_idx[6];
+                            for (int j = 0; j < b_cnt; ++j) tok_idx[j] = exp_toks[e][base + j].t;
+                            pack_gathered_int8_t8(q8_src, tok_idx, b_cnt, e_act->as<int8_t>(), kHidden);
+                            e_act->flush_cache();
+                            uint64_t dns = 0;
+                            if (!m_pool.submit_task(phys_d, model_id,
+                                    {DmaBufferSlice{e_act, 0, in_b},
+                                     DmaBufferSlice{w_buf, w_off, w_sz}},
+                                    {DmaBufferSlice{e_out, 0, out_b}}, &dns)) {
+                                ok_flag = false;
+                                return;
+                            }
+                            drv_ns += dns;
+                            e_out->flush_cache();
+                            const int unpack_t = (b_cnt <= 4) ? b_cnt : 8;
+                            unpack_npu_output(e_out, tmp_buf, 8, 2048, no.exp_scale[e], nullptr, unpack_t, 2048);
+                            for (int j = 0; j < b_cnt; ++j) {
+                                const int t = tok_idx[j];
+                                const int slot = kT8SafeSlots[j];
+                                const float wk = exp_toks[e][base + j].w;
+                                float *dst_row = dst_mlp + static_cast<size_t>(t) * kHidden;
+                                const float *src_row = tmp_buf + static_cast<size_t>(slot) * kHidden;
+                                #pragma omp simd
+                                for (int c = 0; c < kHidden; ++c) {
+                                    dst_row[c] += wk * src_row[c];
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                e_act->flush_cache();
+                for (int idx = 0; idx < n_exps; ++idx) {
+                    int e = exps[idx];
+                    size_t w_off = m_ab_shared_weights ? (d_idx == 0 ? ab[3].off : ab[3].off_d1) : no.exp_offset[e];
+                    size_t w_sz  = no.exp_size[e];
+                    uint64_t dns = 0;
+                    if (!m_pool.submit_task(phys_d, model_id,
+                            {DmaBufferSlice{e_act, 0, in_b},
+                             DmaBufferSlice{w_buf, w_off, w_sz}},
+                            {DmaBufferSlice{e_out, 0, out_b}}, &dns)) {
+                        ok_flag = false;
+                        return;
+                    }
+                    drv_ns += dns;
+                    e_out->flush_cache();
+                    unpack_npu_output(e_out, tmp_buf, T, 2048, no.exp_scale[e], nullptr, T_valid, 2048);
+                    const int cnt = exp_tok_cnt[e];
+                    for (int j = 0; j < cnt; ++j) {
+                        const int t = exp_toks[e][j].t;
+                        const float wk = exp_toks[e][j].w;
+                        float *dst_row = dst_mlp + static_cast<size_t>(t) * kHidden;
+                        const float *src_row = tmp_buf + static_cast<size_t>(t) * kHidden;
+                        #pragma omp simd
+                        for (int c = 0; c < kHidden; ++c) {
+                            dst_row[c] += wk * src_row[c];
+                        }
+                    }
+                }
+            };
+
             run_dual_die(
                 [&]() {
-                    if (n_even == 0) return;
-                    act_buf_d0->flush_cache();
-                    if (T == 1 && n_even <= 4 && no.exp_scale[even_exps[0]].out_dtype == BoundaryDtype::Int16) {
-                        std::vector<DmaBufferSlice> w_slices, out_slices;
-                        w_slices.reserve(n_even);
-                        out_slices.reserve(n_even);
-                        for (int idx = 0; idx < n_even; ++idx) {
-                            int e = even_exps[idx];
-                            size_t w_off = m_ab_shared_weights ? ab[3].off : no.exp_offset[e];
-                            w_slices.push_back(DmaBufferSlice{w_buf_d0, w_off, no.exp_size[e]});
-                            out_slices.push_back(DmaBufferSlice{m_exp_out_t1[0][idx].get(), 0, 4096});
-                        }
-                        if (!m_pool.submit_expert_batch(0, m_mlp_0.id,
-                                DmaBufferSlice{act_buf_d0, 0, in_b0}, w_slices, out_slices, &drv_e0_ns)) {
-                            ok_e0 = false;
-                            return;
-                        }
-                        for (int idx = 0; idx < n_even; ++idx) {
-                            int e = even_exps[idx];
-                            m_exp_out_t1[0][idx]->flush_cache();
-                            const int16_t *src_i16 = m_exp_out_t1[0][idx]->as<int16_t>();
-                            const float wk = exp_toks[e][0].w;
-                            const float *sc_ch = no.exp_scale[e].out_step_chan;
-                            if (sc_ch) {
-                                #pragma omp simd
-                                for (int c = 0; c < kHidden; ++c) {
-                                    mlp_out[c] += static_cast<float>(src_i16[c]) * (wk * sc_ch[c]);
-                                }
-                            } else {
-                                const float w_step = wk * no.exp_scale[e].out_step;
-                                #pragma omp simd
-                                for (int c = 0; c < kHidden; ++c) {
-                                    mlp_out[c] += static_cast<float>(src_i16[c]) * w_step;
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    float *tmp0 = m_buf_exp_tmp[0].data();
-                    for (int idx = 0; idx < n_even; ++idx) {
-                        int e = even_exps[idx];
-                        size_t w_off = m_ab_shared_weights ? ab[3].off : no.exp_offset[e];
-                        size_t w_sz  = no.exp_size[e];
-                        uint64_t dns = 0;
-                        if (!m_pool.submit_task(0, m_mlp_0.id,
-                                {DmaBufferSlice{act_buf_d0, 0, in_b0},
-                                 DmaBufferSlice{w_buf_d0, w_off, w_sz}},
-                                {DmaBufferSlice{out_buf_d0, 0, out_b0}}, &dns)) {
-                            ok_e0 = false;
-                            return;
-                        }
-                        drv_e0_ns += dns;
-                        out_buf_d0->flush_cache();
-                        unpack_npu_output(out_buf_d0, tmp0, T, 2048, no.exp_scale[e], nullptr, T_valid, 2048);
-                        const int cnt = exp_tok_cnt[e];
-                        for (int j = 0; j < cnt; ++j) {
-                            const int t = exp_toks[e][j].t;
-                            const float wk = exp_toks[e][j].w;
-                            float *dst_row = mlp_out + static_cast<size_t>(t) * kHidden;
-                            const float *src_row = tmp0 + static_cast<size_t>(t) * kHidden;
-                            #pragma omp simd
-                            for (int c = 0; c < kHidden; ++c) {
-                                dst_row[c] += wk * src_row[c];
-                            }
-                        }
-                    }
+                    run_die_experts(0, 0, m_mlp_0.id, exp_act0, exp_out0, w_buf_d0,
+                                    even_exps, n_even, in_b0, out_b0,
+                                    m_buf_exp_tmp[0].data(), mlp_out, ok_e0, drv_e0_ns);
                 },
                 [&]() {
-                    if (n_odd == 0) return;
-                    act_buf_d1->flush_cache();
-                    if (T == 1 && n_odd <= 4 && no.exp_scale[odd_exps[0]].out_dtype == BoundaryDtype::Int16) {
-                        std::vector<DmaBufferSlice> w_slices, out_slices;
-                        w_slices.reserve(n_odd);
-                        out_slices.reserve(n_odd);
-                        for (int idx = 0; idx < n_odd; ++idx) {
-                            int e = odd_exps[idx];
-                            size_t w_off = m_ab_shared_weights ? ab[3].off_d1 : no.exp_offset[e];
-                            w_slices.push_back(DmaBufferSlice{w_buf_d1, w_off, no.exp_size[e]});
-                            out_slices.push_back(DmaBufferSlice{m_exp_out_t1[1][idx].get(), 0, 4096});
-                        }
-                        if (!m_pool.submit_expert_batch(phys1, m_mlp_d1.id,
-                                DmaBufferSlice{act_buf_d1, 0, in_b1}, w_slices, out_slices, &drv_e1_ns)) {
-                            ok_e1 = false;
-                            return;
-                        }
-                        for (int idx = 0; idx < n_odd; ++idx) {
-                            int e = odd_exps[idx];
-                            m_exp_out_t1[1][idx]->flush_cache();
-                            const int16_t *src_i16 = m_exp_out_t1[1][idx]->as<int16_t>();
-                            const float wk = exp_toks[e][0].w;
-                            const float *sc_ch = no.exp_scale[e].out_step_chan;
-                            if (sc_ch) {
-                                #pragma omp simd
-                                for (int c = 0; c < kHidden; ++c) {
-                                    mlp_out_d1[c] += static_cast<float>(src_i16[c]) * (wk * sc_ch[c]);
-                                }
-                            } else {
-                                const float w_step = wk * no.exp_scale[e].out_step;
-                                #pragma omp simd
-                                for (int c = 0; c < kHidden; ++c) {
-                                    mlp_out_d1[c] += static_cast<float>(src_i16[c]) * w_step;
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    float *tmp1 = m_buf_exp_tmp[1].data();
-                    for (int idx = 0; idx < n_odd; ++idx) {
-                        int e = odd_exps[idx];
-                        size_t w_off = m_ab_shared_weights ? ab[3].off_d1 : no.exp_offset[e];
-                        size_t w_sz  = no.exp_size[e];
-                        uint64_t dns = 0;
-                        if (!m_pool.submit_task(phys1, m_mlp_d1.id,
-                                {DmaBufferSlice{act_buf_d1, 0, in_b1},
-                                 DmaBufferSlice{w_buf_d1, w_off, w_sz}},
-                                {DmaBufferSlice{out_buf_d1, 0, out_b1}}, &dns)) {
-                            ok_e1 = false;
-                            return;
-                        }
-                        drv_e1_ns += dns;
-                        out_buf_d1->flush_cache();
-                        unpack_npu_output(out_buf_d1, tmp1, T, 2048, no.exp_scale[e], nullptr, T_valid, 2048);
-                        const int cnt = exp_tok_cnt[e];
-                        for (int j = 0; j < cnt; ++j) {
-                            const int t = exp_toks[e][j].t;
-                            const float wk = exp_toks[e][j].w;
-                            float *dst_row = mlp_out_d1 + static_cast<size_t>(t) * kHidden;
-                            const float *src_row = tmp1 + static_cast<size_t>(t) * kHidden;
-                            #pragma omp simd
-                            for (int c = 0; c < kHidden; ++c) {
-                                dst_row[c] += wk * src_row[c];
-                            }
-                        }
-                    }
+                    run_die_experts(1, phys1, m_mlp_d1.id, exp_act1, exp_out1, w_buf_d1,
+                                    odd_exps, n_odd, in_b1, out_b1,
+                                    m_buf_exp_tmp[1].data(), mlp_out_d1, ok_e1, drv_e1_ns);
                 }
             );
             const auto s_moe1 = std::chrono::steady_clock::now();
             const double moe_master_ms = std::chrono::duration<double, std::milli>(s_moe1 - s_moe0).count();
             timers.npu_layer_ms += moe_master_ms;
-            for (int idx = 0; idx < n_even; ++idx) exp_w_bytes += static_cast<double>(no.exp_size[even_exps[idx]]);
-            for (int idx = 0; idx < n_odd;  ++idx) exp_w_bytes += static_cast<double>(no.exp_size[odd_exps[idx]]);
+            if (use_gathered_t8) {
+                for (int idx = 0; idx < n_even; ++idx) exp_w_bytes += static_cast<double>(no.exp_size[even_exps[idx]]) * ((exp_tok_cnt[even_exps[idx]] + 5) / 6);
+                for (int idx = 0; idx < n_odd;  ++idx) exp_w_bytes += static_cast<double>(no.exp_size[odd_exps[idx]])  * ((exp_tok_cnt[odd_exps[idx]] + 5) / 6);
+            } else {
+                for (int idx = 0; idx < n_even; ++idx) exp_w_bytes += static_cast<double>(no.exp_size[even_exps[idx]]);
+                for (int idx = 0; idx < n_odd;  ++idx) exp_w_bytes += static_cast<double>(no.exp_size[odd_exps[idx]]);
+            }
             timers.add_arch(StageTimers::ARCH_MLP, moe_master_ms,
                             static_cast<double>(std::max(drv_e0_ns, drv_e1_ns)) / 1e6, exp_w_bytes);
             if (!ok_e0 || !ok_e1) return false;
@@ -2485,7 +2786,7 @@ public:
             auto tn7 = std::chrono::steady_clock::now();
             timers.cpu_norm_ms += std::chrono::duration<double, std::milli>(tn7 - tn6).count();
 
-            if (debug_layer_outs) {
+            if (debug_layer_outs && debug_layer_outs->size() == static_cast<size_t>(kNumLayers) * kHidden) {
                 const float *last_h = h + static_cast<size_t>(T_valid - 1) * kHidden;
                 std::memcpy(debug_layer_outs->data() + static_cast<size_t>(l) * kHidden,
                             last_h, kHidden * sizeof(float));
@@ -2495,8 +2796,16 @@ public:
         m_pos += T_valid;
         timers.tokens_run += T_valid;
 
-        if (!compute_logits) return true;
         const float *last_h = h + static_cast<size_t>(T_valid - 1) * kHidden;
+        if (!use_t8_verify) {
+            std::memcpy(m_last_h.data(), last_h, kHidden * sizeof(float));
+            m_live_tokens.insert(m_live_tokens.end(), token_ids, token_ids + T_valid);
+            if (m_active_cache_write && !m_in_prefill_cached && (m_pos % kChunk) == 0 && m_pos > 0) {
+                checkpoint_live_block(static_cast<uint32_t>(m_pos / kChunk - 1), m_last_h.data());
+            }
+        }
+
+        if (!compute_logits) return true;
         return compute_logits_from_ptr(last_h, timers, debug_emb_norm);
     }
 
@@ -2657,6 +2966,7 @@ public:
                             const float *visual_embeds, size_t num_visual_tokens,
                             std::vector<float> *debug_layer_outs = nullptr,
                             std::vector<float> *debug_emb_norm = nullptr) {
+        m_tier0_eligible = false;
         const bool force_t1 = std::getenv("LFM3_PREFILL_T1") != nullptr;
         int n = static_cast<int>(tokens.size());
         int idx = 0;
@@ -2711,6 +3021,244 @@ public:
         return prefill_multimodal(tokens, timers, visual_embeds, num_visual_tokens, nullptr, nullptr);
     }
 
+    bool append_tokens(const int32_t *token_ids, int count, bool compute_logits, StageTimers &timers) {
+        int off = 0;
+        while (off < count) {
+            int to_boundary = kChunk - (m_pos % kChunk);
+            int step = std::min(to_boundary, count - off);
+            bool is_last = (off + step == count) && compute_logits;
+            if (!forward_chunk(token_ids + off, step, is_last, timers)) {
+                return false;
+            }
+            off += step;
+        }
+        return true;
+    }
+
+    bool prefill_cached(const std::vector<int32_t> &tokens, StageTimers &timers,
+                        const PrefixCacheOptions &opts, PrefixCacheTelemetry &tel,
+                        const float *visual_embeds = nullptr, size_t num_visual_tokens = 0) {
+        tel = PrefixCacheTelemetry{};
+        if (tokens.empty()) return false;
+        const int n = static_cast<int>(tokens.size());
+        if (n > m_max_ctx) {
+            std::printf("FAIL: prompt (%d tokens) exceeds max_ctx=%d\n", n, m_max_ctx);
+            return false;
+        }
+
+        using namespace eswin::prefix_cache;
+        Hash128 req_vision_fp{};
+        if (visual_embeds && num_visual_tokens > 0) {
+            detail::Hasher128 vh(0x243f6a8885a308d3ULL, 0x13198a2e03707344ULL);
+            vh.update_pod(num_visual_tokens);
+            vh.update(visual_embeds, num_visual_tokens * kHidden * sizeof(float));
+            req_vision_fp = vh.finalize();
+        }
+
+        // Bypass path (--no-prefix-cache or request "cache": false)
+        if (!opts.enabled || !m_prefix_cache_enabled) {
+            reset_state_fast(true);
+            m_active_cache_write = false;
+            m_active_cache_namespace.clear();
+            m_active_pin_blocks_up_to = 0;
+            tel.status = "BYPASS";
+            tel.tier = "none";
+            tel.computed_prompt_tokens = n;
+            bool ok = prefill_multimodal(tokens, timers, visual_embeds, num_visual_tokens, nullptr, nullptr);
+            if (!ok) {
+                invalidate_tier0();
+                return false;
+            }
+            m_live_vision_fp = req_vision_fp;
+            return true;
+        }
+
+        auto t_lkp0 = std::chrono::steady_clock::now();
+
+        // Tier-0 Hot In-RAM Sticky Check (LFM2.5-8B-A1B has ZERO SWA layers -> rewind is unconditionally valid)
+        const bool t0_ctx_ok = m_tier0_eligible &&
+                               (m_active_cache_namespace == opts.cache_namespace) &&
+                               (m_live_vision_fp == req_vision_fp) &&
+                               (m_live_tokens.size() == static_cast<size_t>(m_pos));
+        int tier0_pos = 0;
+        bool tier0_rewind = false;
+        if (t0_ctx_ok) {
+            if (m_pos > 0 && static_cast<size_t>(m_pos) <= tokens.size() &&
+                std::memcmp(tokens.data(), m_live_tokens.data(),
+                            static_cast<size_t>(m_pos) * sizeof(int32_t)) == 0) {
+                tier0_pos = m_pos;
+                tier0_rewind = false;
+            } else if (m_turn_snap_valid && m_turn_snap_pos > 0 &&
+                       static_cast<size_t>(m_turn_snap_pos) <= tokens.size() &&
+                       std::memcmp(tokens.data(), m_live_tokens.data(),
+                                   static_cast<size_t>(m_turn_snap_pos) * sizeof(int32_t)) == 0) {
+                tier0_pos = m_turn_snap_pos;
+                tier0_rewind = true;
+            }
+        }
+
+        // Tier-1 NVMe lookup whenever Tier-0 missed OR NVMe/vision hashing is needed for remaining blocks
+        PrefixLookupResult hit{};
+        const size_t next_blk_end = static_cast<size_t>((tier0_pos / kChunk) + 1) * kChunk;
+        const bool need_lookup = (tier0_pos == 0) ||
+                                 (tokens.size() >= static_cast<size_t>(tier0_pos + kChunk)) ||
+                                 (visual_embeds != nullptr && num_visual_tokens > 0 && tokens.size() >= next_blk_end);
+        if (need_lookup) {
+            hit = m_prefix_cache.lookup(tokens.data(), tokens.size(),
+                                        visual_embeds, num_visual_tokens,
+                                        125030, opts.cache_namespace);
+        }
+        tel.lookup_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_lkp0).count();
+
+        int start_idx = 0;
+        if (tier0_pos > 0 && tier0_pos >= hit.matched_tokens) {
+            if (tier0_rewind) {
+                m_pos = m_turn_snap_pos;
+                m_conv_state = m_turn_snap_conv;
+                m_last_h = m_turn_snap_last_h;
+                m_live_tokens.resize(static_cast<size_t>(m_turn_snap_pos));
+                m_live_block_keys.resize(static_cast<size_t>(m_turn_snap_pos / kChunk));
+                reset_dma_surfaces();
+            }
+            start_idx = m_pos;
+            tel.cached_tier0_tokens = start_idx;
+            tel.status = "HIT_TIER0";
+            tel.tier = "tier0_ram";
+            m_tier0_hits++;
+            m_tier0_tokens_saved += static_cast<uint64_t>(start_idx);
+            if (opts.pin_blocks_up_to > 0 && !m_live_block_keys.empty()) {
+                int np = std::min<int>(static_cast<int>(m_live_block_keys.size()), opts.pin_blocks_up_to);
+                std::vector<Hash128> to_pin(m_live_block_keys.begin(), m_live_block_keys.begin() + np);
+                m_prefix_cache.set_pinned(to_pin, true);
+            }
+        } else if (hit.matched_blocks > 0) {
+            reset_state_fast(false);
+            EngineStateView view = make_state_view();
+            if (m_prefix_cache.restore_blocks(hit, hit.matched_blocks, view,
+                                              m_last_h.data(), tel.restore_ms, tokens.data())) {
+                m_pos = hit.matched_tokens;
+                m_live_tokens.assign(tokens.begin(), tokens.begin() + m_pos);
+                m_live_block_keys.assign(hit.chain_keys.begin(), hit.chain_keys.begin() + hit.matched_blocks);
+                start_idx = m_pos;
+                tel.cached_disk_tokens = start_idx;
+                tel.status = "HIT_DISK";
+                tel.tier = "tier1_nvme";
+                if (opts.pin_blocks_up_to > 0) {
+                    int np = std::min<int>(hit.matched_blocks, opts.pin_blocks_up_to);
+                    std::vector<Hash128> to_pin(hit.chain_keys.begin(), hit.chain_keys.begin() + np);
+                    m_prefix_cache.set_pinned(to_pin, true);
+                }
+            } else {
+                reset_state_fast(true);
+                start_idx = 0;
+                tel.status = "MISS";
+                tel.tier = "none";
+            }
+        } else {
+            reset_state_fast(true);
+            start_idx = 0;
+            tel.status = "MISS";
+            tel.tier = "none";
+        }
+
+        m_active_cache_write = true;
+        m_active_cache_namespace = opts.cache_namespace;
+        m_active_pin_blocks_up_to = opts.pin_blocks_up_to;
+        m_live_vision_fp = req_vision_fp;
+        m_tier0_eligible = true;
+        tel.computed_prompt_tokens = n - start_idx;
+
+        if (start_idx == n) {
+            m_turn_snap_pos = m_pos;
+            m_turn_snap_conv = m_conv_state;
+            m_turn_snap_last_h = m_last_h;
+            m_turn_snap_valid = true;
+            if (!compute_logits_from_ptr(m_last_h.data(), timers)) {
+                invalidate_tier0();
+                return false;
+            }
+            return true;
+        }
+
+        size_t visual_idx = 0;
+        if (visual_embeds && num_visual_tokens > 0) {
+            for (int i = 0; i < start_idx; ++i) {
+                if (tokens[i] == 125030 && visual_idx < num_visual_tokens) visual_idx++;
+            }
+        }
+
+        struct PrefillGuard {
+            bool &flag;
+            explicit PrefillGuard(bool &f) : flag(f) { flag = true; }
+            ~PrefillGuard() { flag = false; }
+        } guard(m_in_prefill_cached);
+
+        const bool force_t1 = std::getenv("LFM3_PREFILL_T1") != nullptr;
+        int idx = start_idx;
+        const int suffix_len = n - start_idx;
+        auto t_pref0 = std::chrono::steady_clock::now();
+
+        if (!force_t1) {
+            while (idx < n) {
+                int to_boundary = kChunk - (idx % kChunk);
+                int step = std::min(to_boundary, n - idx);
+                bool is_last = (idx + step == n);
+                if (!forward_chunk(tokens.data() + idx, step, is_last, timers,
+                                   visual_embeds, &visual_idx, num_visual_tokens,
+                                   nullptr, nullptr)) {
+                    invalidate_tier0();
+                    return false;
+                }
+                idx += step;
+                if ((idx % kChunk) == 0) {
+                    uint32_t b = static_cast<uint32_t>(idx / kChunk - 1);
+                    const Hash128 *known_key = (need_lookup && b < hit.chain_keys.size())
+                                               ? &hit.chain_keys[b] : nullptr;
+                    const Hash128 *known_vh  = (need_lookup && b < hit.vision_hashes.size())
+                                               ? &hit.vision_hashes[b] : nullptr;
+                    checkpoint_live_block(b, m_last_h.data(), nullptr, known_key, known_vh);
+                }
+                int done_sfx = idx - start_idx;
+                if (suffix_len > 128 && (done_sfx % (kChunk * 4) == 0 || is_last)) {
+                    double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pref0).count();
+                    double cur_tok_s = (elapsed_s > 0.0) ? (done_sfx / elapsed_s) : 0.0;
+                    std::printf("\r[Prefill progress: %d/%d suffix tok (%.1f%%) | %.1f tok/s]   ",
+                                done_sfx, suffix_len, (100.0 * done_sfx) / suffix_len, cur_tok_s);
+                    std::fflush(stdout);
+                }
+            }
+            if (suffix_len > 128) {
+                std::printf("\n");
+            }
+        } else {
+            while (idx < n) {
+                bool is_last = (idx + 1 == n);
+                if (!forward_chunk(tokens.data() + idx, 1, is_last, timers,
+                                   visual_embeds, &visual_idx, num_visual_tokens,
+                                   nullptr, nullptr)) {
+                    invalidate_tier0();
+                    return false;
+                }
+                idx++;
+                if ((idx % kChunk) == 0) {
+                    uint32_t b = static_cast<uint32_t>(idx / kChunk - 1);
+                    const Hash128 *known_key = (need_lookup && b < hit.chain_keys.size())
+                                               ? &hit.chain_keys[b] : nullptr;
+                    const Hash128 *known_vh  = (need_lookup && b < hit.vision_hashes.size())
+                                               ? &hit.vision_hashes[b] : nullptr;
+                    checkpoint_live_block(b, m_last_h.data(), nullptr, known_key, known_vh);
+                }
+            }
+        }
+
+        m_turn_snap_pos = m_pos;
+        m_turn_snap_conv = m_conv_state;
+        m_turn_snap_last_h = m_last_h;
+        m_turn_snap_valid = true;
+        return true;
+    }
+
     void set_quant_options(bool force_int8, bool use_shared_archetype_scales) {
         m_force_int8 = force_int8;
         m_use_shared_archetype_scales = use_shared_archetype_scales;
@@ -2730,6 +3278,8 @@ public:
     bool forward_verify_t8(const int32_t *token_ids, int B, StageTimers &timers) {
         if (B < 1 || B > 8) return false;
         m_verify_base_pos = m_pos;
+        m_verify_count = B;
+        std::memcpy(m_verify_tokens, token_ids, static_cast<size_t>(B) * sizeof(int32_t));
         return forward_chunk(token_ids, B, false, timers, nullptr, nullptr, 0, nullptr, nullptr, true);
     }
 
@@ -2749,6 +3299,19 @@ public:
             m_pos = m_verify_base_pos + accepted_count;
             m_conv_state = m_conv_state_snaps[last_accepted_idx];
             timers.tokens_run -= (B_run - accepted_count);
+        }
+        if (accepted_count > 0) {
+            m_live_tokens.insert(m_live_tokens.end(), m_verify_tokens, m_verify_tokens + accepted_count);
+            std::memcpy(m_last_h.data(),
+                        m_buf_h.data() + static_cast<size_t>(last_accepted_idx) * kHidden,
+                        kHidden * sizeof(float));
+            int boundary = ((m_verify_base_pos / kChunk) + 1) * kChunk;
+            if (m_active_cache_write && boundary <= m_pos) {
+                int j_b = boundary - 1 - m_verify_base_pos;
+                checkpoint_live_block(static_cast<uint32_t>(boundary / kChunk - 1),
+                                      m_buf_h.data() + static_cast<size_t>(j_b) * kHidden,
+                                      m_conv_state_snaps[j_b].data());
+            }
         }
     }
 
@@ -4203,7 +4766,34 @@ private:
     bool m_enable_pld = false;
     int m_pld_max_k = 3;
     int m_verify_base_pos = 0;
+    int m_verify_count = 0;
+    int32_t m_verify_tokens[8] = {0};
     std::vector<float> m_conv_state_snaps[8];
+
+    bool m_prefix_cache_enabled = true;
+    std::string m_cache_dir;
+    uint64_t m_cache_max_disk_bytes = 256ULL * 1024 * 1024 * 1024;
+    eswin::prefix_cache::Hash128 m_model_fingerprint{};
+    eswin::prefix_cache::RadixCache m_prefix_cache;
+
+    bool m_active_cache_write = false;
+    bool m_in_prefill_cached = false;
+    bool m_tier0_eligible = false;
+    std::string m_active_cache_namespace;
+    int m_active_pin_blocks_up_to = 0;
+
+    std::vector<int32_t> m_live_tokens;
+    std::vector<eswin::prefix_cache::Hash128> m_live_block_keys;
+    eswin::prefix_cache::Hash128 m_live_vision_fp{};
+    std::vector<float> m_last_h;
+
+    bool m_turn_snap_valid = false;
+    int m_turn_snap_pos = 0;
+    std::vector<float> m_turn_snap_conv;
+    std::vector<float> m_turn_snap_last_h;
+
+    uint64_t m_tier0_hits = 0;
+    uint64_t m_tier0_tokens_saved = 0;
 
     float m_swa_inv_freq[64];
     float m_glob_inv_freq[64];
@@ -4223,6 +4813,7 @@ private:
     std::vector<float> m_buf_h, m_buf_u, m_buf_u_smooth, m_buf_bcx, m_buf_qkv, m_buf_y,
                        m_buf_op_out, m_buf_h_mid, m_buf_v, m_buf_mlp_out, m_buf_mlp_out_d1, m_buf_gates;
     std::vector<float> m_buf_exp_tmp[2];
+    std::vector<int8_t> m_buf_exp_q8;
 };
 
 static double cosine_similarity(const float *a, const float *b, size_t n) {
@@ -4505,6 +5096,64 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             continue;
         }
 
+        auto escape_json_str = [](const std::string &in) -> std::string {
+            std::ostringstream esc;
+            for (char c : in) {
+                if (c == '"') esc << "\\\"";
+                else if (c == '\\') esc << "\\\\";
+                else if (c == '\n') esc << "\\n";
+                else if (c == '\r') esc << "\\r";
+                else if (c == '\t') esc << "\\t";
+                else esc << c;
+            }
+            return esc.str();
+        };
+
+        if (j.has("cmd")) {
+            std::string cmd = j["cmd"].as_string("");
+            if (cmd == "cache_stats") {
+                auto st = engine.prefix_cache_stats();
+                std::ostringstream cs;
+                cs << std::fixed << std::setprecision(2)
+                   << "{\"type\":\"cache_stats\""
+                   << ",\"enabled\":" << (engine.is_prefix_cache_enabled() ? "true" : "false")
+                   << ",\"cache_dir\":\"" << escape_json_str(engine.cache_dir()) << "\""
+                   << ",\"model_fingerprint\":\"" << engine.model_fingerprint().to_hex() << "\""
+                   << ",\"resident_blocks\":" << st.resident_blocks
+                   << ",\"pinned_blocks\":" << st.pinned_blocks
+                   << ",\"disk_bytes_used\":" << st.disk_bytes_used
+                   << ",\"disk_bytes_quota\":" << st.disk_bytes_quota
+                   << ",\"total_lookups\":" << st.total_lookups
+                   << ",\"total_block_hits\":" << st.total_block_hits
+                   << ",\"total_tokens_saved\":" << st.total_tokens_saved
+                   << ",\"total_evictions\":" << st.total_evictions
+                   << ",\"pending_writes\":" << st.pending_writes
+                   << ",\"tier0_hits\":" << engine.tier0_hits()
+                   << ",\"tier0_tokens_saved\":" << engine.tier0_tokens_saved()
+                   << ",\"tier0_live_tokens\":" << engine.live_tokens_count()
+                   << "}\n";
+                std::string cs_resp = cs.str();
+                send(client_fd, cs_resp.data(), cs_resp.size(), 0);
+                close(client_fd);
+                continue;
+            } else if (cmd == "cache_clear") {
+                bool include_pinned = j["include_pinned"].as_bool(false);
+                size_t removed = engine.clear_prefix_cache(include_pinned);
+                std::string clr = "{\"type\":\"cache_cleared\",\"removed_blocks\":" +
+                                  std::to_string(removed) + ",\"include_pinned\":" +
+                                  (include_pinned ? "true" : "false") + "}\n";
+                send(client_fd, clr.data(), clr.size(), 0);
+                close(client_fd);
+                continue;
+            } else {
+                std::string err_resp = "{\"type\":\"error\",\"message\":\"Unknown cmd: " +
+                                       escape_json_str(cmd) + "\"}\n";
+                send(client_fd, err_resp.data(), err_resp.size(), 0);
+                close(client_fd);
+                continue;
+            }
+        }
+
         std::string prompt = j["prompt"].as_string("");
         int max_new_tokens = j["max_tokens"].as_int(128);
         float temperature = static_cast<float>(j["temperature"].as_double(0.1));
@@ -4513,6 +5162,11 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         bool raw = j["raw"].as_bool(false);
         bool return_logits = j["return_logits"].as_bool(false) || (max_new_tokens == 0);
         int image_bytes = j["image_bytes"].as_int(0);
+
+        Lfm3Engine::PrefixCacheOptions cache_opts;
+        cache_opts.enabled = j.has("cache") ? j["cache"].as_bool(true) : true;
+        cache_opts.cache_namespace = j["prompt_cache_key"].as_string("");
+        cache_opts.pin_blocks_up_to = j["pin_blocks_up_to"].as_int(0);
 
         std::vector<float> visual_embeds;
         if (image_bytes > 0 && (image_bytes % (Lfm3Engine::kHidden * sizeof(float)) == 0)) {
@@ -4531,28 +5185,29 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             }
         }
 
-        engine.reset_state();
         SamplerParams sp;
         sp.temperature = temperature;
         sp.top_k = top_k;
-        sp.repeat_penalty = 1.1f;
+        sp.repeat_penalty = 1.05f;
         sp.repeat_window = 64;
+        sp.max_consecutive_duplicates = 4;
         Sampler sampler(sp);
 
         std::string formatted = prompt;
         if (!raw && prompt.find("<|im_start|>") == std::string::npos) {
-            formatted = format_lfm3_chat(prompt, "You are a helpful AI assistant.", !no_think);
+            formatted = format_lfm3_chat(prompt, "", !no_think);
         }
 
         std::vector<int32_t> prompt_ids = encode_lfm3_text(engine.tokenizer(), formatted);
 
         StageTimers prefill_t, decode_t;
+        Lfm3Engine::PrefixCacheTelemetry cache_tel;
         g_in_generation.store(true);
 
         const float *vis_ptr = visual_embeds.empty() ? nullptr : visual_embeds.data();
         size_t num_vis_tok = visual_embeds.size() / Lfm3Engine::kHidden;
 
-        if (!engine.prefill(prompt_ids, prefill_t, vis_ptr, num_vis_tok)) {
+        if (!engine.prefill_cached(prompt_ids, prefill_t, cache_opts, cache_tel, vis_ptr, num_vis_tok)) {
             std::string err_resp = "{\"type\":\"error\",\"message\":\"Prefill failed on NPU\"}\n";
             send(client_fd, err_resp.data(), err_resp.size(), 0);
             g_in_generation.store(false);
@@ -4563,6 +5218,14 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         if (return_logits) {
             std::ostringstream l_ss;
             l_ss << "{\"type\":\"logits\",\"prompt_tokens\":" << prompt_ids.size()
+                 << ",\"cached_tokens\":" << cache_tel.cached_tokens()
+                 << ",\"cached_tier0_tokens\":" << cache_tel.cached_tier0_tokens
+                 << ",\"cached_disk_tokens\":" << cache_tel.cached_disk_tokens
+                 << ",\"computed_prompt_tokens\":" << cache_tel.computed_prompt_tokens
+                 << ",\"cache_lookup_ms\":" << cache_tel.lookup_ms
+                 << ",\"cache_restore_ms\":" << cache_tel.restore_ms
+                 << ",\"cache_status\":\"" << cache_tel.status << "\""
+                 << ",\"cache_tier\":\"" << cache_tel.tier << "\""
                  << ",\"prefill_ms\":" << prefill_t.total_ms() << ",\"logits\":{";
             const auto &all_logits = engine.logits();
             if (j["requested_tokens"].is_array()) {
@@ -4580,12 +5243,47 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             send(client_fd, l_resp.data(), l_resp.size(), 0);
             g_in_generation.store(false);
             close(client_fd);
-            std::printf("[Daemon] Decision query completed: %zu prompt tok, %.1f ms prefill\n",
+            std::printf("[Daemon] Decision query completed: %zu prompt tok (cache %s %d/%zu), %.1f ms prefill\n",
+                        prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(),
                         prompt_ids.size(), prefill_t.total_ms());
             continue;
         }
 
+        {
+            std::ostringstream p_ss;
+            p_ss << "{\"type\":\"prefill_done\",\"prompt_tokens\":" << prompt_ids.size()
+                 << ",\"cached_tokens\":" << cache_tel.cached_tokens()
+                 << ",\"cached_tier0_tokens\":" << cache_tel.cached_tier0_tokens
+                 << ",\"cached_disk_tokens\":" << cache_tel.cached_disk_tokens
+                 << ",\"computed_prompt_tokens\":" << cache_tel.computed_prompt_tokens
+                 << ",\"cache_lookup_ms\":" << cache_tel.lookup_ms
+                 << ",\"cache_restore_ms\":" << cache_tel.restore_ms
+                 << ",\"cache_status\":\"" << cache_tel.status << "\""
+                 << ",\"cache_tier\":\"" << cache_tel.tier << "\""
+                 << ",\"prefill_ms\":" << prefill_t.total_ms()
+                 << "}\n";
+            std::string p_ev = p_ss.str();
+#if defined(MSG_NOSIGNAL)
+            send(client_fd, p_ev.data(), p_ev.size(), MSG_NOSIGNAL);
+#else
+            send(client_fd, p_ev.data(), p_ev.size(), 0);
+#endif
+        }
+
         int step = 0;
+        int reasoning_tokens = 0;
+        bool in_think = !no_think;
+        {
+            size_t last_open_t = formatted.rfind("<think>");
+            size_t last_close_t = formatted.rfind("</think>");
+            if (last_open_t != std::string::npos &&
+                (last_close_t == std::string::npos || last_close_t < last_open_t)) {
+                in_think = true;
+            } else if (last_close_t != std::string::npos &&
+                       (last_open_t == std::string::npos || last_close_t > last_open_t)) {
+                in_think = false;
+            }
+        }
         std::vector<int32_t> history = prompt_ids;
         std::vector<int32_t> draft, cand;
         bool has_pre_sampled = false;
@@ -4594,17 +5292,8 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
 
         auto send_tok_event = [&](int32_t tok_id) -> bool {
             std::string piece = engine.tokenizer().decode_token(tok_id);
-            std::ostringstream esc;
-            for (char c : piece) {
-                if (c == '"') esc << "\\\"";
-                else if (c == '\\') esc << "\\\\";
-                else if (c == '\n') esc << "\\n";
-                else if (c == '\r') esc << "\\r";
-                else if (c == '\t') esc << "\\t";
-                else esc << c;
-            }
             std::string tok_event = "{\"type\":\"token\",\"token_id\":" + std::to_string(tok_id) +
-                                    ",\"text\":\"" + esc.str() + "\"}\n";
+                                    ",\"text\":\"" + escape_json_str(piece) + "\"}\n";
 #if defined(MSG_NOSIGNAL)
             return send(client_fd, tok_event.data(), tok_event.size(), MSG_NOSIGNAL) >= 0;
 #else
@@ -4620,8 +5309,11 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             sampler.accept(next_id);
             history.push_back(next_id);
 
-            if (next_id == 124900) break; // <|im_end|>
-            if (next_id != 124902) {      // not </think>
+            if (next_id == 124900 || next_id == 124895) break; // <|im_end|> or <|endoftext|>
+            if (next_id == 124902) {                           // </think>
+                in_think = false;
+            } else {
+                if (in_think) reasoning_tokens++;
                 if (!send_tok_event(next_id)) break;
             }
 
@@ -4657,12 +5349,15 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                                 step++;
                                 sampler.accept(pred_id);
                                 history.push_back(pred_id);
-                                if (pred_id == 124900) {
+                                if (pred_id == 124900 || pred_id == 124895) {
                                     engine.commit_verify_t8(j, decode_t);
                                     stop_gen = true;
                                     break;
                                 }
-                                if (pred_id != 124902) {
+                                if (pred_id == 124902) {
+                                    in_think = false;
+                                } else {
+                                    if (in_think) reasoning_tokens++;
                                     if (!send_tok_event(pred_id)) {
                                         engine.commit_verify_t8(j, decode_t);
                                         stop_gen = true;
@@ -4690,10 +5385,25 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         }
         g_in_generation.store(false);
 
-        std::string done_event = "{\"type\":\"done\",\"prompt_tokens\":" + std::to_string(prompt_ids.size()) +
-                                 ",\"completion_tokens\":" + std::to_string(step) +
-                                 ",\"prefill_ms\":" + std::to_string(prefill_t.total_ms()) +
-                                 ",\"decode_ms\":" + std::to_string(decode_t.total_ms()) + "}\n";
+        std::ostringstream d_ss;
+        d_ss << "{\"type\":\"done\",\"prompt_tokens\":" << prompt_ids.size()
+             << ",\"cached_tokens\":" << cache_tel.cached_tokens()
+             << ",\"cached_tier0_tokens\":" << cache_tel.cached_tier0_tokens
+             << ",\"cached_disk_tokens\":" << cache_tel.cached_disk_tokens
+             << ",\"computed_prompt_tokens\":" << cache_tel.computed_prompt_tokens
+             << ",\"reasoning_tokens\":" << reasoning_tokens
+             << ",\"completion_tokens\":" << step
+             << ",\"prefill_ms\":" << prefill_t.total_ms()
+             << ",\"decode_ms\":" << decode_t.total_ms()
+             << ",\"cache_lookup_ms\":" << cache_tel.lookup_ms
+             << ",\"cache_restore_ms\":" << cache_tel.restore_ms
+             << ",\"cache_status\":\"" << cache_tel.status << "\""
+             << ",\"cache_tier\":\"" << cache_tel.tier << "\""
+             << ",\"pld_accepted\":" << pld_accepted
+             << ",\"pld_drafted\":" << pld_drafted
+             << ",\"pld_steps\":" << pld_steps
+             << "}\n";
+        std::string done_event = d_ss.str();
 #if defined(MSG_NOSIGNAL)
         send(client_fd, done_event.data(), done_event.size(), MSG_NOSIGNAL);
 #else
@@ -4701,18 +5411,20 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
 #endif
         close(client_fd);
         if (pld_steps > 0) {
-            std::printf("[Daemon] Turn completed: %zu prompt tok (%.1f ms), %d decode tok (%.1f ms = %.2f tok/s | PLD accepted %d/%d across %d steps)\n",
-                        prompt_ids.size(), prefill_t.total_ms(), step, decode_t.total_ms(),
+            std::printf("[Daemon] Turn completed: %zu prompt tok (cache %s %d/%zu, restore %.2f ms, %.1f ms prefill), %d decode tok (%.1f ms = %.2f tok/s | PLD accepted %d/%d across %d steps)\n",
+                        prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
+                        cache_tel.restore_ms, prefill_t.total_ms(), step, decode_t.total_ms(),
                         decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0,
                         pld_accepted, pld_drafted, pld_steps);
         } else {
-            std::printf("[Daemon] Turn completed: %zu prompt tok (%.1f ms), %d decode tok (%.1f ms = %.2f tok/s)\n",
-                        prompt_ids.size(), prefill_t.total_ms(), step, decode_t.total_ms(),
+            std::printf("[Daemon] Turn completed: %zu prompt tok (cache %s %d/%zu, restore %.2f ms, %.1f ms prefill), %d decode tok (%.1f ms = %.2f tok/s)\n",
+                        prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
+                        cache_tel.restore_ms, prefill_t.total_ms(), step, decode_t.total_ms(),
                         decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0);
         }
     }
     close(server_fd);
-    std::printf("[+] LFM3 Daemon shut down cleanly.\n");
+    std::printf("[+] LFM2.5-MoE Daemon shut down cleanly.\n");
 }
 
 } // namespace
@@ -4769,7 +5481,12 @@ int main(int argc, char **argv) {
     bool enable_pld = false;
     int pld_max_k = 3;
     bool daemon_mode = false;
-    int daemon_port = 8088;
+    int daemon_port = 8089;
+    bool enable_prefix_cache = true;
+    std::string cache_dir;
+    uint64_t cache_max_bytes = 256ULL * 1024 * 1024 * 1024;
+    bool verify_prefix_cache = false;
+    std::string verify_prefix_prompt_path;
 
     auto apply_think_setting = [&](const std::string &val) -> bool {
         std::string s = val;
@@ -4876,9 +5593,23 @@ int main(int argc, char **argv) {
                 daemon_port = std::stoi(argv[++i]);
             }
         }
+        else if (a == "--cache-dir") cache_dir = next_arg();
+        else if (a == "--cache-max-gb") {
+            double gb = std::stod(next_arg());
+            if (gb < 0.0) gb = 0.0;
+            cache_max_bytes = static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
+        }
+        else if (a == "--no-prefix-cache") enable_prefix_cache = false;
+        else if (a == "--verify-prefix-cache") {
+            verify_prefix_cache = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                verify_prefix_prompt_path = argv[++i];
+            }
+        }
         else if (a == "--help" || a == "-h") {
-            std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--bench-attn]\n"
-                        "          [--speculative-pld | --pld] [--pld-k K]\n"
+            std::printf("Usage: %s [--model-dir DIR] [--verify-golden golden_ref.bin] [--verify-prefix-cache [FILE]]\n"
+                        "          [--bench-attn] [--speculative-pld | --pld] [--pld-k K]\n"
+                        "          [--cache-dir DIR] [--cache-max-gb N] [--no-prefix-cache]\n"
                         "          [--prompt TEXT | --prompt-file FILE | -f FILE]\n"
                         "          [--max-tokens N | -n N] [--max-ctx N]\n"
                         "          [--no-think | --think-level LEVEL | --think-budget N]\n"
@@ -4886,12 +5617,17 @@ int main(int argc, char **argv) {
                         "          [--daemon [PORT]]\n"
                         "  Dual-Die EP=2 Sparse MoE (Layers 2..23: 16 even experts on Die 0, 16 odd on Die 1;\n"
                         "  Layers 0..1: TP=2 dense stem via 4 quarter-experts; Layers 0..11/12..23 operators).\n"
-                        "  --speculative-pld   Enable Prompt-Lookup Speculative Decoding with T=8 batch verification.\n"
-                        "  --pld-k K           Maximum speculative draft tokens per T=8 step (1..7, default 3).\n"
-                        "  --no-think          Disable <think>...</think> reasoning block.\n"
-                        "  --think-level LEVEL Set thinking token budget preset: none (0), low (64),\n"
-                        "                      medium (256, default), high (512), xhigh (1536), or unlimited.\n"
-                        "  --think-budget N    Set maximum thinking tokens before closing </think> (0 = off).\n",
+                        "  --speculative-pld     Enable Prompt-Lookup Speculative Decoding with T=8 batch verification.\n"
+                        "  --pld-k K             Maximum speculative draft tokens per T=8 step (1..7, default 3).\n"
+                        "  --cache-dir DIR       NVMe prefix cache root directory (default ~/.cache/romanaccio/kvcache).\n"
+                        "  --cache-max-gb N      Prefix cache disk quota in GiB (default 256).\n"
+                        "  --no-prefix-cache     Disable Tier-0/Tier-1 prefix caching for clean A/B benchmarks.\n"
+                        "  --verify-prefix-cache Run Phase F silicon bit-exactness & latency gate (0.000000 diff, <=45 ms @ 8K).\n"
+                        "  --no-think            Disable <think>...</think> reasoning block.\n"
+                        "  --think-level LEVEL   Set thinking token budget preset: none (0), low (64),\n"
+                        "                        medium (256, default), high (512), xhigh (1536), or unlimited.\n"
+                        "  --think-budget N      Set maximum thinking tokens before closing </think> (0 = off).\n"
+                        "  --daemon [PORT]       Start persistent TCP daemon server (default port: 8089).\n",
                         argv[0]);
             return 0;
         }
@@ -4902,7 +5638,18 @@ int main(int argc, char **argv) {
     engine.set_speculative_pld(enable_pld, pld_max_k);
     engine.set_ab_shared_weights(ab_shared_weights);
     engine.set_extent_probe(std::getenv("LFM3_MEASURE_EXTENT") != nullptr, 2u << 20);
-    if (bench_attn && verify_golden_path.empty() && prompt.empty()) {
+    std::string verify_tmp_dir;
+    if (verify_prefix_cache) {
+        enable_prefix_cache = true;
+        std::string base_dir = cache_dir.empty() ? resolve_default_cache_dir() : cache_dir;
+        verify_tmp_dir = base_dir + "/.verify_tmp_moe_" + std::to_string(static_cast<long>(getpid()));
+        std::error_code ec;
+        std::filesystem::remove_all(verify_tmp_dir, ec);
+        engine.set_prefix_cache_options(true, verify_tmp_dir, cache_max_bytes);
+    } else {
+        engine.set_prefix_cache_options(enable_prefix_cache, cache_dir, cache_max_bytes);
+    }
+    if (bench_attn && verify_golden_path.empty() && !verify_prefix_cache && prompt.empty()) {
         engine.benchmark_global_attention_kernel();
         return 0;
     }
@@ -5129,6 +5876,206 @@ int main(int argc, char **argv) {
     }
 
     // -------------------------------------------------------------------------
+    // Prefix Cache Bit-Exactness & Latency Gate (--verify-prefix-cache)
+    // -------------------------------------------------------------------------
+    if (verify_prefix_cache) {
+        std::printf("=================================================================\n");
+        std::printf(" Phase F.5 Acceptance Gate: MoE Prefix Cache Bit-Exactness & Latency\n");
+        std::printf(" Temp NVMe verify dir: %s\n", verify_tmp_dir.c_str());
+        std::printf("=================================================================\n");
+
+        std::string code_text;
+        std::vector<std::string> cands;
+        if (!verify_prefix_prompt_path.empty()) cands.push_back(verify_prefix_prompt_path);
+        cands.push_back("bench_c_code_4k.c");
+        cands.push_back(pkg_dir + "/bench_c_code_4k.c");
+        cands.push_back(pkg_dir + "/../LFM3-1.7B_ENNP/bench_c_code_4k.c");
+        cands.push_back("/home/chri/models/LFM3-1.7B_ENNP/bench_c_code_4k.c");
+        std::string used_src = "synthetic_fallback";
+        for (const std::string &cp : cands) {
+            if (file_exists(cp)) {
+                std::ifstream ifs(cp);
+                if (ifs.is_open()) {
+                    code_text.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                    if (!code_text.empty()) {
+                        used_src = cp;
+                        break;
+                    }
+                }
+            }
+        }
+        if (code_text.empty()) {
+            std::ostringstream syn;
+            syn << "Explain the following C code:\n\n";
+            for (int k = 0; k < 340; ++k) {
+                syn << "int compute_step_" << k << "(int x, int y) { return (x * "
+                    << (k + 3) << ") ^ (y + " << (k * 7 + 1) << "); }\n";
+            }
+            code_text = syn.str();
+        }
+
+        std::string formatted = format_lfm3_chat(code_text, "", false);
+        std::vector<int32_t> tokens = encode_lfm3_text(engine.tokenizer(), formatted);
+        while (static_cast<int>(tokens.size()) < 320) {
+            tokens.insert(tokens.end(), tokens.begin(), tokens.end());
+        }
+        if (static_cast<int>(tokens.size()) > max_ctx - 16) {
+            tokens.resize(static_cast<size_t>(max_ctx - 16));
+        }
+        if ((tokens.size() % 64) == 0 && tokens.size() > 320) {
+            tokens.pop_back();
+        }
+        const int total_toks = static_cast<int>(tokens.size());
+        const int full_blocks = total_toks / 64;
+        const int full_blk_toks = full_blocks * 64;
+        const int suffix_toks = total_toks - full_blk_toks;
+        std::printf("[+] Prompt source: %s (%d tokens = %d blocks x 64 + %d suffix tokens)\n\n",
+                    used_src.c_str(), total_toks, full_blocks, suffix_toks);
+
+        auto diff_logits = [&](const std::vector<float> &a, const std::vector<float> &b,
+                               float &out_max_abs, double &out_cos) {
+            float mx = 0.0f;
+            for (size_t k = 0; k < a.size(); ++k) {
+                float d = std::fabs(a[k] - b[k]);
+                if (d > mx) mx = d;
+            }
+            out_max_abs = mx;
+            out_cos = cosine_similarity(a.data(), b.data(), a.size());
+        };
+
+        Lfm3Engine::PrefixCacheOptions opts_off; opts_off.enabled = false;
+        Lfm3Engine::PrefixCacheOptions opts_on;  opts_on.enabled = true;
+        Lfm3Engine::PrefixCacheTelemetry tel;
+        StageTimers t_tmp;
+
+        // --- Test 1: Short-context (< 256) Global FP32 KV NVMe restore ---
+        std::vector<int32_t> p_short(tokens.begin(), tokens.begin() + 160);
+        engine.reset_state(); t_tmp.reset();
+        if (!engine.prefill_cached(p_short, t_tmp, opts_off, tel)) return 1;
+        std::vector<float> cold_logits_short = engine.logits();
+
+        engine.reset_state(); t_tmp.reset();
+        if (!engine.prefill_cached(p_short, t_tmp, opts_on, tel)) return 1;
+        engine.flush_prefix_cache();
+
+        engine.reset_state(); t_tmp.reset();
+        if (!engine.prefill_cached(p_short, t_tmp, opts_on, tel)) return 1;
+        float t1_max_abs = 0.0f; double t1_cos = 0.0;
+        diff_logits(engine.logits(), cold_logits_short, t1_max_abs, t1_cos);
+        bool t1_pass = (tel.status == "HIT_DISK") && (tel.cached_disk_tokens == 128) &&
+                       (tel.computed_prompt_tokens == 32) && (t1_max_abs == 0.0f) && (t1_cos == 1.0);
+        std::printf("[Test 1] Short-Ctx (<256, Sec4 glob_f32): status=%s cached=%d/%zu restore=%.2fms "
+                    "max_abs=%.6f cos=%.8f [%s]\n",
+                    tel.status.c_str(), tel.cached_disk_tokens, p_short.size(), tel.restore_ms,
+                    t1_max_abs, t1_cos, t1_pass ? "PASS" : "FAIL");
+
+        // --- Test 2: ~4K NVMe restore + suffix + 4/4 greedy + <=45 ms @ 8K ---
+        engine.reset_state();
+        StageTimers t_cold, t_pop, t_warm, t_dec_c, t_dec_w;
+        if (!engine.prefill_cached(tokens, t_cold, opts_off, tel)) return 1;
+        std::vector<float> cold_logits_4k = engine.logits();
+        std::vector<int32_t> cold_gen(4, -1);
+        for (int s = 0; s < 4; ++s) {
+            const auto &lg = engine.logits();
+            cold_gen[s] = static_cast<int32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            if (s < 3 && !engine.forward_chunk(&cold_gen[s], 1, true, t_dec_c)) return 1;
+        }
+
+        engine.reset_state();
+        if (!engine.prefill_cached(tokens, t_pop, opts_on, tel)) return 1;
+        engine.flush_prefix_cache();
+
+        engine.reset_state();
+        if (!engine.prefill_cached(tokens, t_warm, opts_on, tel)) return 1;
+        float t2_max_abs = 0.0f; double t2_cos = 0.0;
+        diff_logits(engine.logits(), cold_logits_4k, t2_max_abs, t2_cos);
+        std::vector<int32_t> warm_gen(4, -1);
+        int greedy_matches = 0;
+        for (int s = 0; s < 4; ++s) {
+            const auto &lg = engine.logits();
+            warm_gen[s] = static_cast<int32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            if (warm_gen[s] == cold_gen[s]) greedy_matches++;
+            if (s < 3 && !engine.forward_chunk(&warm_gen[s], 1, true, t_dec_w)) return 1;
+        }
+        double restore_8k_ms = tel.restore_ms * (8192.0 / std::max(1, tel.cached_disk_tokens));
+        double cold_ms = t_cold.total_ms();
+        double warm_ms = t_warm.total_ms();
+        bool t2_pass = (tel.status == "HIT_DISK") && (tel.cached_disk_tokens == full_blk_toks) &&
+                       (tel.computed_prompt_tokens == suffix_toks) && (t2_max_abs == 0.0f) &&
+                       (t2_cos == 1.0) && (greedy_matches == 4) && (restore_8k_ms <= 45.0);
+        std::printf("[Test 2] Full %d-Tok NVMe Restore + Suffix: status=%s cached=%d+%d restore=%.2fms "
+                    "(8K=%.2fms <=45ms) cold=%.1fms warm=%.1fms (%.1fx) max_abs=%.6f cos=%.8f greedy=%d/4 [%s]\n",
+                    total_toks, tel.status.c_str(), tel.cached_disk_tokens, tel.computed_prompt_tokens,
+                    tel.restore_ms, restore_8k_ms, cold_ms, warm_ms,
+                    (warm_ms > 0.0) ? (cold_ms / warm_ms) : 0.0,
+                    t2_max_abs, t2_cos, greedy_matches, t2_pass ? "PASS" : "FAIL");
+
+        // --- Test 3: Exact 0-suffix block-boundary hit (last_h restoration) ---
+        std::vector<int32_t> p_exact(tokens.begin(), tokens.begin() + full_blk_toks);
+        engine.reset_state(); t_tmp.reset();
+        if (!engine.prefill_cached(p_exact, t_tmp, opts_off, tel)) return 1;
+        std::vector<float> cold_logits_exact = engine.logits();
+
+        engine.reset_state(); t_tmp.reset();
+        if (!engine.prefill_cached(p_exact, t_tmp, opts_on, tel)) return 1;
+        float t3_max_abs = 0.0f; double t3_cos = 0.0;
+        diff_logits(engine.logits(), cold_logits_exact, t3_max_abs, t3_cos);
+        bool t3_pass = (tel.status == "HIT_DISK") && (tel.cached_disk_tokens == full_blk_toks) &&
+                       (tel.computed_prompt_tokens == 0) && (t3_max_abs == 0.0f) && (t3_cos == 1.0);
+        std::printf("[Test 3] Exact 0-Suffix Block Boundary (%d tok): status=%s cached=%d+%d "
+                    "restore=%.2fms total=%.2fms max_abs=%.6f cos=%.8f [%s]\n",
+                    full_blk_toks, tel.status.c_str(), tel.cached_disk_tokens, tel.computed_prompt_tokens,
+                    tel.restore_ms, t_tmp.total_ms(), t3_max_abs, t3_cos, t3_pass ? "PASS" : "FAIL");
+
+        // --- Test 4: Tier-0 Hot In-RAM Sticky Continuation + Snapshot Rewind ---
+        std::vector<int32_t> p_t0(tokens.begin(), tokens.begin() + 128);
+        engine.reset_state(); t_tmp.reset();
+        if (!engine.prefill_cached(p_t0, t_tmp, opts_on, tel)) return 1;
+
+        t_tmp.reset();
+        if (!engine.prefill_cached(p_short, t_tmp, opts_on, tel)) return 1;
+        float t4a_max_abs = 0.0f; double t4a_cos = 0.0;
+        diff_logits(engine.logits(), cold_logits_short, t4a_max_abs, t4a_cos);
+        bool t4a_pass = (tel.status == "HIT_TIER0") && (tel.cached_tier0_tokens == 128) &&
+                        (tel.computed_prompt_tokens == 32) && (tel.restore_ms == 0.0) &&
+                        (t4a_max_abs == 0.0f) && (t4a_cos == 1.0);
+        std::printf("[Test 4a] Tier-0 Direct Continuation (128->160): status=%s cached=%d+%d "
+                    "restore=%.2fms max_abs=%.6f cos=%.8f [%s]\n",
+                    tel.status.c_str(), tel.cached_tier0_tokens, tel.computed_prompt_tokens,
+                    tel.restore_ms, t4a_max_abs, t4a_cos, t4a_pass ? "PASS" : "FAIL");
+
+        // Decode 4 tokens to advance m_pos (160 -> 164) past m_turn_snap_pos (160), then rewind on p_short
+        StageTimers t_dec_rw;
+        for (int s = 0; s < 4; ++s) {
+            const auto &lg = engine.logits();
+            int32_t tok = static_cast<int32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            if (!engine.forward_chunk(&tok, 1, true, t_dec_rw)) return 1;
+        }
+        t_tmp.reset();
+        if (!engine.prefill_cached(p_short, t_tmp, opts_on, tel)) return 1;
+        float t4b_max_abs = 0.0f; double t4b_cos = 0.0;
+        diff_logits(engine.logits(), cold_logits_short, t4b_max_abs, t4b_cos);
+        bool t4b_pass = (tel.status == "HIT_TIER0") && (tel.cached_tier0_tokens == 160) &&
+                        (tel.computed_prompt_tokens == 0) && (tel.restore_ms == 0.0) &&
+                        (t4b_max_abs == 0.0f) && (t4b_cos == 1.0);
+        std::printf("[Test 4b] Tier-0 Snapshot Rewind (164->160): status=%s cached=%d+%d "
+                    "restore=%.2fms max_abs=%.6f cos=%.8f [%s]\n",
+                    tel.status.c_str(), tel.cached_tier0_tokens, tel.computed_prompt_tokens,
+                    tel.restore_ms, t4b_max_abs, t4b_cos, t4b_pass ? "PASS" : "FAIL");
+
+        engine.clear_prefix_cache(true);
+        engine.shutdown_prefix_cache();
+        std::error_code rm_ec;
+        std::filesystem::remove_all(verify_tmp_dir, rm_ec);
+
+        bool all_ok = t1_pass && t2_pass && t3_pass && t4a_pass && t4b_pass;
+        std::printf("=================================================================\n");
+        std::printf(" Phase F.5 Gate Result: %s\n", all_ok ? "ALL 5 SUB-TESTS PASS" : "FAILED");
+        std::printf("=================================================================\n");
+        return all_ok ? 0 : 1;
+    }
+
+    // -------------------------------------------------------------------------
     // Single-Shot Prompt Mode (--prompt "...") or Interactive Chat REPL
     // -------------------------------------------------------------------------
     SamplerParams sp;
@@ -5142,7 +6089,6 @@ int main(int argc, char **argv) {
     std::vector<float> current_image_embeds;
 
     auto run_chat_turn = [&](const std::string &user_text) {
-        engine.reset_state();
         sampler.reset();
         std::string prompt_text = user_text;
         const float *vis_ptr = nullptr;
@@ -5159,10 +6105,13 @@ int main(int argc, char **argv) {
         std::vector<int32_t> prompt_ids = encode_lfm3_text(engine.tokenizer(), formatted);
 
         StageTimers prefill_t, decode_t;
+        Lfm3Engine::PrefixCacheOptions cache_opts;
+        cache_opts.enabled = engine.is_prefix_cache_enabled();
+        Lfm3Engine::PrefixCacheTelemetry cache_tel;
         g_interrupt_flag.store(false);
         g_in_generation.store(true);
 
-        if (!engine.prefill(prompt_ids, prefill_t, vis_ptr, num_vis_tok)) {
+        if (!engine.prefill_cached(prompt_ids, prefill_t, cache_opts, cache_tel, vis_ptr, num_vis_tok)) {
             std::printf("\n[ERROR: prefill failed]\n");
             g_in_generation.store(false);
             return;
@@ -5238,7 +6187,7 @@ int main(int argc, char **argv) {
                 in_think = false;
                 has_pre_sampled = false;
                 if (engine.pos() + static_cast<int>(force_close_ids.size()) >= max_ctx) break;
-                if (!engine.forward_chunk(force_close_ids.data(), static_cast<int>(force_close_ids.size()), true, decode_t)) break;
+                if (!engine.append_tokens(force_close_ids.data(), static_cast<int>(force_close_ids.size()), true, decode_t)) break;
                 for (int32_t cid : force_close_ids) {
                     sampler.accept(cid);
                     history.push_back(cid);
@@ -5330,19 +6279,29 @@ int main(int argc, char **argv) {
         double dec_s = decode_t.total_ms() / 1000.0;
         double tok_s = (dec_s > 0.0) ? ((decode_t.tokens_run + 1) / dec_s) : 0.0;
         double pref_s = prefill_t.total_ms() / 1000.0;
-        double pref_tok_s = (pref_s > 0.0) ? (prompt_ids.size() / pref_s) : 0.0;
+        double pref_tok_s = (pref_s > 0.0) ? (std::max(1, cache_tel.computed_prompt_tokens) / pref_s) : 0.0;
+        std::string cache_info;
+        if (cache_tel.cached_tokens() > 0) {
+            char cbuf[160];
+            std::snprintf(cbuf, sizeof(cbuf), " | Cache: %s %d/%zu tok (restore %.2f ms)",
+                          cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
+                          cache_tel.restore_ms);
+            cache_info = cbuf;
+        }
         if (engine.is_speculative_pld()) {
             double acc_rate = (pld_drafted > 0) ? (100.0 * pld_accepted / pld_drafted) : 0.0;
-            std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok) | PLD(T=8): %d/%d draft accepted (%.1f%%) in %d verify steps]%s\n\n",
+            std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok)%s | Decode: %d tok at %.2f tok/s (%.1f ms/tok) | PLD(T=8): %d/%d draft accepted (%.1f%%) in %d verify steps]%s\n\n",
                         COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(), pref_tok_s,
                         prefill_t.total_ms() / std::max<size_t>(1, prompt_ids.size()),
+                        cache_info.c_str(),
                         decode_t.tokens_run + 1, tok_s,
                         decode_t.total_ms() / std::max(1, decode_t.tokens_run),
                         pld_accepted, pld_drafted, acc_rate, pld_steps, COLOR_RESET);
         } else {
-            std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok) | Decode: %d tok at %.2f tok/s (%.1f ms/tok)]%s\n\n",
+            std::printf("\n\n%s[Prefill: %zu tok in %.1f ms (%.2f tok/s, %.1f ms/tok)%s | Decode: %d tok at %.2f tok/s (%.1f ms/tok)]%s\n\n",
                         COLOR_GRAY, prompt_ids.size(), prefill_t.total_ms(), pref_tok_s,
                         prefill_t.total_ms() / std::max<size_t>(1, prompt_ids.size()),
+                        cache_info.c_str(),
                         decode_t.tokens_run + 1, tok_s,
                         decode_t.total_ms() / std::max(1, decode_t.tokens_run), COLOR_RESET);
         }
@@ -5359,13 +6318,34 @@ int main(int argc, char **argv) {
     }
 
     std::cout << COLOR_BOLD << COLOR_CYAN
-              << "LFM2.5-8B-A1B Sparse MoE Interactive Dual-Die Chat REPL (type '/exit' to quit, '/nothink' or '/think <none|low|medium|high|xhigh|N>' to set thinking budget, '/image <path>' to load image)"
+              << "LFM2.5-8B-A1B Sparse MoE Interactive Dual-Die Chat REPL (type '/exit' to quit, '/nothink' or '/think <none|low|medium|high|xhigh|N>' to set thinking budget, '/cache' or '/cache-clear' to manage KV cache, '/image <path>' to load image)"
               << COLOR_RESET << std::endl;
     std::string line;
     while (true) {
         std::cout << COLOR_BOLD << COLOR_GREEN << "User> " << COLOR_RESET << std::flush;
         if (!std::getline(std::cin, line)) break;
         if (line == "/exit" || line == "/quit") break;
+        if (line == "/cache") {
+            auto st = engine.prefix_cache_stats();
+            std::cout << COLOR_YELLOW
+                      << "[Prefix Cache: " << (engine.is_prefix_cache_enabled() ? "enabled" : "disabled")
+                      << " | dir=" << engine.cache_dir()
+                      << " | blocks=" << st.resident_blocks << " (pinned=" << st.pinned_blocks << ")"
+                      << " | disk=" << std::fixed << std::setprecision(2)
+                      << (st.disk_bytes_used / (1024.0 * 1024.0)) << " MiB"
+                      << " | hits=" << st.total_block_hits << " (" << st.total_tokens_saved << " disk tok)"
+                      << " | tier0_hits=" << engine.tier0_hits() << " (" << engine.tier0_tokens_saved() << " RAM tok)]"
+                      << COLOR_RESET << std::endl;
+            continue;
+        }
+        if (line == "/cache-clear" || line == "/cache-clear --all") {
+            bool all = (line == "/cache-clear --all");
+            size_t removed = engine.clear_prefix_cache(all);
+            std::cout << COLOR_YELLOW << "[Cleared " << removed << " prefix cache block(s)"
+                      << (all ? " (including pinned)" : " (unpinned)") << "]"
+                      << COLOR_RESET << std::endl;
+            continue;
+        }
         if (line == "/nothink") {
             enable_thinking = !enable_thinking;
             if (!enable_thinking) think_budget = 0;
