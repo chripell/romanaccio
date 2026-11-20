@@ -1465,3 +1465,15 @@ public:
      - `GET /v1/cache/stats`: Queries connected daemon(s) (`{"cmd": "cache_stats"}`) and returns resident blocks, pinned blocks, NVMe bytes used vs. quota, block hit rate, and total saved prompt tokens.
      - `POST /v1/cache/clear`: Clears unpinned (or all, if `{"include_pinned": true}`) cache entries.
 
+---
+
+### Milestone 18: Full-SoC Hardware Timing-Margin Audit & End-to-End System Stress-Test Campaign — [PLANNED — NEXT SESSION]
+
+- **Context & Errata Reference**:
+  - Full EIC7700X / EIC7702 hardware, driver, and compiler errata catalog: [`findings/HARDWARE_BUGS.md`](file:///home/chri/aixigua/romanaccio/findings/HARDWARE_BUGS.md) (`HW-01`..`HW-07`) and [`FINDINGS.md`](file:///home/chri/aixigua/romanaccio/FINDINGS.md) §52.8.
+  - Ruled-out hypotheses (do not duplicate) and full 4-track stress-test plan: [`src/LFM2.5-8B-A1B/PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/PLAN.md) (**Phase F.3** & **Phase G**).
+- **Primary `LFM3` Investigation Goals for Next Session**:
+  1. **Die 0 `1.50 GHz` PEC Column #2 Audit on `LFM3` (`HW-01`)**: Test `lfm3_mlp_t64_classb.model` (`PP=2`), `lfm3_mlp_tp2_t64_classb.model` (`TP=2`), and `*_t8_classb.model` on Die 0 vs. Die 1 (`N >= 2,000` batches across all 24 layers, `1.50 GHz` vs. `1.04 GHz` + thermal soak) to verify whether `LFM3`'s dense `W16A16` `w2` slices also exhibit intermittent `t % 8 in {4, 5}` faults under sustained load.
+  2. **Long-Context (`4K`–`32K`) Determinism & Long-Decode Soak**: Run `10+` repeated cold & warm passes on `bench_c_code_4k.c` and `bench_c_code_32k.c` (`max_abs=0.000000`, `cos=1.00000000`) plus sustained `-n 2048..4096` thinking-budget & `--speculative-pld` stress runs.
+  3. **`RadixCache` Endurance & Dual-Daemon OpenAI Soak**: Quota eviction (`num_children == 0`, pinned preservation), `SIGKILL` mid-write WAL recovery, corrupted `.kvb` CRC64 fallback, and 500+ mixed concurrent requests across live `:8088` (`lfm3_v2`) + `:8089` (`lfm2_moe`) behind `lfm3_openai_server.py` while asserting zero `dmesg`/`journald` errors and zero memory/FD leaks.
+

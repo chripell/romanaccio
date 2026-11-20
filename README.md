@@ -11,8 +11,9 @@ It provides standalone runtimes, bug fixes for vendor software, comprehensive re
 ```
 romanaccio/
 ├── README.md                         # Main repository architecture and component index
-├── FINDINGS.md                       # Master summary of reverse engineering discoveries (§1–§49)
+├── FINDINGS.md                       # Master summary of reverse engineering discoveries (§1–§52)
 ├── findings/                         # Detailed standalone technical reports
+│   ├── HARDWARE_BUGS.md              # Silicon, kernel, driver & EsAAC compiler errata (HW-01..HW-07)
 │   ├── NPU_OPERATIONS.md             # Hardware engine & 372 DSP kernels catalog, GPU profile
 │   ├── MODEL_FORMAT.md               # Reverse-engineered .model (NVDA FlatBuffers) specification
 │   ├── SYSTEM_CAPABILITIES_AND_MODELS.md # Compute envelope, latency benchmarks, model feasibility

@@ -298,3 +298,46 @@ Because `LFM2.5-8B-A1B` prefills at `34.15–35.9 tok/s` (`~101 s` cold at `3,81
    - [x] **Gate 2 (`--verify-golden golden_ref.bin` on `roma`)**: **PASS** (`Min Layer Cos = 0.97924192`, `128K Logits Cos = 0.99837211`, `DETERMINISM`/`SENSITIVITY`/`RESTORE` PASS, `4/4` greedy exact, **`11.38 tok/s`** decode).
    - [x] **Gate 3 (Live OpenAI Gateway -> `roma:8089`)**: **PASS** (`GET /v1/models`, Turn 1 `MISS`, Turn 2 SSE `PARTIAL` `tier1_nvme` `restore_ms=8.13` `cached_tokens=64` trailing `choices: []` chunk, Turn 3 repeat `HIT` `tier0_ram` `cached_tokens=125`, `/v1/cache/stats`, `/v1/cache/clear`, clean `dmesg`).
 
+#### F.3 Ruled-Out Hypotheses & Completed Diagnostics (Do Not Duplicate)
+Full silicon errata catalog: [`../../findings/HARDWARE_BUGS.md`](file:///home/chri/aixigua/romanaccio/findings/HARDWARE_BUGS.md) (`HW-01`..`HW-07`) and [`../../FINDINGS.md`](file:///home/chri/aixigua/romanaccio/FINDINGS.md) §52.8. Do **not** re-run any of the already-settled experiments below:
+
+| Hypothesis Tested | Experiment Executed on `roma` | Observed Outcome | Conclusion (Closed) |
+| :--- | :--- | :--- | :--- |
+| Short-context `prefix_cache.hpp` / `INT8` Global KV bugs (`m_pos >= 256`) | `--max-ctx 384 --verify-prefix-cache` & `LFM2_DIAG_4K=1 --max-ctx 512` (`496` tok) | `5/5` & `128+368` `0` mismatches (`max_abs=0.000000, cos=1.00000000`) | **Ruled out** (`prefix_cache.hpp` logic & Global `INT8` scatter/gather are bit-exact) |
+| Exact divergence point at `3,818` tokens | `LFM2_DIAG_4K=1` per-stage FNV hash across `chunk/layer/stage/die` | Cold Pass 2 vs Pass 1 diverged at `chunk=2 pos=128 L12 EXP_D0 die=0` (`retry == cur != ref`) | **Localized** to Die 0 MoE expert execution (not `prefix_cache.hpp`, not attention) |
+| CPU cache coherency / stale cachelines (`Cached` vs `NoCache`) | `CondA` (`Cached`, `5000×2`) & `CondB` (`CacheMode::NoCache`, `5000×2`); `libes_memory.so` disassembly | `CondB` (`NoCache`) **still failed on Die 0** (`die0=1, cur=6839 vs 8224, t=[4..5]`); `>1 MiB` `ES_SYS_MemFlushCache` only flushes target `nid` | **CPU coherency ruled out** for the `t=[4..5]` glitch; `init()` thread NUMA pinning fixed the `>1 MiB` flush hazard separately |
+| OpenMP thread count or weight-blob DRAM offset fault | Serial Die 0 (`T1a=21`, `T1b=42`), Dual-Die (`T1c=55`), fresh Node-0 `DmaBuffer` copy `w_copy_d0` (`T2=21`), vs Die-1 `w_copy_d1` (`T3=0`) | Fresh Node-0 DMA buffer still failed `21/2000`; bit-identical `e=12` on **Die 1 scored `0/2000`** | **SW/OpenMP/DDR corruption ruled out** — hardware defect is specific to Die 0 `51c00000.eswin-npu` |
+| PEC column #2 (`t % 8 in {4, 5}`) & `1.50 GHz` timing margin | `T4` (`b_cnt=4`, `t=4..7` zeroed: `0/2000`), `T5` (`mlp_t1`: `0/2000`), and Die 0 devfreq cap to `1.04 GHz` (`T1a–T5`: all `0/2000`) | **Zero errors** across all 7 tests (`N=2,000` each) at `1.04 GHz`, and **zero** at `1.50 GHz` when avoiding `t in {4, 5}` (`kT8SafeSlots`) | **Proven root cause (`HW-01`)** & resolved at full `1.50 GHz` via 6-slot safe packing |
+
+---
+
+### Phase G: Comprehensive Silicon Timing-Margin & End-to-End System Stress-Test Strategy — [PLANNED — NEXT SESSION]
+
+Objective: Validate long-duration reliability across all deployed components (`lfm2_moe`, `lfm3_v2`, `RadixCache`, and `lfm3_openai_server.py`) at full `1.50 GHz` and check whether any other archetypes (especially `LFM3` `T=64` / `T=8`) share `HW-01`'s PEC column #2 sensitivity.
+
+1. **Track 1 — Full-SoC Silicon Timing Margin & PEC Column Sweep (Die 0 vs. Die 1, `1.50 GHz` vs. `1.04 GHz`)**:
+   - **Check `LFM2.5-8B-A1B` remaining margins**:
+     - Run an extended **`N = 10,000`** stress sweep on `kT8SafeSlots[6] = {0, 1, 2, 3, 6, 7}` (`b_cnt=6`, vs `b_cnt=4`) across worst-case switching experts in `L02..L23` (`712` experts total) under sustained NPU thermal load (`~55–65°C` soak).
+     - Probe all 3 `W=64` operator archetypes (`conv_in_t64`, `proj2048_t64`, `attn_qkv_t64`) across all 8 columns `t % 8 in {0..7}` on Die 0 vs Die 1 (`INT8 -> INT16`).
+   - **Critical Cross-Check for `LFM3-1.7B`**:
+     - Stress-test `lfm3_mlp_t64_classb.model` (`PP=2`), `lfm3_mlp_tp2_t64_classb.model` (`TP=2`), and `*_t8_classb.model` on **Die 0 vs. Die 1** (`N >= 2,000` batches across all 24 layers, logging per-slot diffs `t % 8 in {0..7}`) at `1.50 GHz` vs `1.04 GHz`.
+     - If Die 0 triggers `HW-01` (`t % 8 in {4, 5}`) on `LFM3` `T=64` or `T=8` under heavy soak, evaluate three options: (a) apply `kT8SafeSlots` to `lfm3_v2` `T=8` + column-masked `T=64` (`48` active tokens/chunk vs `64`), (b) offload `W16A16` fault-prone layers to Die 1 (`71c00000.eswin-npu`), or (c) inspect EIC7700X device-tree / PMIC regulator voltage tables at the `1.50 GHz` OPP.
+
+2. **Track 2 — Long-Context Determinism (`4K`–`32K`), Thinking Budgets & `RadixCache` Endurance**:
+   - **Cold & Warm Bit-Exactness Determinism**: Repeat back-to-back identical `4K` (`bench_c_code_4k.c`) and `16K`/`32K` (`bench_c_code_32k.c`) prompts (`--temp 0`) on both `lfm2_moe` and `lfm3_v2` (`10+` passes cold, `10+` passes warm `.kvb` restore) verifying `max_abs=0.000000`, `cos=1.00000000`, and zero silent token divergence over multi-hour sustained decoding (`-n 2048..4096` with `--think-level none|low|medium|high|xhigh|unlimited` and `--speculative-pld`).
+   - **`RadixCache` Endurance & Fault Injection**:
+     - Small-quota thrash (`--cache-max-gb 1` or MB-level test quota) with 100+ branching sessions + `cache_control: {"type": "pinned"}` blocks -> assert pinned ancestors survive 100% while leaves evict cleanly.
+     - Send `SIGKILL` mid-write to test crash recovery (`index.snap` + `index.wal` replay, orphan `.kvb.tmp.*` reaping) and flip bytes inside an on-disk `.kvb` section to verify CRC64 rejection + seamless fallback recompute without crash.
+
+3. **Track 3 — Unified OpenAI Gateway Concurrent & Multi-Model Soak (`lfm3_openai_server.py`)**:
+   - Run **both** C++ daemons concurrently on `roma` (`lfm3_v2 --int8 --tp2 --speculative-pld --daemon 8088` + `lfm2_moe --speculative-pld --daemon 8089`) with unified `lfm3_openai_server.py` fronting them for 500+ mixed requests:
+     - Alternate `lfm3-1.7b`, `lfm2.5-8b-a1b`, `lfm3-vl-2b` (multimodal `image_url`), and `d1-2b` (`/v1/decisions`).
+     - Test client-side SSE socket aborts mid-generation (`BrokenPipe` / asyncio cancellation), isolated `prompt_cache_key` namespaces, non-stream + `stream_options.include_usage` telemetry consistency, and periodic `/v1/cache/{stats,clear}`.
+
+4. **Track 4 — Automated Silicon Health Watchdog (Every Stage)**:
+   - Monitor continuously throughout Tracks 1–3 and fail immediately if any threshold trips:
+     - `dmesg` / `journalctl`: **0** kernel Oops (`destroy_frame`), **0** `eswin-npu`/`dmabuf` errors, **0** `[ERR][NPU][setDevice:202]` lines.
+     - Memory & FD stability: `MemAvailable > 8.0 GiB` (no page-cache creep from weight loads), `/proc/<pid>/fd` count bounded, zero leaked `.kvb.tmp.*` files.
+     - Clock & thermal telemetry: NPU devfreq stays at `1500000000` Hz (unless intentionally testing `1.04 GHz` A/B), board temperatures remain within safe passive limits.
+
+
