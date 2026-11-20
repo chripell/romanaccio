@@ -248,10 +248,11 @@ With only **7 resident loadables per die**, the runtime consumes only **11.3% of
 
 ---
 
-### Phase E: `dyntok`-Consistent Output Scale Calibration Fix (Cross-Ref `src/LFM3/PLAN.md` §7 Milestone 16) — [PLANNED — WHEN `roma` ONLINE]
-- [ ] Update [`build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) (or compile `INT16`-output `conv_in`/`attn_qkv`/`proj2048` archetypes) so `out_max` is calibrated on `y_npu_equiv = (x_t @ W.T) / r_t` (`1.15×` safety margin), eliminating INT8 `±127` clipping on low-kurtosis tokens (`'\n\n'`, `' that'`).
-- [ ] Apply safety floor `scale_ratios[t] >= 1.0f / 1.15f` gated strictly on `sc.out_dtype == BoundaryDtype::Int8` in [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp), leaving `INT16` `expert_mlp` unclamped.
-- [ ] **Silicon Gate**: `--verify-golden golden_ref.bin` min-layer cosine `>= 0.9690`, 128K logits cosine `>= 0.9965`, `4/4` greedy exact match, and per-layer cosine `>= 0.9750` on unseen multi-line Python code prompts.
+### Phase E: `INT16` Operators, `dyntok` `INT16` LM Head & DropBOS SmoothQuant Fix (Cross-Ref `src/LFM3/PLAN.md` §7 Milestone 16) — [COMPLETED & VERIFIED ON SILICON — 2026-11-20]
+- [x] Compiled `9` `INT8 -> INT16` operator templates (`conv_in` `sh=14`, `proj2048` `sh=13`, `attn_qkv` `sh=14` across `T={1,8,64}`) and `1` `INT8 -> INT16` 16K LM Head template (`lm_head_16k_int16_npu_b1.model`, `sh=16`) via `EsAAC`, all verified on `EsSimulator` (`cosDistance = 1.000000`, `relativeDiff = 0.000000`), preserving `5.166 GiB/die` and `12 / 62` resident loadables/die (`16 / 62` with `--speculative-pld`).
+- [x] Updated [`build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) with DropBOS RMS SmoothQuant (excluding `BOS` `124894` sink outliers > `3.0×` median from `s_x` and `in_t` while bounding `y_norm_max` across all calibration tokens), upgrading all 48 operator regions + 8 LM Head slices to `INT16` `dyntok` output (`0` `qm_raw > 32767` overflows; `14,470 / 128,000` Nov-8 `INT8` LM Head clipping channels eliminated; Nov-8 `sh2=27` `expert_mlp` retained unchanged).
+- [x] Updated [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) with `unpack_npu_output_int16_dyntok()`, `min_amax = max(safe_thresh * 0.05f, 1e-8f)`, `m_emb_norm_smooth` `dyntok` LM Head packing/unpacking (`Ops out=int16, ExpertMLP out=int16, LMHead=int16`), and `s_out1=16384`, `s_out8=98304`, `s_lmout=32768`.
+- [x] **Silicon Gate PASSED (`roma`, 2026-11-20)**: `--verify-golden golden_ref.bin` achieved **Min Layer Cosine `0.97924192`** (`L00=0.999548`, `L23=0.986258`), **`embedding_norm` `0.97533698`**, **128K Logits Cosine `0.99837211`**, **`4/4` greedy exact match**, and **`12.67 tok/s`** decode (`78.95 ms/tok`); unseen Python coding prompts (palindrome `--no-think` `11.02 tok/s`, palindrome `--speculative-pld --think-level low` `10.64 tok/s`, linked-list reverse `--no-think` `11.94 tok/s`) generated clean executable Python verified on host `python3` with `ZERO setDevice errors`.
 
 ---
 

@@ -2974,7 +2974,32 @@ Extended the package builder with CLI configuration options:
      - **Layer 23 Cosine vs. PyTorch FP32**: **`0.96810421` $\to$ `0.97990484`**.
      - **128K Final Logits Cosine vs. PyTorch FP32**: **`0.99521100` $\to$ `0.99686629`** (`35%` error reduction).
      - **Sustained INT8 Decode Speed (`--verify-golden`)**: **`11.30 tok/s` $\to$ `13.07 tokens/sec`** (`76.53 ms/tok`, `4/4` greedy exact match).
-   - **Follow-Up (Milestone 16 in [`src/LFM3/PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM3/PLAN.md#L1050))**: Also isolated why tokens with flatter channel distributions (such as `'\n\n'` id `8`, where `r_t = amax_t / in_thresh ≈ 0.26`) can still clip the **INT8 (`±127`)** outputs of `conv_in`, `attn_qkv`, and `proj2048` under `dyntok`: [`build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py) calibrated `out_max` on unscaled `y = x @ W.T` instead of `dyntok`-scaled `y_npu = (x @ W.T) / r_t`. Calibrating `out_max` on `(x @ W.T) / r_t` (or switching `conv_in`/`attn_qkv`/`proj2048` outputs to `INT16` like `expert_mlp`) is tracked as **Milestone 16** in [`src/LFM3/PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM3/PLAN.md#L1050).
+   - **Follow-Up (Milestone 16 COMPLETED in [`src/LFM3/PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM3/PLAN.md#L1050))**: See **§52.6** below for the structural `INT16` operator + `dyntok` `INT16` LM Head fix and verified silicon results.
+
+### 52.6 Milestone 16: Structural `INT16` Operators, `dyntok` `INT16` LM Head & DropBOS SmoothQuant Fix
+
+During Milestone 16 evaluation on unseen multi-line Python code prompts (`"Can you write a Python function that returns all the palindrome substrings of a given string."`), we isolated and eliminated two remaining precision bottlenecks:
+
+1. **Root Cause 1 — Static `INT8` LM Head Vocab Saturation (`14,470 / 128,000` channels)**:
+   - Calibrated on Nov-8 prose tokens (`output_dtype="int8"`, `truncate = 22`, static `in_t * 1.05`), `14,470` of `128,000` vocabulary rows exceeded their `INT8` output cap on modern ChatML coding activations by up to `2.99×`. Crucially, `'python'` (`tok 63513`) was hard-clamped at `17.94` vs. true logit `36.32` (`2.02×`), ```` ``` ```` (`tok 25797`) at `22.71` vs. `29.92` (`1.32×`), and `'def'` (`tok 3162`) at `26.38` vs. `31.20` (`1.18×`).
+   - Isolated on host FP32: swapping *only* the `lm_head` forward pass to Nov-8 `INT8` on an otherwise 100% FP32 24-layer backbone reproduced the exact prose/empty-fence degradation (`"You just asked..."`), confirming the `INT8` LM Head was the primary culprit.
+2. **Root Cause 2 — `BOS` (`124894`) Sink-Token Inflation in RMS SmoothQuant**:
+   - Computing per-channel RMS `s_x` and `in_t` over all `1,021` calibration tokens including `BOS` (`124894`) sink outliers inflated operator `input_threshold` by `2.5×–5.7×` (e.g., `l22_conv_out`: `1.799 -> 10.326`), wasting dynamic `INT8` input resolution on regular tokens and dropping initial `INT16`-operator `--verify-golden` min-layer cosine from `0.9694` to `0.9547` (`Step 3` mismatch `' The'` vs. `' city'`).
+3. **Structural Fix & Template Compilation ([`build_lfm2_moe_pkg.py`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/build_lfm2_moe_pkg.py), [`lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp))**:
+   - **10 `INT8 -> INT16` Templates Compiled via `EsAAC` & `EsSimulator`-Verified (`cosDistance = 1.000000`, `relativeDiff = 0.000000`)**: Added `conv_in` (`sh=14`), `proj2048` (`sh=13`), and `attn_qkv` (`sh=14`) at `T={1,8,64}` plus `lm_head_16k_int16_npu_b1.model` (`sh=16`, `32 KiB` `dataType=3` planar `INT16` output) — keeping `weights_die{0,1}.bin` at **`5.166 GiB/die`** (`0 B` weight growth) and resident loadables at **`12 / 62` per die** (`16 / 62` with `--speculative-pld`). Setting `model_info.output_data_type = ["int16"]` while keeping `node_info["/Conv"]["data_type"] = "int8"` compiles cleanly; setting `/Conv.data_type = "int16"` segfaults `EsAAC`.
+   - **DropBOS RMS SmoothQuant + Bounded `y_norm_max`**: `build_single_conv_region_dyntok()` and `build_lm_head_slices()` filter sink outliers (`rm <= median(rm) * 3.0`) when computing `s_x` and `in_t`, while still bounding `y_norm_max` across all tokens (including `BOS`) with `2.0×` safety margin, an 80th/90th-percentile row L2-norm `u_c` floor, and a `120.0` uniform logit cap floor on the LM Head (`0` `qm_raw > 32767` overflows across all 48 operators + 8 LM Head slices). Nov-8 `expert_mlp` (`sh2 = 27`, `9.9 GiB`) was verified against the 1,021-token calibration set (`0 / 2048` output channel clips, `c0_max <= 9.86 < 12.0`) and retained untouched.
+   - **C++ `INT16` `dyntok` Runtime (`lfm2_moe.cpp`)**: Added `unpack_npu_output_int16_dyntok()`, lowered dynamic input clamp floor from `0.10f` to `0.05f * safe_thresh`, added `m_emb_norm_smooth` + `dyntok` `INT16` path in `compute_logits_from_ptr()`, and updated `s_out1=16384`, `s_out8=98304`, and `s_lmout=32768`.
+4. **Silicon Verification Results on `roma` (`Ops out=int16, ExpertMLP out=int16, LMHead=int16`)**:
+
+   | Metric | Pre-M16 Baseline (`sh2=25`) | `sh2=27` + `INT8` Ops/Head | **Milestone 16 (`INT16` Ops + `dyntok` `INT16` Head)** |
+   |---|---:|---:|---:|
+   | **Min Layer Cosine (24L)** | `0.95180935` | `0.96935594` | **`0.97924192`** (`L00=0.999548`, `L11=0.986639`, `L12=0.985364`, `L23=0.986258`) |
+   | **Final `embedding_norm` Cosine** | — | — | **`0.97533698`** |
+   | **128K Final Logits Cosine** | `0.99521100` | `0.99686629` | **`0.99837211`** |
+   | **Greedy 4-Token Match (`--verify-golden`)** | `4/4 exact` | `4/4 exact` | **`PASS (4/4 exact)`** (`' Paris'`, `'.'`, `' city'`; `DETERMINISM`+`SENSITIVITY`+`RESTORE` PASS) |
+   | **Golden Decode Speed (`15` tok)** | `11.30 tok/s` | `13.07 tok/s` | **`12.67 tok/s` (`78.95 ms/tok`)**; LM Head `4.78 ms` (`63.02 GB/s` drv) |
+   | **Unseen Python Code Prompts (`roma`)** | Degraded prose / empty ```` ``` ```` | Broken fences / `enlist(s)` | **Valid executable Python** (`11.02 tok/s` palindrome `--no-think`; `10.64 tok/s` `--speculative-pld --think-level low` w/ `27.6%` PLD accept & exact host Python execution; `11.94 tok/s` linked list reverse) |
+   | **Kernel / Journal Health** | Clean | Clean | Clean PMU DSP power logs; **`ZERO setDevice errors`** |
 
 
 

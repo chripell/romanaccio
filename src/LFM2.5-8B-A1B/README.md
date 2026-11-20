@@ -2,7 +2,7 @@
 
 Native C++17 engine ([`lfm2_moe`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp)) for `LiquidAI/LFM2.5-8B-A1B` (**8.47B** total parameters, **~1.42B** active parameters/token): 18 gated short convolutions (`K=3`), 6 global GQA layers (`32` Q / `8` KV heads, `d_head=64`, `θ=5,000,000`), 2 dense stem SwiGLU layers (L0–L1, `TP=2` via 4 quarter-experts), and 22 sparse MoE layers (L2–L23, **32 experts, Top-4 routing**, `EP=2` with 16 even experts on Die 0 and 16 odd experts on Die 1).
 
-Design details live in [`PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/PLAN.md) and silicon measurements live in [`../../FINDINGS.md`](file:///home/chri/aixigua/romanaccio/FINDINGS.md#L2878-L2954) (§52).
+Design details live in [`PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/PLAN.md) and silicon measurements live in [`../../FINDINGS.md`](file:///home/chri/aixigua/romanaccio/FINDINGS.md#L2878-L3005) (§52).
 
 ---
 
@@ -12,11 +12,13 @@ Design details live in [`PLAN.md`](file:///home/chri/aixigua/romanaccio/src/LFM2
 |---|---|---|
 | **MMZ Weight Allocation** | **`5.166 GiB × 2` (`3` chunks/die `< 2.0 GiB`)** | Works around `eswin_rsvmem_heap_mmap` 4.0 GiB kernel truncation bug; **`8.78 GiB` Linux OS RAM free** |
 | **Resident Loadables / Die** | **`12 / 62`** (`16 / 62` with `--speculative-pld`) | `[PASS]` (`< 55` safety gate; kernel ceiling `62`) |
-| **Min Layer Cosine (All 24 Layers)** | **`0.95180935`** | `[PASS]` (`>= 0.9500`) |
-| **128K Final Logits Cosine vs. FP32** | **`0.99521100`** | `[PASS]` (`>= 0.9950`) |
+| **Boundary Precision (`Ops / Exp / Head`)** | **`INT16 / INT16 / INT16` outputs (`INT8` weights)** | Eliminates all `dyntok` INT8 output & 128K LM Head vocab clipping (Milestone 16) |
+| **Min Layer Cosine (All 24 Layers)** | **`0.97924192`** (`L00=0.999548`, `L23=0.986258`) | `[PASS]` (`>= 0.9690`) |
+| **128K Final Logits Cosine vs. FP32** | **`0.99837211`** (`embedding_norm = 0.975337`) | `[PASS]` (`>= 0.9965`) |
 | **Greedy 4-Token Match** | **`4 / 4 exact`** (`' Paris'`, `'.'`, `' city'`) | `[PASS]` (`DETERMINISM` + `SENSITIVITY` + `RESTORE`) |
-| **Short-Context Decode (`15`–`64` tok)** | **`11.25 – 11.30 tok/s` (`88.5 – 90.3 ms/tok`)** | `exp_mlp`: `35.92 GB/s` driver; `LM Head`: `55.44 GB/s` driver |
-| **332-Token C-Refactoring (`160` tok)** | **Prefill: `33.46 – 34.15 tok/s` (`29.3 ms/tok`)**, **Decode (`T=1`): `10.39 tok/s` (`96.9 ms/tok`)** | `--no-think` masks `<think>` (`124901`) for instant code generation |
+| **Golden Decode (`15` tok, `--verify-golden`)** | **`12.67 tok/s` (`78.95 ms/tok`)** | `exp_mlp`: `41.45 GB/s` driver; `LM Head`: `63.02 GB/s` driver (`4.78 ms`) |
+| **Unseen Python Code Prompts (`roma`)** | **`11.02–11.94 tok/s`** (`10.64 tok/s` `--speculative-pld`) | `--no-think` & `--think-level low` generate verified executable Python (`ZERO setDevice errors`) |
+| **332-Token C-Refactoring (`160` tok)** | **Prefill: `33.46 – 34.15 tok/s` (`29.3 ms/tok`)**, **Decode (`T=1`): `10.39 tok/s` (`96.9 ms/tok`)** | Pre-M16 332-token benchmark; `--no-think` masks `<think>` (`124901`) for instant code generation |
 
 ---
 

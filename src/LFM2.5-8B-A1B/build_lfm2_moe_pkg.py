@@ -28,6 +28,7 @@ import time
 import json
 import struct
 import shutil
+import argparse
 import subprocess
 from pathlib import Path
 import numpy as np
@@ -46,7 +47,7 @@ LFM3_TEMPL_DIR  = Path("/home/chri/aixigua/deep/artifacts/lfm3_probe_templates")
 LFM2_TEMPL_DIR  = Path("/home/chri/aixigua/deep/artifacts/lfm2_moe_templates")
 LFM3_PKG_DIR    = Path("/home/chri/aixigua/deep/models/LFM3-1.7B/eswin_pkg_int8")
 GOLDEN_DIR      = Path("/home/chri/aixigua/deep/artifacts/lfm2_moe_golden")
-CALIB_PT_PATH   = Path("/tmp/lfm2_calib_fp32.pt")
+CALIB_PT_PATH   = GOLDEN_DIR / "lfm2_calib_fp32.pt"
 COMPILER_PY     = Path(__file__).resolve().parent.parent / "eswin_compiler" / "compiler.py"
 VENV_PY         = "/home/chri/aixigua/venv/bin/python3"
 
@@ -54,12 +55,59 @@ SDP_SIG = bytes.fromhex("000000000000010001010000")
 ATTN_LAYERS = {2, 6, 10, 14, 18, 21}
 
 TRUNCS = {
-    "conv_in":    [20] * 12,
-    "proj2048":   [20] * 4,
-    "attn_qkv":   [21] * 6,
+    "conv_in":    [14] * 12,
+    "proj2048":   [13] * 4,
+    "attn_qkv":   [14] * 6,
     "expert_mlp": [16] * 7 + [15] * 7 + [27] * 8,
-    "lm_head":    [22] * 63,
+    "lm_head":    [16] * 63,
 }
+
+LM_TMPL_PATH = LFM2_TEMPL_DIR / "ops_int16" / "lm_head_16k_int16_npu_b1.model"
+
+OP_TMPL_MAP = {
+    "conv_in_t1":   LFM2_TEMPL_DIR / "ops_int16" / "conv_in_t1_int16_npu_b1.model",
+    "conv_in_t8":   LFM2_TEMPL_DIR / "ops_int16" / "conv_in_t8_int16_npu_b1.model",
+    "conv_in_t64":  LFM2_TEMPL_DIR / "ops_int16" / "conv_in_t64_int16_npu_b1.model",
+    "proj2048_t1":  LFM2_TEMPL_DIR / "ops_int16" / "proj2048_t1_int16_npu_b1.model",
+    "proj2048_t8":  LFM2_TEMPL_DIR / "ops_int16" / "proj2048_t8_int16_npu_b1.model",
+    "proj2048_t64": LFM2_TEMPL_DIR / "ops_int16" / "proj2048_t64_int16_npu_b1.model",
+    "attn_qkv_t1":  LFM2_TEMPL_DIR / "ops_int16" / "attn_qkv_t1_int16_npu_b1.model",
+    "attn_qkv_t8":  LFM2_TEMPL_DIR / "ops_int16" / "attn_qkv_t8_int16_npu_b1.model",
+    "attn_qkv_t64": LFM2_TEMPL_DIR / "ops_int16" / "attn_qkv_t64_int16_npu_b1.model",
+}
+
+EXP_TMPL_MAP = {
+    "expert_mlp_t1":  LFM2_TEMPL_DIR / "expert_mlp_t1_npu_b1.model",
+    "expert_mlp_t8":  LFM2_TEMPL_DIR / "expert_mlp_t8_npu_b1.model",
+    "expert_mlp_t64": LFM2_TEMPL_DIR / "expert_mlp_t64_npu_b1.model",
+}
+
+CALIB_TEXTS = [
+    # Diverse prose
+    "The capital of France is Paris, a major European city and a global center for art, fashion, gastronomy and culture.",
+    "Liquid Foundation Models combine gated short convolutions with grouped-query attention and sparse Mixture of Experts routing.",
+    "The RISC-V architecture provides an open, extensible instruction set for modern embedded and dual-die neural processing accelerators.",
+    "In quantum mechanics, the wave function describes the quantum state of an isolated system of particles and evolves according to the Schrodinger equation.",
+    "Operating system kernels manage virtual memory pages using hardware page tables, TLBs, and NUMA-aware allocators across DDR5 channels.",
+    "Symmetric integer quantization maps floating-point weights and activations into compact 8-bit and 16-bit integer representations.",
+    "Photosynthesis converts light energy into chemical energy stored in carbohydrate molecules within plant chloroplasts.",
+    "Distributed consensus algorithms such as Raft replicate state machines safely across unreliable network links.",
+    # ChatML Python / coding turns
+    "<|im_start|>user\nCan you write a Python function that finds all prime numbers up to n?<|im_end|>\n<|im_start|>assistant\n<think>\nTo find primes up to n, use the Sieve of Eratosthenes.\n</think>\n\n```python\ndef sieve(n: int) -> list[int]:\n    if n < 2:\n        return []\n    is_prime = [True] * (n + 1)\n    is_prime[0] = is_prime[1] = False\n    for p in range(2, int(n ** 0.5) + 1):\n        if is_prime[p]:\n            for m in range(p * p, n + 1, p):\n                is_prime[m] = False\n    return [i for i, ok in enumerate(is_prime) if ok]\n```\n<|im_end|>\n",
+    "<|im_start|>user\nWrite a Python function to merge overlapping intervals.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n```python\ndef merge_intervals(intervals: list[list[int]]) -> list[list[int]]:\n    if not intervals:\n        return []\n    intervals.sort(key=lambda x: x[0])\n    merged = [intervals[0]]\n    for start, end in intervals[1:]:\n        if start <= merged[-1][1]:\n            merged[-1][1] = max(merged[-1][1], end)\n        else:\n            merged.append([start, end])\n    return merged\n```\n<|im_end|>\n",
+    "<|im_start|>system\nYou are a helpful coding assistant.<|im_end|>\n<|im_start|>user\nFix the off-by-one bug in this C loop:\n```c\nfor (int i = 0; i <= n; i++) sum += arr[i];\n```\n<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\nChange `i <= n` to `i < n` so `arr[n]` is not read out of bounds.\n<|im_end|>\n",
+    "<|im_start|>user\nExplain the difference between a mutex and a semaphore in C++17.<|im_end|>\n<|im_start|>assistant\n<think>\nA mutex provides mutual exclusion with ownership, whereas a semaphore counts available resources.\n</think>\n\n1. **Ownership**: A `std::mutex` must be unlocked by the same thread that locked it.\n2. **Counting**: A semaphore allows up to `N` concurrent threads.\n<|im_end|>\n",
+    # Reasoning & mathematics
+    "<|im_start|>user\nCompute the binary search complexity and write an iterative version in Python.<|im_end|>\n<|im_start|>assistant\n<think>\nHalving the search range each step gives O(log n) time and O(1) space.\n</think>\n\n```python\ndef binary_search(nums: list[int], target: int) -> int:\n    lo, hi = 0, len(nums) - 1\n    while lo <= hi:\n        mid = lo + (hi - lo) // 2\n        if nums[mid] == target:\n            return mid\n        if nums[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1\n```\n<|im_end|>\n",
+    # Additional prose without BOS
+    "When climbing high alpine ridges, mountaineers monitor barometric pressure, wind shear, and freezing levels carefully before committing to an exposed traverse.",
+    "Direct memory access controllers transfer large contiguous buffers between device memory and host DRAM without stalling scalar CPU pipelines.",
+    "Fourier transforms decompose time-domain waveforms into orthogonal sinusoidal frequency bins with fast O(N log N) butterfly stages.",
+    "Hello, world! Today is Monday, and we are benchmarking sparse Mixture of Experts throughput across both dies.",
+    "In Python, dictionaries preserve insertion order and support average O(1) hash table lookups for arbitrary hashable keys.",
+    "<|im_start|>user\nSummarize the three laws of thermodynamics.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n1. Energy is conserved.\n2. Entropy of an isolated system never decreases.\n3. Entropy approaches a constant as temperature approaches absolute zero.\n<|im_end|>\n",
+    "Hardware cache coherence protocols ensure all cores observe a consistent view of shared memory lines across NUMA sockets.",
+]
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -89,35 +137,55 @@ def build_single_conv_region_dyntok(
     X_cal: torch.Tensor,
     sh: int,
     reg,
-) -> tuple[bytes, float, float, np.ndarray, np.ndarray]:
+    margin: float = 2.0,
+    q_floor: float = 0.80,
+    op_label: str = "",
+) -> tuple[bytes, float, float, np.ndarray, np.ndarray, int]:
     """
     Calibrates and tiles a 1x1 Conv2D Class B weight region for dynamic per-token input packing
-    (pack_npu_input with dyntok ratios = amax_tok / in_t).
+    (INT8 input + INT16 output via dyntok ratios = amax_tok / in_t), using DropBOS RMS SmoothQuant
+    (outliers > 3x median excluded from s_x and in_t, while included in y_norm_max bounds),
+    float64 round-to-even arithmetic, and an 80th-percentile row L2-norm output bound floor (u_c).
     """
     M_out, K = w_t.shape
-    Y_cal = X_cal @ w_t.t()
-    x_ch = X_cal.abs().amax(dim=0).clamp(min=1e-5)
-    w_ch = w_t.abs().amax(dim=0).clamp(min=1e-5)
-    smooth = (x_ch.pow(0.5) / w_ch.pow(0.5)).clamp(min=1e-3, max=1e3)
+    w_f32 = w_t.float()
+    x_f32 = X_cal.float()
+    rm = x_f32.abs().amax(dim=1)
+    clean_mask = rm <= (torch.median(rm) * 3.0)
+    x_clean = x_f32[clean_mask] if int(clean_mask.sum().item()) >= 16 else x_f32
+    s_x = x_clean.pow(2).mean(dim=0).sqrt().clamp(min=1e-5)
+    s_w = w_f32.abs().amax(dim=0).clamp(min=1e-5)
+    smooth = (s_x / s_w).sqrt().clamp(min=1e-3, max=1e3)
     inv_smooth = 1.0 / smooth
 
-    X_sm = X_cal * inv_smooth.unsqueeze(0)
-    W_sm = w_t * smooth.unsqueeze(0)
-    in_t = float(X_sm.abs().max().item())
+    X_sm_clean = x_clean * inv_smooth.unsqueeze(0)
+    in_t = float(X_sm_clean.abs().amax(dim=1).clamp(min=1e-8).max().item())
     in_s = in_t / 127.0
 
-    amax_cal = X_sm.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
-    ratios_cal = amax_cal / in_t
-    out_t_chan = (Y_cal / ratios_cal).abs().amax(dim=0).clamp(min=1e-5) * 1.05
+    X_sm_all = x_f32 * inv_smooth.unsqueeze(0)
+    amax_all = X_sm_all.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    x_q = torch.clamp(torch.round(X_sm_all * (127.0 / amax_all)), -127.0, 127.0).double()
 
+    W_sm = (w_f32 * smooth.unsqueeze(0)).double()
     w_s = W_sm.abs().amax(dim=1).clamp(min=1e-12) / 127.0
-    min_out_s = (in_s * w_s * (1 << sh)) / 32767.0
-    out_s_chan = torch.max(out_t_chan / 127.0, min_out_s)
+    w_q_f64 = torch.clamp(torch.round(W_sm / w_s.unsqueeze(1)), -127.0, 127.0)
 
-    qm_f = torch.clamp(torch.round((in_s * w_s / out_s_chan) * (1 << sh)), 1.0, 32767.0)
+    u_c = W_sm.norm(dim=1).clamp(min=1e-8)
+    y_norm_max = (F.linear(x_q, w_q_f64).abs().amax(dim=0)) * (in_s * w_s)
+    qf = torch.quantile(y_norm_max / u_c, q_floor)
+    y_bound_c = torch.maximum(y_norm_max * margin, qf * u_c * margin)
+
+    min_out_s = (in_s * w_s * (1 << sh)) / 32767.0
+    out_s_chan = torch.maximum(y_bound_c / 32767.0, min_out_s)
+
+    qm_raw = torch.round((in_s * w_s / out_s_chan) * (1 << sh))
+    n_hi = int((qm_raw > 32767.0).sum().item())
+    if n_hi > 0:
+        print(f"  [WARN] {op_label or 'conv'}: {n_hi} channels had qm_raw > 32767 at sh={sh} (max={float(qm_raw.max().item()):.1f})")
+    qm_f = torch.clamp(qm_raw, 1.0, 32767.0)
     out_step_chan = ((in_s * w_s * (1 << sh)) / qm_f).float().numpy()
 
-    w_q = torch.clamp(torch.round(W_sm / w_s.unsqueeze(1)), -127, 127).to(torch.int8)
+    w_q = w_q_f64.to(torch.int8)
     K_pad = ((K + 95) // 96) * 96
     w_pad = F.pad(w_q, (0, K_pad - K))
     n_slices = len(reg.contents) // 2
@@ -132,7 +200,130 @@ def build_single_conv_region_dyntok(
         buf[reg.offsets[2*s] : reg.offsets[2*s] + slice_w_bytes] = w_tiled[s].tobytes()
         buf[reg.offsets[2*s+1] : reg.offsets[2*s+1] + slice_qm_bytes] = qm_i16[s].tobytes()
 
-    return bytes(buf), in_t, in_s, inv_smooth.float().numpy(), out_step_chan
+    return bytes(buf), in_t, in_s, inv_smooth.float().numpy(), out_step_chan, n_hi
+
+
+def collect_calibration_activations(sf, tok: AutoTokenizer, out_pt_path: Path) -> dict[str, torch.Tensor]:
+    """
+    Collects FP32 layer-by-layer calibration activations across diverse prose, ChatML turns,
+    <think>...</think> formatting, and Python/C/C++ code sequences, streaming one layer at a
+    time directly from safetensors to keep host memory usage minimal.
+    """
+    t0 = time.time()
+    print(f"\n[+] Collecting FP32 calibration activations ({len(CALIB_TEXTS)} sequences) -> {out_pt_path}...")
+    emb = sf.get_tensor("model.embed_tokens.weight").float()
+    inv_freq = 1.0 / (5000000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64.0))
+
+    seq_states = []
+    tot_tokens = 0
+    for idx, text in enumerate(CALIB_TEXTS):
+        body = tok.encode(text, add_special_tokens=False)
+        # Include BOS on the first 12 sequences so BOS-sink and non-BOS tokens are both represented
+        ids = ([124894] + body) if (idx < 12) else body
+        tot_tokens += len(ids)
+        seq_states.append(emb[torch.tensor(ids, dtype=torch.long)].clone())
+    del emb
+    print(f"  [+] Prepared {len(seq_states)} calibration sequences ({tot_tokens} total tokens)")
+
+    calib_x: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for l in range(24):
+            tl0 = time.time()
+            pfx = f"model.layers.{l}."
+            op_norm = sf.get_tensor(pfx + "operator_norm.weight").float()
+            ffn_norm = sf.get_tensor(pfx + "ffn_norm.weight").float()
+
+            x_op_in_list = []
+            x_op_out_list = []
+
+            if l not in ATTN_LAYERS:
+                w_in = sf.get_tensor(pfx + "conv.in_proj.weight").float()
+                w_conv = sf.get_tensor(pfx + "conv.conv.weight").float()
+                w_out = sf.get_tensor(pfx + "conv.out_proj.weight").float()
+                for s_i, h in enumerate(seq_states):
+                    T = h.shape[0]
+                    u = rms_norm(h, op_norm)
+                    x_op_in_list.append(u)
+                    bcx = u @ w_in.t()
+                    B, C, xp = bcx.chunk(3, dim=-1)
+                    bx = (B * xp).transpose(0, 1).unsqueeze(0)
+                    conv_out = F.conv1d(F.pad(bx, (2, 0)), w_conv, groups=2048)[0, :, :T].transpose(0, 1)
+                    y_mid = C * conv_out
+                    x_op_out_list.append(y_mid)
+                    seq_states[s_i] = h + (y_mid @ w_out.t())
+                calib_x[f"l{l:02d}_conv_in"] = torch.cat(x_op_in_list, dim=0)
+                calib_x[f"l{l:02d}_conv_out"] = torch.cat(x_op_out_list, dim=0)
+            else:
+                wq = sf.get_tensor(pfx + "self_attn.q_proj.weight").float()
+                wk = sf.get_tensor(pfx + "self_attn.k_proj.weight").float()
+                wv = sf.get_tensor(pfx + "self_attn.v_proj.weight").float()
+                w_qkv = torch.cat([wq, wk, wv], dim=0)
+                qn = sf.get_tensor(pfx + "self_attn.q_layernorm.weight").float()
+                kn = sf.get_tensor(pfx + "self_attn.k_layernorm.weight").float()
+                wo = sf.get_tensor(pfx + "self_attn.out_proj.weight").float()
+                for s_i, h in enumerate(seq_states):
+                    T = h.shape[0]
+                    u = rms_norm(h, op_norm)
+                    x_op_in_list.append(u)
+                    qkv = u @ w_qkv.t()
+                    q_raw = rms_norm(qkv[:, :2048].view(T, 32, 64), qn)
+                    k_raw = rms_norm(qkv[:, 2048:2560].view(T, 8, 64), kn)
+                    v = qkv[:, 2560:].view(T, 8, 64)
+                    freqs = torch.outer(torch.arange(T, dtype=torch.float32), inv_freq)
+                    cos_tab = torch.cat([freqs.cos(), freqs.cos()], dim=-1).unsqueeze(1)
+                    sin_tab = torch.cat([freqs.sin(), freqs.sin()], dim=-1).unsqueeze(1)
+                    q = q_raw * cos_tab + rotate_half(q_raw) * sin_tab
+                    k = k_raw * cos_tab + rotate_half(k_raw) * sin_tab
+                    scores = (q.transpose(0, 1) @ k.transpose(0, 1).repeat_interleave(4, dim=0).transpose(-1, -2)) * 0.125
+                    probs = F.softmax(scores + torch.triu(torch.full((T, T), float("-inf")), diagonal=1).unsqueeze(0), dim=-1)
+                    attn_y = (probs @ v.transpose(0, 1).repeat_interleave(4, dim=0)).transpose(0, 1).contiguous().view(T, 2048)
+                    x_op_out_list.append(attn_y)
+                    seq_states[s_i] = h + (attn_y @ wo.t())
+                calib_x[f"l{l:02d}_attn_qkv"] = torch.cat(x_op_in_list, dim=0)
+                calib_x[f"l{l:02d}_attn_out"] = torch.cat(x_op_out_list, dim=0)
+
+            # Collect FFN inputs & advance hidden states
+            x_ffn_list = [rms_norm(h, ffn_norm) for h in seq_states]
+            calib_x[f"l{l:02d}_ffn"] = torch.cat(x_ffn_list, dim=0)
+            if l < 2:
+                w1 = sf.get_tensor(pfx + "feed_forward.w1.weight").float()
+                w3 = sf.get_tensor(pfx + "feed_forward.w3.weight").float()
+                w2 = sf.get_tensor(pfx + "feed_forward.w2.weight").float()
+                for s_i, (h, v_cur) in enumerate(zip(seq_states, x_ffn_list)):
+                    seq_states[s_i] = h + ((F.silu(v_cur @ w1.t()) * (v_cur @ w3.t())) @ w2.t())
+            else:
+                gw = sf.get_tensor(pfx + "feed_forward.gate.weight").float()
+                eb = sf.get_tensor(pfx + "feed_forward.expert_bias").float()
+                experts_w = {}
+                for s_i, (h, v_cur) in enumerate(zip(seq_states, x_ffn_list)):
+                    rw = torch.sigmoid(v_cur @ gw.t())
+                    _, top_idx = torch.topk(rw + eb.unsqueeze(0), k=4, dim=-1)
+                    top_w = torch.gather(rw, -1, top_idx)
+                    top_w = top_w / (top_w.sum(dim=-1, keepdim=True) + 1e-6)
+                    ffn_out = torch.zeros_like(v_cur)
+                    for e in torch.unique(top_idx).tolist():
+                        if e not in experts_w:
+                            epfx = f"{pfx}feed_forward.experts.{e}."
+                            experts_w[e] = (
+                                sf.get_tensor(epfx + "w1.weight").float(),
+                                sf.get_tensor(epfx + "w3.weight").float(),
+                                sf.get_tensor(epfx + "w2.weight").float(),
+                            )
+                        w1_e, w3_e, w2_e = experts_w[e]
+                        e_out = (F.silu(v_cur @ w1_e.t()) * (v_cur @ w3_e.t())) @ w2_e.t()
+                        for k_i in range(4):
+                            ffn_out += (top_idx[:, k_i] == e).unsqueeze(-1).float() * top_w[:, k_i:k_i+1] * e_out
+                    seq_states[s_i] = h + ffn_out
+                del experts_w
+            print(f"  [+] Calibration L{l:02d} collected in {time.time() - tl0:.2f}s")
+
+        emb_norm = sf.get_tensor("model.embedding_norm.weight").float()
+        calib_x["lm_head"] = torch.cat([rms_norm(h, emb_norm) for h in seq_states], dim=0)
+
+    out_pt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"calib_x": calib_x, "num_tokens": tot_tokens}, str(out_pt_path))
+    print(f"  [+] Saved calibration cache ({len(calib_x)} tensors, {tot_tokens} tokens) in {time.time() - t0:.1f}s")
+    return calib_x
 
 
 def build_expert_mlp_region(
@@ -214,30 +405,46 @@ def build_lm_head_slices(
     models_out_dir: Path,
 ) -> tuple[float, float, np.ndarray, list[np.ndarray]]:
     """
-    Patches the 8 static Class A LM head slices (lfm2_lm_head_d{0,1}_s{0..3}.model) directly
-    from lfm3_lm_head_d0_s0.model with SmoothQuant input balancing and per-channel output steps.
+    Patches the 8 Class A LM head slices (lfm2_lm_head_d{0,1}_s{0..3}.model) directly
+    from lm_head_16k_int16_npu_b1.model with DropBOS RMS SmoothQuant and dyntok INT16 output steps.
     """
-    sh = 22
-    Y_true = X_cal_lm @ emb_w.t()
-    x_ch = X_cal_lm.abs().amax(dim=0).clamp(min=1e-5)
-    w_ch = emb_w.abs().amax(dim=0).clamp(min=1e-5)
-    smooth = (x_ch.pow(0.5) / w_ch.pow(0.5)).clamp(min=1e-3, max=1e3)
+    sh = TRUNCS["lm_head"][0]
+    x_f32 = X_cal_lm.float()
+    rm = x_f32.abs().amax(dim=1)
+    clean_mask = rm <= (torch.median(rm) * 3.0)
+    x_clean = x_f32[clean_mask] if int(clean_mask.sum().item()) >= 16 else x_f32
+    s_x = x_clean.pow(2).mean(dim=0).sqrt().clamp(min=1e-5)
+    s_w = emb_w.abs().amax(dim=0).clamp(min=1e-5)
+    smooth = (s_x / s_w).sqrt().clamp(min=1e-3, max=1e3)
     inv_smooth = 1.0 / smooth
 
-    X_sm = X_cal_lm * inv_smooth.unsqueeze(0)
-    W_sm = emb_w * smooth.unsqueeze(0)
-    in_t = float(X_sm.abs().max().item() * 1.05)
+    X_sm = x_clean * inv_smooth.unsqueeze(0)
+    amax_tok = X_sm.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    in_t = float(amax_tok.max().item())
     in_s = in_t / 127.0
+    x_q_all = torch.clamp(torch.round(X_sm * (127.0 / amax_tok)), -127.0, 127.0).double()
 
+    W_sm = (emb_w.float() * smooth.unsqueeze(0)).double()
     w_s = W_sm.abs().amax(dim=1).clamp(min=1e-12) / 127.0
-    out_t_chan = Y_true.abs().amax(dim=0).clamp(min=1e-5) * 1.15
+    w_q_f64 = torch.clamp(torch.round(W_sm / w_s.unsqueeze(1)), -127.0, 127.0)
+
+    u_c = W_sm.norm(dim=1).clamp(min=1e-8)
+    y_norm_max = (F.linear(x_q_all, w_q_f64).abs().amax(dim=0)) * (in_s * w_s)
+    qf = torch.quantile(y_norm_max / u_c, 0.90)
+    y_bound = torch.maximum(
+        torch.maximum(y_norm_max * 2.0, qf * u_c * 2.0),
+        torch.full_like(y_norm_max, 120.0),
+    )
     min_out_s = (in_s * w_s * (1 << sh)) / 32767.0
-    out_s_chan = torch.max(out_t_chan / 127.0, min_out_s)
-    qm_all_f = torch.clamp(torch.round((in_s * w_s / out_s_chan) * (1 << sh)), 1.0, 32767.0)
+    out_s_chan = torch.maximum(y_bound / 32767.0, min_out_s)
+    qm_raw = torch.round((in_s * w_s / out_s_chan) * (1 << sh))
+    n_hi = int((qm_raw > 32767.0).sum().item())
+    assert n_hi == 0, f"LM head qm_raw > 32767 on {n_hi} channels at sh={sh}"
+    qm_all_f = torch.clamp(qm_raw, 1.0, 32767.0)
     out_step_all = ((in_s * w_s * (1 << sh)) / qm_all_f).float().numpy()
     qm_all_i16 = qm_all_f.to(torch.int16).numpy()
 
-    w_q_all = torch.clamp(torch.round(W_sm / w_s.unsqueeze(1)), -127, 127).to(torch.int8)
+    w_q_all = w_q_f64.to(torch.int8)
     w_pad_all = F.pad(w_q_all, (0, 64))  # K=2048 -> K_pad=2112
 
     m = ModelReader.read_file(str(tmpl_lm_path))
@@ -364,7 +571,176 @@ def generate_golden_bin(sf, tok: AutoTokenizer, out_bin_path: Path):
     print(f"  [+] Wrote {out_bin_path} (in_ids={in_ids}, gold_gen={gold_gen} -> {[tok.decode([t]) for t in gold_gen]})")
 
 
+def build_classb_models(tmpl_map: dict[str, Path], models_out_dir: Path):
+    cb_work = Path("/tmp/lfm2_cb_work")
+    cb_work.mkdir(parents=True, exist_ok=True)
+    try:
+        for key, src_p in tmpl_map.items():
+            arch = key.rsplit("_", 1)[0]
+            stem = f"lfm2_{key}"
+            patched_p = cb_work / f"{stem}.model"
+            patch_model_truncates(src_p, patched_p, TRUNCS[arch])
+            subprocess.run(
+                [VENV_PY, str(COMPILER_PY), "-m", str(patched_p), "-o", str(cb_work), "--convert-weights"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            cb_out = cb_work / f"{stem}_classb.model"
+            dst_cb = models_out_dir / f"{stem}_classb.model"
+            shutil.copy2(cb_out, dst_cb)
+            print(f"  [+] Built {dst_cb.name} ({dst_cb.stat().st_size} B, truncs={set(TRUNCS[arch])})")
+    finally:
+        shutil.rmtree(cb_work, ignore_errors=True)
+
+
+def calibrate_layer_operators(sf, l: int, calib_x: dict, cached_regs: dict, margin: float):
+    pfx = f"model.layers.{l}."
+    if l not in ATTN_LAYERS:
+        k_in, k_out = f"lfm2_l{l:02d}_conv_in", f"lfm2_l{l:02d}_conv_out"
+        w_in = sf.get_tensor(pfx + "conv.in_proj.weight").float()
+        w_out = sf.get_tensor(pfx + "conv.out_proj.weight").float()
+        sh_in, sh_out = TRUNCS["conv_in"][0], TRUNCS["proj2048"][0]
+        reg_in, cal_key_in, cal_key_out = cached_regs["conv_in"], f"l{l:02d}_conv_in", f"l{l:02d}_conv_out"
+    else:
+        k_in, k_out = f"lfm2_l{l:02d}_attn_qkv", f"lfm2_l{l:02d}_attn_out"
+        wq = sf.get_tensor(pfx + "self_attn.q_proj.weight").float()
+        wk = sf.get_tensor(pfx + "self_attn.k_proj.weight").float()
+        wv = sf.get_tensor(pfx + "self_attn.v_proj.weight").float()
+        w_in = torch.cat([wq, wk, wv], dim=0)
+        w_out = sf.get_tensor(pfx + "self_attn.out_proj.weight").float()
+        sh_in, sh_out = TRUNCS["attn_qkv"][0], TRUNCS["proj2048"][0]
+        reg_in, cal_key_in, cal_key_out = cached_regs["attn_qkv"], f"l{l:02d}_attn_qkv", f"l{l:02d}_attn_out"
+
+    res_in = build_single_conv_region_dyntok(w_in, calib_x[cal_key_in], sh_in, reg_in, margin=margin, op_label=k_in)
+    res_out = build_single_conv_region_dyntok(w_out, calib_x[cal_key_out], sh_out, cached_regs["proj2048"], margin=margin, op_label=k_out)
+    return (k_in, res_in), (k_out, res_out)
+
+
+def patch_operators_only(sf, tok: AutoTokenizer, args):
+    t_start = time.time()
+    print("=" * 80)
+    print(f" LiquidAI / LFM2.5-8B-A1B Milestone 16: Operator-Only Patch (margin={args.op_margin:.2f})")
+    print("=" * 80)
+
+    print("\n[1/4] Rebuilding 9 Operator Class B Loadables (conv_in sh=%d, proj2048 sh=%d, attn_qkv sh=%d)..." % (
+        TRUNCS["conv_in"][0], TRUNCS["proj2048"][0], TRUNCS["attn_qkv"][0]))
+    build_classb_models(OP_TMPL_MAP, PKG_OUT_DIR / "models")
+
+    cached_regs = {}
+    for k in ["conv_in_t1", "proj2048_t1", "attn_qkv_t1"]:
+        m = ModelReader.read_file(str(OP_TMPL_MAP[k]))
+        cached_regs[k.rsplit("_", 1)[0]] = find_weight_regions(m)[0]
+
+    print(f"\n[2/4] Loading FP32 calibration dataset ({CALIB_PT_PATH})...")
+    if args.recalibrate or not CALIB_PT_PATH.exists():
+        calib_x = collect_calibration_activations(sf, tok, CALIB_PT_PATH)
+    else:
+        calib_x = torch.load(str(CALIB_PT_PATH))["calib_x"]
+
+    print("\n[3/4] Patching 8 INT16 LM Head slices + 48 operator regions in weights_die{0,1}.bin + quant_chan_scales.bin...")
+    w_map_path = PKG_OUT_DIR / "weights_map.json"
+    qs_path = PKG_OUT_DIR / "quant_scales.json"
+    chan_bin_path = PKG_OUT_DIR / "quant_chan_scales.bin"
+    w_map = json.loads(w_map_path.read_text())
+    qs = json.loads(qs_path.read_text())
+    chan_arr = np.fromfile(str(chan_bin_path), dtype=np.float32)
+
+    emb_f32 = sf.get_tensor("model.embed_tokens.weight").float()
+    lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_slices(
+        emb_f32, calib_x["lm_head"], LM_TMPL_PATH, PKG_OUT_DIR / "models"
+    )
+    del emb_f32
+    lm_sc0 = qs["subgraphs"]["lfm2_lm_head_d0_s0"]
+    lm_in_off, lm_in_cnt = int(lm_sc0["in_smooth_offset"]), int(lm_sc0["in_smooth_count"])
+    assert lm_in_cnt == lm_inv_smooth.size
+    chan_arr[lm_in_off : lm_in_off + lm_in_cnt] = lm_inv_smooth
+    for d in range(2):
+        for s in range(4):
+            k_lm = f"lfm2_lm_head_d{d}_s{s}"
+            sc = qs["subgraphs"][k_lm]
+            out_off, out_cnt = int(sc["out_step_offset"]), int(sc["out_step_count"])
+            osc_lm = lm_slice_out_steps[d * 4 + s]
+            assert out_cnt == osc_lm.size
+            chan_arr[out_off : out_off + out_cnt] = osc_lm
+            out_s_med = float(np.median(osc_lm))
+            sc["input_dtype"] = "int8"
+            sc["output_dtype"] = "int16"
+            sc["input_threshold"] = float(lm_in_t)
+            sc["input_step"] = float(lm_in_s)
+            sc["output_threshold"] = float(out_s_med * 32767.0)
+            sc["output_step"] = float(out_s_med)
+
+    patch_records = []
+    tot_hi = 0
+    with open(PKG_OUT_DIR / "weights_die0.bin", "r+b") as df0, open(PKG_OUT_DIR / "weights_die1.bin", "r+b") as df1:
+        die_files = {0: df0, 1: df1}
+        for l in range(24):
+            (k_in, res_in), (k_out, res_out) = calibrate_layer_operators(sf, l, calib_x, cached_regs, args.op_margin)
+            for k_name, (blob_bytes, in_t, in_s, inv_sm, osc, n_hi) in [(k_in, res_in), (k_out, res_out)]:
+                tot_hi += n_hi
+                wm = w_map[k_name]
+                die = int(wm["die"])
+                off = int(wm["weight_offset"])
+                sz = int(wm["weight_size"])
+                assert len(blob_bytes) == sz, f"{k_name}: size mismatch {len(blob_bytes)} vs {sz}"
+                die_files[die].seek(off)
+                die_files[die].write(blob_bytes)
+                if args.emit_roma_patch is not None:
+                    patch_records.append((die, off, blob_bytes))
+
+                sc = qs["subgraphs"][k_name]
+                in_off, in_cnt = int(sc["in_smooth_offset"]), int(sc["in_smooth_count"])
+                out_off, out_cnt = int(sc["out_step_offset"]), int(sc["out_step_count"])
+                assert in_cnt == inv_sm.size, f"{k_name}: in_cnt {in_cnt} != {inv_sm.size}"
+                assert out_cnt == osc.size, f"{k_name}: out_cnt {out_cnt} != {osc.size}"
+                chan_arr[in_off : in_off + in_cnt] = inv_sm
+                chan_arr[out_off : out_off + out_cnt] = osc
+
+                out_s_med = float(np.median(osc))
+                sc["input_dtype"] = "int8"
+                sc["output_dtype"] = "int16"
+                sc["input_threshold"] = float(in_t)
+                sc["input_step"] = float(in_s)
+                sc["output_threshold"] = float(out_s_med * 32767.0)
+                sc["output_step"] = float(out_s_med)
+
+    chan_arr.tofile(str(chan_bin_path))
+    qs_path.write_text(json.dumps(qs, indent=2))
+
+    if args.emit_roma_patch is not None:
+        print(f"\n[4/4] Writing binary operator patch -> {args.emit_roma_patch} ({len(patch_records)} regions)...")
+        args.emit_roma_patch.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.emit_roma_patch, "wb") as pf:
+            pf.write(b"LFM2OPAT")
+            pf.write(struct.pack("<I", len(patch_records)))
+            for die, off, blob in patch_records:
+                pf.write(struct.pack("<IQQ", die, off, len(blob)))
+                pf.write(blob)
+        print(f"  [+] Wrote {args.emit_roma_patch} ({args.emit_roma_patch.stat().st_size / (1024*1024):.2f} MiB)")
+
+    print("\n" + "=" * 80)
+    print(f" Operator Patch COMPLETE in {time.time() - t_start:.1f}s | total qm_raw > 32767 = {tot_hi}")
+    print("=" * 80)
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Build or patch LFM2.5-8B-A1B ENNP package")
+    parser.add_argument("--patch-operators-only", action="store_true",
+                        help="Rebuild only the 9 operator Class B .model files and patch the 48 operator regions in-place")
+    parser.add_argument("--op-margin", type=float, default=2.0,
+                        help="Safety margin multiplier on operator INT16 output bounds (default: 2.0)")
+    parser.add_argument("--recalibrate", action="store_true",
+                        help="Force regenerating FP32 calibration activations cache")
+    parser.add_argument("--emit-roma-patch", type=Path, default=None,
+                        help="Optional binary patch file containing the 48 patched operator regions for in-place deployment on roma")
+    args = parser.parse_args()
+
+    sf = safe_open(str(MODEL_DIR / "model.safetensors"), framework="pt", device="cpu")
+    tok = AutoTokenizer.from_pretrained(str(MODEL_DIR), local_files_only=True)
+
+    if args.patch_operators_only:
+        patch_operators_only(sf, tok, args)
+        return
+
     t_start = time.time()
     print("=" * 80)
     print(" LiquidAI / LFM2.5-8B-A1B Sparse MoE: Dual-Die ENNP Package Builder")
@@ -372,9 +748,6 @@ def main():
 
     (PKG_OUT_DIR / "models").mkdir(parents=True, exist_ok=True)
     shutil.copy2(MODEL_DIR / "tokenizer.json", PKG_OUT_DIR / "tokenizer.json")
-
-    sf = safe_open(str(MODEL_DIR / "model.safetensors"), framework="pt", device="cpu")
-    tok = AutoTokenizer.from_pretrained(str(MODEL_DIR), local_files_only=True)
 
     # 1. Build embedding.bin ([128000, 2048] FP16)
     emb_bin_path = PKG_OUT_DIR / "embedding.bin"
@@ -420,34 +793,8 @@ def main():
 
     # 3. Build 12 Class B Archetype Loadables (t1, t8, t64 for conv_in, proj2048, attn_qkv, expert_mlp)
     print("\n[3/6] Building 12 Class B Archetype Loadables (conv_in, proj2048, attn_qkv, expert_mlp x {t1,t8,t64})...")
-    tmpl_map = {
-        "conv_in_t1":     LFM3_TEMPL_DIR / "lfm3_l00_conv_in_npu_b1.model",
-        "conv_in_t8":     LFM3_TEMPL_DIR / "conv_in_t8_npu_b1.model",
-        "conv_in_t64":    LFM3_TEMPL_DIR / "lfm3_l00_conv_in_t64_npu_b1.model",
-        "proj2048_t1":    LFM3_TEMPL_DIR / "lfm3_l00_conv_out_npu_b1.model",
-        "proj2048_t8":    LFM3_TEMPL_DIR / "proj2048_t8_npu_b1.model",
-        "proj2048_t64":   LFM3_TEMPL_DIR / "lfm3_l00_conv_out_t64_npu_b1.model",
-        "attn_qkv_t1":    LFM3_TEMPL_DIR / "lfm3_l02_attn_qkv_npu_b1.model",
-        "attn_qkv_t8":    LFM3_TEMPL_DIR / "attn_qkv_t8_npu_b1.model",
-        "attn_qkv_t64":   LFM3_TEMPL_DIR / "lfm3_l02_attn_qkv_t64_npu_b1.model",
-        "expert_mlp_t1":  LFM2_TEMPL_DIR / "expert_mlp_t1_npu_b1.model",
-        "expert_mlp_t8":  LFM2_TEMPL_DIR / "expert_mlp_t8_npu_b1.model",
-        "expert_mlp_t64": LFM2_TEMPL_DIR / "expert_mlp_t64_npu_b1.model",
-    }
-    cb_work = Path("/tmp/lfm2_cb_work")
-    cb_work.mkdir(parents=True, exist_ok=True)
-    for key, src_p in tmpl_map.items():
-        arch = key.rsplit("_", 1)[0]
-        stem = f"lfm2_{key}"
-        patched_p = cb_work / f"{stem}.model"
-        patch_model_truncates(src_p, patched_p, TRUNCS[arch])
-        subprocess.run([VENV_PY, str(COMPILER_PY), "-m", str(patched_p), "-o", str(cb_work), "--convert-weights"],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        cb_out = cb_work / f"{stem}_classb.model"
-        dst_cb = PKG_OUT_DIR / "models" / f"{stem}_classb.model"
-        shutil.copy2(cb_out, dst_cb)
-        print(f"  [+] Built {dst_cb.name} ({dst_cb.stat().st_size} B)")
-    shutil.rmtree(cb_work, ignore_errors=True)
+    tmpl_map = {**OP_TMPL_MAP, **EXP_TMPL_MAP}
+    build_classb_models(tmpl_map, PKG_OUT_DIR / "models")
 
     # Pre-cache template weight regions
     cached_regs = {}
@@ -455,13 +802,16 @@ def main():
         m = ModelReader.read_file(str(tmpl_map[k]))
         cached_regs[k.rsplit("_", 1)[0]] = find_weight_regions(m)[0]
 
-    # 4. Load FP32 calibration dataset & build 8 LM head slices
-    print("\n[4/6] Building 8 INT8 LM Head Slices (lfm2_lm_head_d{0,1}_s{0..3}.model)...")
-    calib_x = torch.load(str(CALIB_PT_PATH))["calib_x"]
+    # 4. Load FP32 calibration dataset & build 8 dyntok INT16 LM head slices
+    print("\n[4/6] Building 8 dyntok INT16 LM Head Slices (lfm2_lm_head_d{0,1}_s{0..3}.model)...")
+    if args.recalibrate or not CALIB_PT_PATH.exists():
+        calib_x = collect_calibration_activations(sf, tok, CALIB_PT_PATH)
+    else:
+        calib_x = torch.load(str(CALIB_PT_PATH))["calib_x"]
     lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_slices(
         emb_f32,
         calib_x["lm_head"],
-        LFM3_PKG_DIR / "models" / "lfm3_lm_head_d0_s0.model",
+        LM_TMPL_PATH,
         PKG_OUT_DIR / "models",
     )
 
@@ -505,35 +855,20 @@ def main():
     for d in range(2):
         for s in range(4):
             k_lm = f"lfm2_lm_head_d{d}_s{s}"
-            record_scale_entry(k_lm, "int8", "int8", lm_in_t, lm_in_s, lm_in_off, lm_in_cnt, lm_slice_out_steps[d*4 + s])
+            record_scale_entry(k_lm, "int8", "int16", lm_in_t, lm_in_s, lm_in_off, lm_in_cnt, lm_slice_out_steps[d*4 + s])
 
     for l in range(24):
         t_l0 = time.time()
         op_die = 0 if l < 12 else 1
         pfx = f"model.layers.{l}."
-        if l not in ATTN_LAYERS:
-            k_in, k_out = f"lfm2_l{l:02d}_conv_in", f"lfm2_l{l:02d}_conv_out"
-            w_in = sf.get_tensor(pfx + "conv.in_proj.weight").float()
-            w_out = sf.get_tensor(pfx + "conv.out_proj.weight").float()
-            b_in, in_t_i, in_s_i, inv_i, osc_i = build_single_conv_region_dyntok(
-                w_in, calib_x[f"l{l:02d}_conv_in"], 20, cached_regs["conv_in"])
-            b_out, in_t_o, in_s_o, inv_o, osc_o = build_single_conv_region_dyntok(
-                w_out, calib_x[f"l{l:02d}_conv_out"], 20, cached_regs["proj2048"])
-        else:
-            k_in, k_out = f"lfm2_l{l:02d}_attn_qkv", f"lfm2_l{l:02d}_attn_out"
-            wq = sf.get_tensor(pfx + "self_attn.q_proj.weight").float()
-            wk = sf.get_tensor(pfx + "self_attn.k_proj.weight").float()
-            wv = sf.get_tensor(pfx + "self_attn.v_proj.weight").float()
-            wo = sf.get_tensor(pfx + "self_attn.out_proj.weight").float()
-            b_in, in_t_i, in_s_i, inv_i, osc_i = build_single_conv_region_dyntok(
-                torch.cat([wq, wk, wv], dim=0), calib_x[f"l{l:02d}_attn_qkv"], 21, cached_regs["attn_qkv"])
-            b_out, in_t_o, in_s_o, inv_o, osc_o = build_single_conv_region_dyntok(
-                wo, calib_x[f"l{l:02d}_attn_out"], 20, cached_regs["proj2048"])
+        (k_in, res_in), (k_out, res_out) = calibrate_layer_operators(sf, l, calib_x, cached_regs, args.op_margin)
+        b_in, in_t_i, in_s_i, inv_i, osc_i, _ = res_in
+        b_out, in_t_o, in_s_o, inv_o, osc_o, _ = res_out
 
         in_off_i, in_cnt_i = append_chan_vec(inv_i)
         in_off_o, in_cnt_o = append_chan_vec(inv_o)
-        record_scale_entry(k_in,  "int8", "int8", in_t_i, in_s_i, in_off_i, in_cnt_i, osc_i)
-        record_scale_entry(k_out, "int8", "int8", in_t_o, in_s_o, in_off_o, in_cnt_o, osc_o)
+        record_scale_entry(k_in,  "int8", "int16", in_t_i, in_s_i, in_off_i, in_cnt_i, osc_i)
+        record_scale_entry(k_out, "int8", "int16", in_t_o, in_s_o, in_off_o, in_cnt_o, osc_o)
 
         for k_name, blob_bytes in [(k_in, b_in), (k_out, b_out)]:
             w_map[k_name] = {
