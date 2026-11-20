@@ -14,7 +14,7 @@ TARGET         = lfm3_v2
 
 all: $(TARGET)
 
-$(TARGET): lfm3_v2.cpp
+$(TARGET): lfm3_v2.cpp $(RUNTIME_DIR)/include/prefix_cache.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 

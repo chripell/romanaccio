@@ -1391,30 +1391,27 @@ public:
 
 ---
 
-#### Milestone 17B: `lfm3_v2.cpp` Tri-Hybrid Engine Integration (Tier-0 Sticky Turn State + Tier-1 NVMe `.kvb` + PLD Synergy)
+#### Milestone 17B: `lfm3_v2.cpp` Tri-Hybrid Engine Integration (Tier-0 Sticky Turn State + Tier-1 NVMe `.kvb` + PLD Synergy) — **COMPLETE (Verified on `roma` Silicon)**
 
-- **Goal**: Wire `RadixCache` and Tier-0 sticky session state into `Lfm3Engine` (`src/LFM3/lfm3_v2.cpp`) for both `--daemon` mode and interactive REPL / CLI benchmarks.
-- **Files to Modify**:
+- **Goal**: Wire `RadixCache` and Tier-0 sticky session state into `Lfm3Engine` (`src/LFM3/lfm3_v2.cpp`) for `--daemon` mode, interactive REPL, and CLI benchmarks.
+- **Files Modified**:
   - `src/LFM3/lfm3_v2.cpp`
-  - `src/LFM3/Makefile` & `src/LFM3/CMakeLists.txt` (add `-I../eswin_runtime/include`)
-- **Step-by-Step Instructions**:
-  1. **Compute `model_fingerprint` at `Lfm3Engine::init()`**:
-     - Combine the existing 64-bit FNV-1a `head`/`tail` hashes of `weights_die0.bin` and `weights_die1.bin` (`lfm3_v2.cpp`) with a 64-bit hash of `quant_chan_scales.bin`, `m_cpu_weights_buf`, and `m_tp_degree`.
-  2. **Tier-0 Hot In-RAM Sticky State + Ephemeral Turn-End Slot (`0 ms` Consecutive Chat TTFT)**:
-     - Track `std::vector<int32_t> m_live_tokens` representing tokens `[0 .. m_pos - 1]` currently resident in `Lfm3Engine`'s RAM buffers, plus one unaligned turn-end snapshot (`m_turn_snap_pos`, `m_turn_snap_conv`, `m_turn_snap_last_h`).
-     - In `run_daemon_server()`, when generation finishes on `<|im_end|>` (`124900`), `m_live_tokens` already holds `prompt_ids + generated_assistant_ids` (excluding `<|im_end|>`). On the next HTTP request, compute Longest Common Prefix (`lcp`) between `new_prompt_ids` and `m_live_tokens`:
-       - If `lcp == m_turn_snap_pos` and `lcp >= disk_hit_tokens` (standard multi-turn chat continuation where the client appended `<|im_end|>\n<|im_start|>user\n...`), **do NOT call `reset_state()` and do NOT touch NVMe**! Rewind `m_pos = m_turn_snap_pos`, restore `m_conv_state = m_turn_snap_conv`, and prefill **only** the new turn's suffix tokens (`new_prompt_ids[lcp .. end]`)!
-  3. **Tier-1 NVMe `.kvb` Restore & Block Checkpointing (`prefill_cached()`)**:
-     - When Tier-0 LCP is shorter than `RadixCache::lookup()`, call `reset_state_fast()` (skipping `NumaKvBuffer::clear()` on regions about to be overwritten, clearing only `m_act`/`m_out` DMA buffers), then call `m_prefix_cache.restore_blocks(...)`:
-       - If `matched_tokens < prompt_ids.size()`: set `m_pos = matched_tokens` and run `forward_chunk` in `T=64` batches over `[matched_tokens .. prompt_ids.size() - 1]`.
-       - If `matched_tokens == prompt_ids.size()` (`0` suffix tokens): set `m_pos = matched_tokens` and call `compute_logits_from_ptr(restored_last_h, timers, nullptr)` (`~7 ms` Dual-Die LM Head!).
-     - At the end of every full `T=64` step in `prefill_cached()` (and whenever autoregressive decode / `T=8` PLD crosses a `64`-token boundary `(m_pos % 64) == 0`), call `m_prefix_cache.enqueue_save_block(...)` if that `block_key` is not already cached.
-  4. **Milestone 9 `--speculative-pld` Synergy**:
-     - Ensure `history` in `run_daemon_server()` is initialized with the **full** `prompt_ids` (including restored cached prefix tokens!), so `draft_pld()` immediately mines $n$-grams from cached code files and system prompts at `20–24 tok/s`.
-  5. **New CLI & Verification Flags**:
-     - `--cache-dir DIR` (default `/var/lib/romanaccio/kv_cache` or `~/.cache/romanaccio/kv_cache`), `--cache-max-gb N` (default `256`), `--no-prefix-cache` (disables cache for A/B benchmarks), and `--verify-prefix-cache` (runs automated on-silicon bit-exactness gate).
-- **Acceptance Gate (On `roma` Silicon When Connected)**:
-  - `./lfm3_v2 --tp2 --verify-prefix-cache`: Runs a `3,781`-token prompt (`bench_c_code_4k.c`) cold (populates `59` `.kvb` blocks), calls `reset_state()`, re-runs the same `3,781` tokens + `64`-token query from NVMe cache, and asserts **`Max Abs Logits Diff == 0.000000` (`Cosine == 1.00000000`)** and **`4/4` identical greedy tokens** vs. uncached execution, with **8K restore latency `<= 50 ms`**.
+  - `src/LFM3/Makefile` (tracks `$(RUNTIME_DIR)/include/prefix_cache.hpp`; `CMakeLists.txt` already included `../eswin_runtime/include`)
+  - `src/eswin_runtime/include/prefix_cache.hpp` (restore latency optimizations: 4-lane unrolled `hash64_bytes()`, pre-warmed `thread_restore_buf()`, `openat(m_ns_dir_fd)`, OpenMP `>= 2` blocks, descending block dispatch)
+- **What Was Implemented**:
+  1. **`model_fingerprint` at `Lfm3Engine::init()`**: Hashes 64 KiB FNV-1a `head`/`mid`/`tail` of `weights_die{0,1}.bin`, `cpu_weights.bin`, `quant_chan_scales.bin`, per-layer & LM-head `SubgraphScaleInfo` values, `embedding.bin` size + sample rows, `tp_degree`, `is_quant_active()`, and `m_use_shared_archetype_scales`. Resolves default cache root via `LFM3_CACHE_DIR` or `SUDO_USER` home NVMe (`~/.cache/romanaccio/kvcache`).
+  2. **Tier-0 Hot In-RAM Sticky State + SWA-Safe Snapshot Rewind**: Tracks `m_live_tokens`, `m_live_block_keys`, `m_live_vision_fp`, `m_last_h`, and turn-end snapshot (`m_turn_snap_pos`, `m_turn_snap_conv`, `m_turn_snap_last_h`), handling both exact prefix continuation (`start_idx == m_pos`) and SWA-safe snapshot rewind (`m_pos - m_turn_snap_pos <= 64 || m_pos <= 320`, `0.00 ms` restore).
+  3. **Tier-1 NVMe `.kvb` Restore & Checkpointing (`prefill_cached()`, `append_tokens()`, `commit_verify_t8()`)**: `reset_state_fast()` zeroes & flushes DMA surface buffers (`reset_dma_surfaces()`) to prevent stale-tail divergence while skipping `200+ MiB` `NumaKvBuffer::clear()`; checkpoints every 64-token boundary across prefill, `T=1` decode, and `T=8` PLD speculative verification (`m_conv_state_snaps[j_b]`); and executes exact `0`-suffix hits via `compute_logits_from_ptr(m_last_h.data())` (`7.07 ms`).
+  4. **Daemon Protocol, CLI & Gate**: Added `--cache-dir DIR`, `--cache-max-gb N`, `--no-prefix-cache`, `--verify-prefix-cache [FILE]`, REPL `/cache` & `/cache-clear`, daemon `{"cmd":"cache_stats"}` / `{"cmd":"cache_clear"}`, request options `cache`, `prompt_cache_key`, `pin_blocks_up_to`, `reasoning_tokens`, and cache telemetry fields on `logits`/`done` events, while seeding PLD `history` with the full prompt.
+- **Measured Acceptance Results**:
+  - **Host Unit Test (`test_prefix_cache`)**: `4/4` PASS in **`468.7 ms`** (`<= 2.0 s` gate).
+  - **`--verify-prefix-cache` on `roma` (`TP=2 INT8`, `3,828` tok `bench_c_code_4k.c`)**: **ALL 5/5 SUB-TESTS PASS** with **`Max Abs Logits Diff = 0.000000`** (`Cosine = 1.00000000`), **`4/4` exact greedy match**:
+    - Test 1 (`<256` Sec4 `glob_f32` `128/160` tok): `HIT_DISK`, `max_abs = 0.000000`, `cos = 1.00000000` **[PASS]**.
+    - Test 2 (`3,776 + 52` tok NVMe + suffix): `restore = 22.73 ms` (`8K extrapolated = 49.32 ms <= 50 ms`), `cold = 49,486.5 ms -> warm = 922.4 ms` (**`53.6×` speedup**), `max_abs = 0.000000`, `cos = 1.00000000`, `greedy = 4/4` **[PASS]**.
+    - Test 3 (`3,776 + 0` tok 0-suffix boundary): `restore = 22.49 ms`, `total = 7.07 ms`, `max_abs = 0.000000`, `cos = 1.00000000` **[PASS]**.
+    - Test 4a (`Tier-0 Direct 128->160`) & Test 4b (`Tier-0 Rewind 164->160`): `HIT_TIER0`, `restore = 0.00 ms`, `max_abs = 0.000000`, `cos = 1.00000000` **[PASS]**.
+  - **`--verify-golden golden_ref.bin` on `roma`**: PASS (`Min Layer Cosine = 0.98038221`, `Logits Cosine = 0.99243842`, `4/4` exact greedy, `13.38 tok/s`).
+  - **Daemon Multi-Turn Test on `roma` (`--speculative-pld --daemon 8099`)**: Turn 1 `MISS` (`49,550 ms`) -> Turn 2 **`HIT_TIER0`** (`3,875 / 3,899` tok, `0.000 ms` restore, **`670.8 ms` prefill = `73.9×` speedup**) -> Turn 3 `MISS` -> Turn 4 **`HIT_DISK`** (`3,776 / 3,813` tok, `22.24 ms` restore, **`806.3 ms` prefill = `61.5×` speedup**, **`pld_accepted = 11`** verbatim struct names); `cache_stats` + `cache_clear` verified (`62` blocks cleared) with clean `dmesg`.
 
 ---
 

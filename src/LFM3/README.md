@@ -43,14 +43,15 @@ sudo ./lfm3_v2 --int8 --pp2 --speculative-pld -f /tmp/test_pld_c_refactor.txt --
 # 2. Prompt from file (codebase analysis / benchmarking)
 sudo ./lfm3_v2 --int8 --tp2 -f bench_c_code_32k.c --no-think -n 4096 --max-ctx 36864
 
-# 3. Interactive terminal chat REPL (supports /image <path>, /nothink, /think <none|low|medium|high|xhigh|N>, /exit)
+# 3. Interactive terminal chat REPL (supports /image <path>, /nothink, /think <none|low|medium|high|xhigh|N>, /cache, /cache-clear, /exit)
 sudo ./lfm3_v2 --int8 --tp2 --speculative-pld --think-level medium
 
 # 4. Resident background daemon (listening on port 8088 for OpenAI server or d1_runner)
 sudo ./lfm3_v2 --int8 --tp2 --daemon 8088
 
-# 5. Full acceptance gate (golden numerical verification & determinism tests in both modes)
+# 5. Full acceptance gates (golden numerical verification & prefix cache bit-exactness in both modes)
 sudo ./lfm3_v2 --int8 --tp2 --verify-golden golden_ref.bin
+sudo ./lfm3_v2 --int8 --tp2 --verify-prefix-cache bench_c_code_4k.c
 sudo ./lfm3_v2 --int8 --pp2 --verify-golden golden_ref.bin
 
 # 6. Global attention kernel micro-benchmark
@@ -78,6 +79,10 @@ sudo ./lfm3_v2 --bench-attn
 | `--max-tokens N` | `-n` | `128` | Maximum new answer tokens to decode autoregressively. |
 | `--max-ctx N` | | `4096` | Context window size in tokens (supports up to `32768`–`40960` for 32K prompts). |
 | `--daemon [PORT]` | `--server` | `8088` | Run as resident socket daemon for the OpenAI REST server or `d1_runner.py`. |
+| `--cache-dir DIR` | | `~/.cache/romanaccio/kvcache` | Root directory for persistent NVMe `.kvb` prefix cache (`LFM3_CACHE_DIR` env override). |
+| `--cache-max-gb N` | | `256` | Prefix cache NVMe disk quota in GiB (leaf-first GDSF eviction with block pinning). |
+| `--no-prefix-cache` | | `false` | Disable Tier-0 RAM and Tier-1 NVMe prefix caching for uncached A/B benchmarks. |
+| `--verify-prefix-cache` | | `off` | Run Milestone 17B prefix-cache bit-exactness (`0.000000` diff) & latency gate (`[FILE]` optional). |
 | `--model-dir DIR` | `-m` | `.` | Directory containing `cpu_weights.bin`, `weights_die*.bin`, `embedding.bin`. |
 | `--system TEXT` | | `"You are a..."` | Custom system prompt for ChatML template. |
 | `--temp F` | | `0.1` | Sampling temperature ($F \ge 0.0$). |
@@ -207,7 +212,10 @@ cd /home/chri/models/LFM3-1.7B_ENNP
 sudo ./lfm3_v2 --int8 --daemon 8088
 ```
 
-The daemon keeps all weights resident in dual-die MMZ and listens on port `8088` for JSON-lines queries.
+The daemon keeps all weights resident in dual-die MMZ, maintains a Tier-0 RAM sticky turn cache plus persistent Tier-1 NVMe `.kvb` radix prefix cache (`53.6×–73.9×` faster repeat-prefix TTFT), and listens on port `8088` for JSON-lines queries:
+- **Request fields**: optional `"cache": false` (bypass for A/B benchmarks), `"prompt_cache_key": "<ns>"` (namespace isolation), and `"pin_blocks_up_to": N` (pin the first $N$ 64-token blocks).
+- **Response telemetry** (`logits` and `done` events): `cached_tokens`, `cached_tier0_tokens`, `cached_disk_tokens`, `computed_prompt_tokens`, `reasoning_tokens`, `cache_lookup_ms`, `cache_restore_ms`, `cache_status` (`HIT_TIER0` | `HIT_DISK` | `MISS` | `BYPASS`), `cache_tier` (`tier0_ram` | `tier1_nvme` | `none`), `pld_accepted`, `pld_drafted`, `pld_steps`.
+- **Control commands**: `{"cmd":"cache_stats"}` and `{"cmd":"cache_clear","include_pinned":false}`.
 
 ### 5.2 Start the OpenAI API Server (on host or board)
 

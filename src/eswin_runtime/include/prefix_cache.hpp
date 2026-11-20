@@ -260,10 +260,37 @@ private:
 
 inline uint64_t hash64_bytes(const void *data, size_t len, uint64_t seed = 0x517cc1b727220a95ULL) noexcept {
     if (!data || len == 0) return 0;
-    Hasher128 h(seed, seed ^ 0x9e3779b97f4a7c15ULL);
-    h.update(data, len);
-    Hash128 r = h.finalize();
-    return r.lo ^ r.hi;
+    const uint8_t *p = static_cast<const uint8_t *>(data);
+    uint64_t h0 = seed ^ 0x9e3779b97f4a7c15ULL;
+    uint64_t h1 = seed ^ 0xbf58476d1ce4e5b9ULL;
+    uint64_t h2 = seed ^ 0x94d049bb133111ebULL;
+    uint64_t h3 = seed ^ 0xa0761d6478bd642fULL;
+    size_t i = 0;
+    for (; i + 32 <= len; i += 32) {
+        uint64_t w0, w1, w2, w3;
+        std::memcpy(&w0, p + i +  0, 8);
+        std::memcpy(&w1, p + i +  8, 8);
+        std::memcpy(&w2, p + i + 16, 8);
+        std::memcpy(&w3, p + i + 24, 8);
+        h0 = (h0 ^ w0) * 0x9e3779b97f4a7c15ULL;
+        h1 = (h1 ^ w1) * 0xbf58476d1ce4e5b9ULL;
+        h2 = (h2 ^ w2) * 0x94d049bb133111ebULL;
+        h3 = (h3 ^ w3) * 0xa0761d6478bd642fULL;
+    }
+    for (; i + 8 <= len; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h0 = (h0 ^ w) * 0x9e3779b97f4a7c15ULL;
+    }
+    if (i < len) {
+        uint64_t tail = 0;
+        std::memcpy(&tail, p + i, len - i);
+        h1 = (h1 ^ tail) * 0xbf58476d1ce4e5b9ULL;
+    }
+    uint64_t r = (h0 ^ (h1 >> 1) ^ (h2 << 1) ^ h3) ^ static_cast<uint64_t>(len);
+    r ^= r >> 30; r *= 0xbf58476d1ce4e5b9ULL;
+    r ^= r >> 27; r *= 0x94d049bb133111ebULL;
+    return r ^ (r >> 31);
 }
 
 inline Hash128 hash128_bytes(const void *data, size_t len, uint64_t seed = 0xa0761d6478bd642fULL) noexcept {
@@ -552,6 +579,12 @@ public:
             write_snapshot_locked();
             m_initialized = false;
         }
+        if (m_ns_dir_fd >= 0) {
+#if defined(__unix__) || defined(__APPLE__)
+            ::close(m_ns_dir_fd);
+#endif
+            m_ns_dir_fd = -1;
+        }
     }
 
     bool init(const std::filesystem::path &root_dir,
@@ -567,42 +600,63 @@ public:
             return false;
         }
 
-        std::lock_guard<std::mutex> lk(m_mtx);
-        m_geom           = geom;
-        m_max_disk_bytes = max_disk_bytes;
-        m_ns_dir         = root_dir / sanitize_ns(geom.model_namespace);
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_geom           = geom;
+            m_max_disk_bytes = max_disk_bytes;
+            m_ns_dir         = root_dir / sanitize_ns(geom.model_namespace);
 
-        std::error_code ec;
-        std::filesystem::create_directories(m_ns_dir, ec);
-        if (ec) return false;
-
-        // Pre-create 256 fanout directories ("00" .. "ff") so background writes never contend on mkdir
-        static constexpr char kHex[] = "0123456789abcdef";
-        for (int i = 0; i < 256; ++i) {
-            char sub[3] = {kHex[(i >> 4) & 0xF], kHex[i & 0xF], '\0'};
-            std::filesystem::create_directories(m_ns_dir / sub, ec);
+            std::error_code ec;
+            std::filesystem::create_directories(m_ns_dir, ec);
             if (ec) return false;
+
+            // Pre-create 256 fanout directories ("00" .. "ff") so background writes never contend on mkdir
+            static constexpr char kHex[] = "0123456789abcdef";
+            for (int i = 0; i < 256; ++i) {
+                char sub[3] = {kHex[(i >> 4) & 0xF], kHex[i & 0xF], '\0'};
+                std::filesystem::create_directories(m_ns_dir / sub, ec);
+                if (ec) return false;
+            }
+
+#if defined(__unix__) || defined(__APPLE__)
+            m_ns_dir_fd = ::open(m_ns_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+#endif
+
+            m_snap_path = m_ns_dir / "index.snap";
+            m_wal_path  = m_ns_dir / "index.wal";
+
+            m_nodes.clear();
+            m_inflight_blobs.clear();
+            m_disk_bytes_used    = 0;
+            m_clock              = 0.0;
+            m_tick_seq           = 0;
+            m_total_lookups      = 0;
+            m_total_block_hits   = 0;
+            m_total_tokens_saved = 0;
+            m_total_evictions    = 0;
+
+            cleanup_orphan_temps_locked();
+            load_index_locked();
+
+            m_writer_stop = false;
+            m_writer_thread = std::thread([this]() { writer_loop(); });
+            m_initialized = true;
         }
 
-        m_snap_path = m_ns_dir / "index.snap";
-        m_wal_path  = m_ns_dir / "index.wal";
-
-        m_nodes.clear();
-        m_inflight_blobs.clear();
-        m_disk_bytes_used    = 0;
-        m_clock              = 0.0;
-        m_tick_seq           = 0;
-        m_total_lookups      = 0;
-        m_total_block_hits   = 0;
-        m_total_tokens_saved = 0;
-        m_total_evictions    = 0;
-
-        cleanup_orphan_temps_locked();
-        load_index_locked();
-
-        m_writer_stop = false;
-        m_writer_thread = std::thread([this]() { writer_loop(); });
-        m_initialized = true;
+        // Pre-warm per-thread restore scratch buffers so the very first restore_blocks() call
+        // incurs zero minor page faults across worker threads.
+#if defined(_OPENMP)
+        #pragma omp parallel
+        {
+            auto &buf = thread_restore_buf();
+            if (buf.size() < 2560 * 1024) buf.resize(2560 * 1024);
+        }
+#else
+        {
+            auto &buf = thread_restore_buf();
+            if (buf.size() < 2560 * 1024) buf.resize(2560 * 1024);
+        }
+#endif
         return true;
     }
 
@@ -746,24 +800,29 @@ public:
 
         // Snapshot any in-flight memory buffers under lock so file I/O runs completely lock-free
         std::vector<std::shared_ptr<const std::vector<uint8_t>>> mem_blobs(blocks_to_restore);
-        std::vector<std::string> paths(blocks_to_restore);
+        std::vector<std::string> paths;
+        int dir_fd = -1;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
+            dir_fd = m_ns_dir_fd;
+            if (dir_fd < 0) paths.resize(blocks_to_restore);
             for (int b = 0; b < blocks_to_restore; ++b) {
                 const Hash128 &k = hit.chain_keys[b];
                 auto it_mem = m_inflight_blobs.find(k);
                 if (it_mem != m_inflight_blobs.end()) {
                     mem_blobs[b] = it_mem->second;
                 }
-                paths[b] = (b < static_cast<int>(hit.hit_paths.size()))
-                           ? hit.hit_paths[b]
-                           : kvb_path_for(k).string();
+                if (dir_fd < 0) {
+                    paths[b] = (b < static_cast<int>(hit.hit_paths.size()))
+                               ? hit.hit_paths[b]
+                               : kvb_path_for(k).string();
+                }
             }
         }
 
         std::atomic<int> first_corrupt_blk{std::numeric_limits<int>::max()};
 
-        auto process_one_block = [&](int b) {
+        auto process_one_block = [&](int b, std::vector<uint8_t> &local_buf) {
             if (first_corrupt_blk.load(std::memory_order_relaxed) <= b) return;
 
             const bool read_swa      = (b >= swa_start_blk) && (m_geom.num_swa_layers > 0);
@@ -776,7 +835,6 @@ public:
             if (read_conv)     prefix_read_end = L.off_conv_f32 + L.len_conv_f32;
             if (read_glob_f32) prefix_read_end = L.off_glob_f32 + L.len_glob_f32;
 
-            std::vector<uint8_t> local_buf;
             const uint8_t *raw = nullptr;
             size_t avail_len = 0;
 
@@ -789,17 +847,26 @@ public:
                     return;
                 }
             } else {
+#if defined(__unix__) || defined(__APPLE__)
+                int fd = -1;
+                if (dir_fd >= 0) {
+                    char rel[48];
+                    format_kvb_rel_path(hit.chain_keys[b], rel);
+                    fd = ::openat(dir_fd, rel, O_RDONLY);
+                } else {
+                    fd = ::open(paths[b].c_str(), O_RDONLY);
+                }
+#else
                 int fd = ::open(paths[b].c_str(), O_RDONLY);
+#endif
                 if (fd < 0) {
                     int prev = first_corrupt_blk.load();
                     while (b < prev && !first_corrupt_blk.compare_exchange_weak(prev, b)) {}
                     return;
                 }
-#if defined(POSIX_FADV_SEQUENTIAL)
-                // Keep .kvb hot in Linux VFS page cache (NEVER POSIX_FADV_DONTNEED)
-                ::posix_fadvise(fd, 0, static_cast<off_t>(prefix_read_end), POSIX_FADV_SEQUENTIAL);
-#endif
-                local_buf.resize(prefix_read_end);
+                if (local_buf.size() < prefix_read_end) {
+                    local_buf.resize(prefix_read_end);
+                }
                 bool ok = detail::pread_exact(fd, local_buf.data(), prefix_read_end, 0);
                 // If need_glob_f32 is true for b < 4 and b != term_blk, prefix_read_end already
                 // spans [0 .. off_glob_f32 + len_glob_f32]. Close fd immediately.
@@ -810,7 +877,7 @@ public:
                     return;
                 }
                 raw = local_buf.data();
-                avail_len = local_buf.size();
+                avail_len = prefix_read_end;
             }
 
             // 1. Validate 256-byte KvbHeader & exact token/hash invariants
@@ -897,11 +964,20 @@ public:
         };
 
 #if defined(_OPENMP)
-        #pragma omp parallel for if(blocks_to_restore >= 4) schedule(dynamic, 1)
-#endif
-        for (int b = 0; b < blocks_to_restore; ++b) {
-            process_one_block(b);
+        #pragma omp parallel if(blocks_to_restore >= 2)
+        {
+            auto &tl_buf = thread_restore_buf();
+            #pragma omp for schedule(dynamic, 1)
+            for (int i = 0; i < blocks_to_restore; ++i) {
+                process_one_block(blocks_to_restore - 1 - i, tl_buf);
+            }
         }
+#else
+        auto &seq_buf = thread_restore_buf();
+        for (int b = blocks_to_restore - 1; b >= 0; --b) {
+            process_one_block(b, seq_buf);
+        }
+#endif
 
         const int bad = first_corrupt_blk.load();
         if (bad < blocks_to_restore) {
@@ -1199,6 +1275,33 @@ private:
             }
         }
         return out.empty() ? "default_model" : out;
+    }
+
+    static std::vector<uint8_t> &thread_restore_buf() {
+        static thread_local std::vector<uint8_t> buf;
+        return buf;
+    }
+
+    static void format_kvb_rel_path(const Hash128 &k, char out[48]) noexcept {
+        static constexpr char kHex[] = "0123456789abcdef";
+        const uint8_t dir_byte = static_cast<uint8_t>((k.hi >> 56) & 0xFFu);
+        out[0] = kHex[(dir_byte >> 4) & 0xFu];
+        out[1] = kHex[dir_byte & 0xFu];
+        out[2] = '/';
+        char *p = out + 3;
+        uint64_t words[2] = {k.hi, k.lo};
+        for (int w = 0; w < 2; ++w) {
+            uint64_t v = words[w];
+            for (int i = 15; i >= 0; --i) {
+                p[w * 16 + i] = kHex[v & 0xFu];
+                v >>= 4;
+            }
+        }
+        p[32] = '.';
+        p[33] = 'k';
+        p[34] = 'v';
+        p[35] = 'b';
+        p[36] = '\0';
     }
 
     std::filesystem::path kvb_path_for(const Hash128 &k) const {
@@ -1740,6 +1843,7 @@ private:
     std::filesystem::path m_ns_dir;
     std::filesystem::path m_snap_path;
     std::filesystem::path m_wal_path;
+    int                m_ns_dir_fd   = -1;
     bool               m_initialized = false;
 
     mutable std::mutex m_mtx;

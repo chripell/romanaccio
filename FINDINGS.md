@@ -3001,5 +3001,25 @@ During Milestone 16 evaluation on unseen multi-line Python code prompts (`"Can y
    | **Unseen Python Code Prompts (`roma`)** | Degraded prose / empty ```` ``` ```` | Broken fences / `enlist(s)` | **Valid executable Python** (`11.02 tok/s` palindrome `--no-think`; `10.64 tok/s` `--speculative-pld --think-level low` w/ `27.6%` PLD accept & exact host Python execution; `11.94 tok/s` linked list reverse) |
    | **Kernel / Journal Health** | Clean | Clean | Clean PMU DSP power logs; **`ZERO setDevice errors`** |
 
+---
+
+### 52.7 Milestone 17B: `LFM3` Hybrid Prefix Caching (`Tier-0` Sticky RAM + `Tier-1` NVMe `.kvb`) & Restore Latency Optimization
+
+1. **Architecture & Bit-Exact Invariants ([`lfm3_v2.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM3/lfm3_v2.cpp), [`prefix_cache.hpp`](file:///home/chri/aixigua/romanaccio/src/eswin_runtime/include/prefix_cache.hpp))**:
+   - **128-bit Model Fingerprinting**: `Lfm3Engine::init()` hashes `weights_die{0,1}.bin` 64 KiB FNV `head`/`mid`/`tail`, `cpu_weights.bin`, `quant_chan_scales.bin`, per-subgraph `SubgraphScaleInfo`, `embedding.bin` size/rows, and `tp_degree` (`b1e393da1d1e091f0271a044f4f61d40` for INT8 `TP=2`). When invoked under `sudo`, `resolve_default_cache_dir()` resolves `SUDO_USER`'s NVMe home (`~/.cache/romanaccio/kvcache`) rather than `/root` or tmpfs.
+   - **`reset_state_fast()` DMA Surface Hygiene**: Skipping the `200+ MiB` `NumaKvBuffer::clear()` on restore is safe because restored blocks and suffix `forward_chunk` overwrite all attended KV slots, whereas **zeroing & flushing the ~`2.2 MiB` DMA surface buffers (`reset_dma_surfaces()`) MUST be retained** to prevent §45.3 stale-tail divergence on partial chunks (`T_valid < 64`).
+   - **SWA Ring Rewind Bound**: Because `kSwaCap = 320` (`256 + 64`), in-RAM Tier-0 snapshot rewind (`Subcase 1B`) is valid iff `(m_pos - m_turn_snap_pos) <= 64 || m_pos <= 320`; longer generations fall through cleanly to Tier-1 NVMe `.kvb` restore.
+   - **64-Token Boundary Checkpointing across `T=1` & `T=8` PLD**: `commit_verify_t8()` tracks `m_verify_tokens` and checkpoints crossed `(m_pos % 64) == 0` boundaries using `m_conv_state_snaps[j_b]` and `m_buf_h + j_b * kHidden`; mid-turn forced `</think>` injection uses `append_tokens()` split across `kChunk = 64` boundaries.
+   - **Operational Note (`/proc/<pid>/comm`)**: Because `lfm3_v2` re-execs via `execv("/proc/self/exe", argv)` for `GOMP_SPINCOUNT=5000`, Linux reports `comm = "exe"`, so process supervision must match full cmdline (`pkill -f lfm3_v2`) rather than `pkill -x lfm3_v2`.
+
+2. **Prefix Restore Latency Optimization (`prefix_cache.hpp`, `~32.4 ms -> 22.73 ms` at 4K / `40.5–49.3 ms` @ 8K)**:
+   - Profiling `restore_blocks()` on SiFive P550 showed per-block `std::vector<uint8_t>` allocations (`14,300` minor faults/TLB shootdowns), single-threaded `hash64_bytes` WyMix128 (`13.37 ms` at 8K), and ascending block iteration (leaving the `1.65–2.26 MiB` SWA/Conv blocks at the tail) dominated wall time.
+   - Switching `hash64_bytes()` to a 4-lane unrolled multiply-XOR + SplitMix64 finalizer (`4.5 ms` at 8K, keeping `Hasher128` for keys), pre-warming OpenMP `thread_restore_buf()` buffers at `RadixCache::init()`, using `openat(m_ns_dir_fd, rel, O_RDONLY)` without per-block `posix_fadvise`, setting OpenMP threshold `>= 2` blocks, and iterating descending (`N-1 .. 0`) cut host `test_prefix_cache` to **`468.7 ms`** (`<= 2.0 s`) and `roma` 4K restore to **`22.24–22.73 ms` (`49.32 ms <= 50 ms` 8K linear extrapolation; `40.53 ms` measured on 128 real 8K blocks)**.
+
+3. **Silicon Verification Results (`roma`, `LFM3-1.7B_TP2`, `--verify-prefix-cache`, `--verify-golden`, & Daemon)**:
+   - **`--verify-prefix-cache` (`bench_c_code_4k.c`, `3,828` tok = `59 × 64 + 52`)**: **`5/5` SUB-TESTS PASS** — `Max Abs Logits Diff = 0.000000`, `Cosine = 1.00000000` across Test 1 (`<256` Sec4 `glob_f32`), Test 2 (`3,776 + 52` NVMe restore `22.73 ms` -> **`49,486.5 ms -> 922.4 ms` (`53.6×` speedup)**, **`4/4` greedy**), Test 3 (`3,776 + 0` 0-suffix `7.07 ms` total), Test 4a (Tier-0 `128->160`, `0.00 ms` restore), and Test 4b (Tier-0 rewind `164->160`, `0.00 ms` restore).
+   - **`--verify-golden golden_ref.bin`**: PASS (`0.98038221` min-layer, `0.99243842` logits, `DETERMINISM`/`SENSITIVITY`/`RESTORE` PASS, `4/4` exact greedy, `13.38 tok/s` decode).
+   - **Resident Daemon Multi-Turn + PLD (`--speculative-pld --daemon 8099`)**: Turn 1 `MISS` (`49,550 ms`) -> Turn 2 **`HIT_TIER0`** (`3,875 / 3,899` tok, `0.000 ms` restore, **`670.8 ms` prefill = `73.9×` speedup**) -> Turn 3 `MISS` -> Turn 4 **`HIT_DISK`** (`3,776 / 3,813` tok, `22.24 ms` restore, **`806.3 ms` prefill = `61.5×` speedup**, **`pld_accepted = 11`**); `cache_stats`/`cache_clear` (`62` blocks cleared) and `dmesg` completely clean.
+
 
 
