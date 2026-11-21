@@ -1,5 +1,6 @@
 """Local-first Python multi-model agent harness foundation for LFM3 / LFM2.5 on roma."""
 
+from .approvals import ApprovalManager, ApprovalOutcome, StageOutcome
 from .backend import (
     BackendDisconnectError,
     BackendError,
@@ -34,6 +35,7 @@ from .config import (
     SafetyLimits,
     validate_workspace_root,
 )
+from .gates import EvidenceGate, EvidenceGateVerdict, WriteGate, WriteGateVerdict
 from .paths import PathSandboxError, WorkspaceSandbox, WriteReceipt
 from .protocol import (
     ParsedAssistantTurn,
@@ -43,6 +45,7 @@ from .protocol import (
     parse_assistant_output,
     render_prompt,
 )
+from .router import INTENTS, INTENT_CRITERIA, IntentRouter, RouteDecision, heuristic_route
 from .store import HarnessStore
 from .tools import StagedWriteProposal, ToolExecutor, ToolResult, ToolSpec, get_tool_schemas
 
@@ -50,6 +53,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "APPROVAL_TTL_S",
+    "ApprovalManager",
+    "ApprovalOutcome",
     "BackendDisconnectError",
     "BackendEndpoint",
     "BackendError",
@@ -62,9 +67,14 @@ __all__ = [
     "DaemonEvent",
     "DecisionResult",
     "EVIDENCE_GATE_FLOOR",
+    "EvidenceGate",
+    "EvidenceGateVerdict",
     "GenerateRequest",
     "HarnessConfig",
     "HarnessStore",
+    "INTENTS",
+    "INTENT_CRITERIA",
+    "IntentRouter",
     "MAX_GATE_EVIDENCE_CHARS",
     "MAX_JOB_TURNS",
     "MAX_LIST_ENTRIES",
@@ -79,8 +89,10 @@ __all__ = [
     "PathSandboxError",
     "ROUTE_MIN_CONFIDENCE",
     "RenderedPrompt",
+    "RouteDecision",
     "SafetyLimits",
     "SessionBusyError",
+    "StageOutcome",
     "StagedWriteProposal",
     "TokenizerLookup",
     "ToolExecutor",
@@ -88,11 +100,14 @@ __all__ = [
     "ToolSpec",
     "WRITE_GATE_FLOOR",
     "WorkspaceSandbox",
+    "WriteGate",
+    "WriteGateVerdict",
     "WriteReceipt",
     "__version__",
     "build_pinned_system_prefix",
+    "get_tool_schemas",
+    "heuristic_route",
     "parse_assistant_output",
     "render_prompt",
-    "get_tool_schemas",
     "validate_workspace_root",
 ]

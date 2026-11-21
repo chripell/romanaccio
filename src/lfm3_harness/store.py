@@ -318,6 +318,19 @@ class HarnessStore:
         row = self.conn.execute("SELECT * FROM chat_actions WHERE id = ?", (action_id,)).fetchone()
         return dict(row) if row else None
 
+    def list_actions(self, session_id: str, *, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        if status is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM chat_actions WHERE session_id = ? AND status = ? ORDER BY created_at ASC, rowid ASC",
+                (session_id, status),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM chat_actions WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def transition_action(self, action_id: str, *, expected_status: str, new_status: str, error: str = "") -> bool:
         now = time.time()
         with self.conn:
