@@ -24,6 +24,7 @@ bin/
 /src/qwen2_fix/es_qwen2
 /src/qwen2_v2/qwen2_v2
 /src/LFM3/lfm3_v2
+/src/LFM2.5-8B-A1B/lfm2_moe
 
 # Python artifacts and caches
 __pycache__/

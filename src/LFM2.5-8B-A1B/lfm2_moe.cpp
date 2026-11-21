@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -3442,6 +3443,7 @@ public:
     float* logits_mut() { return m_logits.data(); }
     const Tokenizer& tokenizer() const { return m_tokenizer; }
     int pos() const { return m_pos; }
+    int max_ctx() const { return m_max_ctx; }
     bool is_quant_active() const { return m_layer_npu[0].op_in_scale.in_dtype != BoundaryDtype::Fp16; }
 
     // Standalone Attention Microbenchmark at 512, 4096, and 32768 context (PLAN.md Milestone 4 Gate)
@@ -4848,11 +4850,36 @@ static std::string format_lfm3_chat(const std::string &user_prompt,
 // like ' uint64' or ' uint32') and ensures 4-space indentation splits into '   ' + ' word'
 // identically to the model's generated token stream.
 static std::vector<int32_t> encode_lfm3_text(const Tokenizer &tok, const std::string &text) {
-    static const char *const kSpecials[] = {
-        "<|startoftext|>", "<|im_start|>", "<|im_end|>",
-        "<|vision_start|>", "<|vision_end|>", "<|image|>",
+    static const char *const kAllSpecials[] = {
+        "<|tool_list_start|>", "<|tool_list_end|>",
+        "<|tool_call_start|>", "<|tool_call_end|>",
+        "<additional_tools>", "</additional_tools>",
+        "<tool_response>", "</tool_response>",
+        "<tool_call>", "</tool_call>",
+        "<parameter=", "</parameter>",
+        "<function=", "</function>",
+        "<tools>", "</tools>",
+        "<|vision_start|>", "<|vision_end|>",
+        "<|startoftext|>", "<|endoftext|>",
+        "<|im_start|>", "<|im_end|>",
+        "<|audio_start|>", "<|audio_out|>",
+        "<|audio|>", "<|image|>", "<|video|>",
         "</think>", "<think>"
     };
+    struct ActiveSpecial {
+        const char *str;
+        size_t len;
+        int32_t id;
+    };
+    std::vector<ActiveSpecial> active_specials;
+    active_specials.reserve(sizeof(kAllSpecials) / sizeof(kAllSpecials[0]));
+    for (const char *sp : kAllSpecials) {
+        size_t slen = std::strlen(sp);
+        int32_t id = tok.piece_to_id(std::string(sp, slen));
+        if (id >= 0) {
+            active_specials.push_back({sp, slen, id});
+        }
+    }
     auto is_alpha_b = [](uint8_t b) { return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= 128); };
     auto is_digit_b = [](uint8_t b) { return (b >= '0' && b <= '9'); };
     auto is_space_b = [](uint8_t b) { return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'; };
@@ -4864,28 +4891,25 @@ static std::vector<int32_t> encode_lfm3_text(const Tokenizer &tok, const std::st
     size_t i = 0;
 
     while (i < N) {
-        // 1. Match special tokens atomically
+        // 1. Match active special tokens atomically
         bool matched_sp = false;
-        for (const char *sp : kSpecials) {
-            size_t slen = std::strlen(sp);
-            if (i + slen <= N && std::memcmp(text.data() + i, sp, slen) == 0) {
-                int32_t id = tok.piece_to_id(std::string(sp, slen));
-                if (id >= 0) {
-                    out.push_back(id);
-                    i += slen;
-                    matched_sp = true;
-                    break;
-                }
+        for (const auto &sp : active_specials) {
+            if (i + sp.len <= N && std::memcmp(text.data() + i, sp.str, sp.len) == 0) {
+                out.push_back(sp.id);
+                i += sp.len;
+                matched_sp = true;
+                break;
             }
         }
         if (matched_sp) continue;
 
-        // 2. Find end of normal chunk before next special token
+        // 2. Find end of normal chunk before next active special token
         size_t chunk_end = N;
-        for (const char *sp : kSpecials) {
-            size_t pos = text.find(sp, i);
+        for (const auto &sp : active_specials) {
+            size_t pos = text.find(sp.str, i);
             if (pos != std::string::npos && pos < chunk_end) chunk_end = pos;
         }
+        if (chunk_end == i) chunk_end = i + 1;
 
         // 3. Segment [i .. chunk_end) into GPT-2 / Llama-3 pre-tokens and encode each span
         size_t p = i;
@@ -5019,6 +5043,35 @@ static void draft_pld(const std::vector<int32_t> &history, int max_k,
     }
 }
 
+static bool send_nosig(int fd, const std::string &data) {
+    size_t sent = 0;
+    const char *ptr = data.data();
+    const size_t len = data.size();
+    while (sent < len) {
+#if defined(MSG_NOSIGNAL)
+        ssize_t n = send(fd, ptr + sent, len - sent, MSG_NOSIGNAL);
+#else
+        ssize_t n = send(fd, ptr + sent, len - sent, 0);
+#endif
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool is_client_disconnected(int fd) {
+    char peek = 0;
+    ssize_t r = recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) return true;
+    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        return true;
+    }
+    return false;
+}
+
 static void run_daemon_server(Lfm3Engine &engine, int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -5091,7 +5144,7 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         auto j = eswin::JsonValue::parse(req_line, parse_err);
         if (!parse_err.empty() || !j.is_object()) {
             std::string err_resp = "{\"type\":\"error\",\"message\":\"Invalid JSON request: " + parse_err + "\"}\n";
-            send(client_fd, err_resp.data(), err_resp.size(), 0);
+            send_nosig(client_fd, err_resp);
             close(client_fd);
             continue;
         }
@@ -5132,8 +5185,7 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                    << ",\"tier0_tokens_saved\":" << engine.tier0_tokens_saved()
                    << ",\"tier0_live_tokens\":" << engine.live_tokens_count()
                    << "}\n";
-                std::string cs_resp = cs.str();
-                send(client_fd, cs_resp.data(), cs_resp.size(), 0);
+                send_nosig(client_fd, cs.str());
                 close(client_fd);
                 continue;
             } else if (cmd == "cache_clear") {
@@ -5142,13 +5194,13 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                 std::string clr = "{\"type\":\"cache_cleared\",\"removed_blocks\":" +
                                   std::to_string(removed) + ",\"include_pinned\":" +
                                   (include_pinned ? "true" : "false") + "}\n";
-                send(client_fd, clr.data(), clr.size(), 0);
+                send_nosig(client_fd, clr);
                 close(client_fd);
                 continue;
             } else {
                 std::string err_resp = "{\"type\":\"error\",\"message\":\"Unknown cmd: " +
                                        escape_json_str(cmd) + "\"}\n";
-                send(client_fd, err_resp.data(), err_resp.size(), 0);
+                send_nosig(client_fd, err_resp);
                 close(client_fd);
                 continue;
             }
@@ -5158,10 +5210,31 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         int max_new_tokens = j["max_tokens"].as_int(128);
         float temperature = static_cast<float>(j["temperature"].as_double(0.1));
         int top_k = j["top_k"].as_int(50);
+        float repeat_penalty = static_cast<float>(j["repeat_penalty"].as_double(1.05));
+        repeat_penalty = std::max(0.5f, std::min(3.0f, repeat_penalty));
+        int think_budget = std::max(0, j["think_budget"].as_int(0));
         bool no_think = j["no_think"].as_bool(true);
         bool raw = j["raw"].as_bool(false);
         bool return_logits = j["return_logits"].as_bool(false) || (max_new_tokens == 0);
         int image_bytes = j["image_bytes"].as_int(0);
+
+        std::vector<std::string> stop_seqs;
+        if (j["stop"].is_string()) {
+            std::string s = j["stop"].as_string("");
+            if (!s.empty() && s.size() <= 256) stop_seqs.push_back(s);
+        } else if (j["stop"].is_array()) {
+            for (const auto &sv : j["stop"].as_array()) {
+                if (sv.is_string()) {
+                    std::string s = sv.as_string("");
+                    if (!s.empty() && s.size() <= 256) {
+                        stop_seqs.push_back(s);
+                        if (stop_seqs.size() >= 16) break;
+                    }
+                }
+            }
+        }
+        size_t max_stop_len = 0;
+        for (const auto &s : stop_seqs) max_stop_len = std::max(max_stop_len, s.size());
 
         Lfm3Engine::PrefixCacheOptions cache_opts;
         cache_opts.enabled = j.has("cache") ? j["cache"].as_bool(true) : true;
@@ -5188,7 +5261,7 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         SamplerParams sp;
         sp.temperature = temperature;
         sp.top_k = top_k;
-        sp.repeat_penalty = 1.05f;
+        sp.repeat_penalty = repeat_penalty;
         sp.repeat_window = 64;
         sp.max_consecutive_duplicates = 4;
         Sampler sampler(sp);
@@ -5209,7 +5282,7 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
 
         if (!engine.prefill_cached(prompt_ids, prefill_t, cache_opts, cache_tel, vis_ptr, num_vis_tok)) {
             std::string err_resp = "{\"type\":\"error\",\"message\":\"Prefill failed on NPU\"}\n";
-            send(client_fd, err_resp.data(), err_resp.size(), 0);
+            send_nosig(client_fd, err_resp);
             g_in_generation.store(false);
             close(client_fd);
             continue;
@@ -5239,13 +5312,19 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                 }
             }
             l_ss << "}}\n";
-            std::string l_resp = l_ss.str();
-            send(client_fd, l_resp.data(), l_resp.size(), 0);
+            send_nosig(client_fd, l_ss.str());
             g_in_generation.store(false);
             close(client_fd);
             std::printf("[Daemon] Decision query completed: %zu prompt tok (cache %s %d/%zu), %.1f ms prefill\n",
                         prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(),
                         prompt_ids.size(), prefill_t.total_ms());
+            continue;
+        }
+
+        if (is_client_disconnected(client_fd)) {
+            g_in_generation.store(false);
+            close(client_fd);
+            std::printf("[Daemon] Client disconnected after prefill, skipping decode\n");
             continue;
         }
 
@@ -5262,14 +5341,15 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                  << ",\"cache_tier\":\"" << cache_tel.tier << "\""
                  << ",\"prefill_ms\":" << prefill_t.total_ms()
                  << "}\n";
-            std::string p_ev = p_ss.str();
-#if defined(MSG_NOSIGNAL)
-            send(client_fd, p_ev.data(), p_ev.size(), MSG_NOSIGNAL);
-#else
-            send(client_fd, p_ev.data(), p_ev.size(), 0);
-#endif
+            if (!send_nosig(client_fd, p_ss.str())) {
+                g_in_generation.store(false);
+                close(client_fd);
+                std::printf("[Daemon] Client disconnected sending prefill_done\n");
+                continue;
+            }
         }
 
+        const std::vector<int32_t> force_close_ids = encode_lfm3_text(engine.tokenizer(), "\n</think>\n\n");
         int step = 0;
         int reasoning_tokens = 0;
         bool in_think = !no_think;
@@ -5289,19 +5369,148 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         bool has_pre_sampled = false;
         int32_t pre_sampled_id = 0;
         int pld_steps = 0, pld_drafted = 0, pld_accepted = 0;
+        bool last_ended_punct = false;
+        bool last_ended_nl = false;
+        std::string pending_buf;
+        std::string finish_reason = "length";
+        std::string stopped_by;
+        bool aborted = false;
 
-        auto send_tok_event = [&](int32_t tok_id) -> bool {
-            std::string piece = engine.tokenizer().decode_token(tok_id);
+        auto send_text_event = [&](int32_t tok_id, const std::string &text, bool is_thinking) -> bool {
+            if (text.empty()) return true;
             std::string tok_event = "{\"type\":\"token\",\"token_id\":" + std::to_string(tok_id) +
-                                    ",\"text\":\"" + escape_json_str(piece) + "\"}\n";
-#if defined(MSG_NOSIGNAL)
-            return send(client_fd, tok_event.data(), tok_event.size(), MSG_NOSIGNAL) >= 0;
-#else
-            return send(client_fd, tok_event.data(), tok_event.size(), 0) >= 0;
-#endif
+                                    ",\"text\":\"" + escape_json_str(text) + "\"" +
+                                    ",\"thinking\":" + (is_thinking ? "true" : "false") + "}\n";
+            return send_nosig(client_fd, tok_event);
         };
 
-        for (; step < max_new_tokens && !g_interrupt_flag.load(); ++step) {
+        auto apply_think_logit_rules = [&]() {
+            float *lg = engine.logits_mut();
+            lg[124901] = -1e30f;
+            if (!in_think) {
+                lg[124902] = -1e30f;
+                return;
+            }
+            if (think_budget > 0) {
+                int soft_start = (think_budget * 3) / 4;
+                if (reasoning_tokens >= soft_start) {
+                    float frac = static_cast<float>(reasoning_tokens - soft_start) /
+                                 static_cast<float>(std::max(1, think_budget - soft_start));
+                    float boost = std::min(12.0f, 3.0f + 9.0f * frac);
+                    if (reasoning_tokens >= think_budget && last_ended_punct) {
+                        boost += 18.0f;
+                    }
+                    lg[124902] += boost;
+                }
+            }
+        };
+
+        auto handle_generated_token = [&](int32_t tok_id) -> bool {
+            if (tok_id == 124902) { // </think>
+                if (in_think) {
+                    in_think = false;
+                    if (!send_nosig(client_fd, "{\"type\":\"think_end\"}\n")) {
+                        aborted = true;
+                        finish_reason = "aborted";
+                        return false;
+                    }
+                }
+                return true;
+            }
+            std::string piece = engine.tokenizer().decode_token(tok_id);
+            if (!piece.empty()) {
+                char back = piece.back();
+                last_ended_nl = (back == '\n');
+                last_ended_punct = (back == '.' || back == '!' || back == '?' || back == '\n');
+            }
+            if (in_think) {
+                reasoning_tokens++;
+                if (!send_text_event(tok_id, piece, true)) {
+                    aborted = true;
+                    finish_reason = "aborted";
+                    return false;
+                }
+                return true;
+            }
+            if (stop_seqs.empty()) {
+                if (!send_text_event(tok_id, piece, false)) {
+                    aborted = true;
+                    finish_reason = "aborted";
+                    return false;
+                }
+                return true;
+            }
+            pending_buf += piece;
+            size_t earliest_pos = std::string::npos;
+            std::string matched_stop;
+            for (const auto &s : stop_seqs) {
+                size_t pos = pending_buf.find(s);
+                if (pos != std::string::npos) {
+                    if (pos < earliest_pos || (pos == earliest_pos && s.size() > matched_stop.size())) {
+                        earliest_pos = pos;
+                        matched_stop = s;
+                    }
+                }
+            }
+            if (earliest_pos != std::string::npos) {
+                if (earliest_pos > 0) {
+                    if (!send_text_event(tok_id, pending_buf.substr(0, earliest_pos), false)) {
+                        pending_buf.clear();
+                        aborted = true;
+                        finish_reason = "aborted";
+                        return false;
+                    }
+                }
+                pending_buf.clear();
+                finish_reason = "stop";
+                stopped_by = matched_stop;
+                return false;
+            }
+            if (max_stop_len > 1 && pending_buf.size() > max_stop_len - 1) {
+                size_t safe_len = pending_buf.size() - (max_stop_len - 1);
+                if (!send_text_event(tok_id, pending_buf.substr(0, safe_len), false)) {
+                    pending_buf.clear();
+                    aborted = true;
+                    finish_reason = "aborted";
+                    return false;
+                }
+                pending_buf.erase(0, safe_len);
+            }
+            return true;
+        };
+
+        for (; step < max_new_tokens && engine.pos() < engine.max_ctx() - 8; ) {
+            if (g_interrupt_flag.load() || is_client_disconnected(client_fd)) {
+                aborted = true;
+                finish_reason = "aborted";
+                break;
+            }
+
+            if (in_think && think_budget > 0 &&
+                (reasoning_tokens >= think_budget + 24 || (reasoning_tokens >= think_budget && last_ended_nl))) {
+                in_think = false;
+                has_pre_sampled = false;
+                if (!send_nosig(client_fd, "{\"type\":\"think_end\"}\n")) {
+                    aborted = true;
+                    finish_reason = "aborted";
+                    break;
+                }
+                if (engine.pos() + static_cast<int>(force_close_ids.size()) >= engine.max_ctx()) {
+                    finish_reason = "length";
+                    break;
+                }
+                if (!engine.append_tokens(force_close_ids.data(), static_cast<int>(force_close_ids.size()), true, decode_t)) {
+                    break;
+                }
+                for (int32_t cid : force_close_ids) {
+                    sampler.accept(cid);
+                    history.push_back(cid);
+                }
+            }
+
+            if (!has_pre_sampled) {
+                apply_think_logit_rules();
+            }
             int32_t next_id = has_pre_sampled
                 ? pre_sampled_id
                 : sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
@@ -5309,17 +5518,19 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
             sampler.accept(next_id);
             history.push_back(next_id);
 
-            if (next_id == 124900 || next_id == 124895) break; // <|im_end|> or <|endoftext|>
-            if (next_id == 124902) {                           // </think>
-                in_think = false;
-            } else {
-                if (in_think) reasoning_tokens++;
-                if (!send_tok_event(next_id)) break;
+            if (next_id == 124900 || next_id == 124895) { // <|im_end|> or <|endoftext|>
+                finish_reason = "stop";
+                break;
             }
+            bool keep_going = handle_generated_token(next_id);
+            step++;
+            if (!keep_going) break;
 
-            if (step + 1 < max_new_tokens) {
-                int rem = max_new_tokens - (step + 1);
-                if (engine.is_speculative_pld() && rem >= 2) {
+            if (step < max_new_tokens && engine.pos() < engine.max_ctx() - 8) {
+                int rem = max_new_tokens - step;
+                bool allow_pld = engine.is_speculative_pld() && rem >= 2 &&
+                                 !(in_think && think_budget > 0 && reasoning_tokens >= (think_budget * 3) / 4);
+                if (allow_pld) {
                     draft_pld(history, std::min(engine.pld_max_k(), rem), draft);
                 } else {
                     draft.clear();
@@ -5343,29 +5554,35 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                             break;
                         }
                         if (j < B - 1) {
+                            apply_think_logit_rules();
                             int32_t pred_id = sampler.sample(engine.logits_mut(), Lfm3Engine::kVocab);
                             if (pred_id == cand[j + 1]) {
+                                if (g_interrupt_flag.load() || is_client_disconnected(client_fd)) {
+                                    engine.commit_verify_t8(j, decode_t);
+                                    aborted = true;
+                                    finish_reason = "aborted";
+                                    stop_gen = true;
+                                    break;
+                                }
                                 pld_accepted++;
-                                step++;
                                 sampler.accept(pred_id);
                                 history.push_back(pred_id);
                                 if (pred_id == 124900 || pred_id == 124895) {
                                     engine.commit_verify_t8(j, decode_t);
+                                    finish_reason = "stop";
                                     stop_gen = true;
                                     break;
                                 }
-                                if (pred_id == 124902) {
-                                    in_think = false;
-                                } else {
-                                    if (in_think) reasoning_tokens++;
-                                    if (!send_tok_event(pred_id)) {
-                                        engine.commit_verify_t8(j, decode_t);
-                                        stop_gen = true;
-                                        break;
-                                    }
-                                }
-                                if (step + 1 >= max_new_tokens) {
+                                bool cont = handle_generated_token(pred_id);
+                                step++;
+                                if (!cont) {
                                     engine.commit_verify_t8(j, decode_t);
+                                    stop_gen = true;
+                                    break;
+                                }
+                                if (step >= max_new_tokens) {
+                                    engine.commit_verify_t8(j, decode_t);
+                                    finish_reason = "length";
                                     stop_gen = true;
                                     break;
                                 }
@@ -5385,6 +5602,17 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         }
         g_in_generation.store(false);
 
+        if (aborted) {
+            close(client_fd);
+            std::printf("[Daemon] Client disconnected mid-turn, aborted at step %d\n", step);
+            continue;
+        }
+
+        if (!pending_buf.empty()) {
+            send_text_event(-1, pending_buf, false);
+            pending_buf.clear();
+        }
+
         std::ostringstream d_ss;
         d_ss << "{\"type\":\"done\",\"prompt_tokens\":" << prompt_ids.size()
              << ",\"cached_tokens\":" << cache_tel.cached_tokens()
@@ -5393,7 +5621,11 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
              << ",\"computed_prompt_tokens\":" << cache_tel.computed_prompt_tokens
              << ",\"reasoning_tokens\":" << reasoning_tokens
              << ",\"completion_tokens\":" << step
-             << ",\"prefill_ms\":" << prefill_t.total_ms()
+             << ",\"finish_reason\":\"" << finish_reason << "\"";
+        if (!stopped_by.empty()) {
+            d_ss << ",\"stopped_by\":\"" << escape_json_str(stopped_by) << "\"";
+        }
+        d_ss << ",\"prefill_ms\":" << prefill_t.total_ms()
              << ",\"decode_ms\":" << decode_t.total_ms()
              << ",\"cache_lookup_ms\":" << cache_tel.lookup_ms
              << ",\"cache_restore_ms\":" << cache_tel.restore_ms
@@ -5403,22 +5635,17 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
              << ",\"pld_drafted\":" << pld_drafted
              << ",\"pld_steps\":" << pld_steps
              << "}\n";
-        std::string done_event = d_ss.str();
-#if defined(MSG_NOSIGNAL)
-        send(client_fd, done_event.data(), done_event.size(), MSG_NOSIGNAL);
-#else
-        send(client_fd, done_event.data(), done_event.size(), 0);
-#endif
+        send_nosig(client_fd, d_ss.str());
         close(client_fd);
         if (pld_steps > 0) {
-            std::printf("[Daemon] Turn completed: %zu prompt tok (cache %s %d/%zu, restore %.2f ms, %.1f ms prefill), %d decode tok (%.1f ms = %.2f tok/s | PLD accepted %d/%d across %d steps)\n",
-                        prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
+            std::printf("[Daemon] Turn completed (%s): %zu prompt tok (cache %s %d/%zu, restore %.2f ms, %.1f ms prefill), %d decode tok (%.1f ms = %.2f tok/s | PLD accepted %d/%d across %d steps)\n",
+                        finish_reason.c_str(), prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
                         cache_tel.restore_ms, prefill_t.total_ms(), step, decode_t.total_ms(),
                         decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0,
                         pld_accepted, pld_drafted, pld_steps);
         } else {
-            std::printf("[Daemon] Turn completed: %zu prompt tok (cache %s %d/%zu, restore %.2f ms, %.1f ms prefill), %d decode tok (%.1f ms = %.2f tok/s)\n",
-                        prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
+            std::printf("[Daemon] Turn completed (%s): %zu prompt tok (cache %s %d/%zu, restore %.2f ms, %.1f ms prefill), %d decode tok (%.1f ms = %.2f tok/s)\n",
+                        finish_reason.c_str(), prompt_ids.size(), cache_tel.status.c_str(), cache_tel.cached_tokens(), prompt_ids.size(),
                         cache_tel.restore_ms, prefill_t.total_ms(), step, decode_t.total_ms(),
                         decode_t.total_ms() > 0 ? (1000.0 * step / decode_t.total_ms()) : 0.0);
         }
