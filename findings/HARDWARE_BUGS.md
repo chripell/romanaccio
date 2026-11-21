@@ -8,7 +8,7 @@ Comprehensive reference catalog of silicon defects, kernel driver bugs, userspac
 
 | ID | Component / Layer | Severity | Core Defect / Trigger | Verified Mitigation / Workaround | Primary Reference |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **HW-01** | Die 0 NPU Silicon (`51c00000.eswin-npu`) | **CRITICAL** | Intermittent timing margin fault at `1.50 GHz` on `W16A16` `down_proj` in NVDLA PEC column #2 (`t % 8 in {4, 5}`) | Bypass slots `{4, 5}` (`kT8SafeSlots = {0,1,2,3,6,7}` in `lfm2_moe.cpp`), or cap Die 0 at `1.04 GHz` | [`FINDINGS.md` §52.8](../FINDINGS.md) |
+| **HW-01** | Die 0 NPU Silicon (`51c00000.eswin-npu`) | **CRITICAL** | Intermittent dynamic timing margin collapse at `1.50 GHz @ 1050 mV` (`llc=1188 MHz`) on `W16A16` `down_proj` under 8/8-slot load, striking **both** PEC column #0 (`t % 8 in {0, 1}`) and PEC column #2 (`t % 8 in {4, 5}`) | Bypass slots `{4, 5}` (`kT8SafeSlots = {0,1,2,3,6,7}` in `lfm2_moe.cpp`: `0/10,000` deterministic soak), or cap Die 0 at `1.04 GHz @ 900 mV` (`0/2,000` at 8/8); multi-seed `safe6` soak pending | [`FINDINGS.md` §52.8](../FINDINGS.md) |
 | **HW-02** | `libes_memory.so` (`ES_SYS_MemFlushCache`) | **HIGH** | Buffers `> 1 MiB` flush **only** target `nid` CPU caches (`SYS_MemFlushCacheAllByNid`); smaller buffers flush whole allocation (`DMA_BUF_IOCTL_SYNC`) | Pin filling thread to Core `0` (Die 0) / Core `4` (Die 1) before `flush_cache()`; use compact geometry surfaces (`-58.7 ms/tok`) | [`FINDINGS.md` §44, §47.1, §52.8](../FINDINGS.md) |
 | **HW-03** | Linux Kernel (`eswin_rsvmem_heap_mmap`) | **CRITICAL** | 32-bit signed truncation (`sext.w a3, s2` at `0xffffffff80d00f86`) corrupts `mmap()` lengths `>= 2.0 GiB` | Split MMZ allocations into `< 2.0 GiB` chunks (`m_w_blob[2][3]`), abort on MMZ failure (no OS RAM fallback), `POSIX_FADV_DONTNEED` on weight reads | [`FINDINGS.md` §52.1](../FINDINGS.md) |
 | **HW-04** | Kernel Driver (`eic7700_npu.ko`) | **CRITICAL** | Hard 62-model/die ceiling; missing `ERR_PTR(-EINVAL)` check causes `destroy_frame.part.0+0x68/0x140` kernel Oops + multi-thread `submitSync` stalls | Route D Class B shared archetypes (`12–16 / 62` loadables/die) + isolated per-die `WorkerPool` processes | [`FINDINGS.md` §33.3–§33.4](../FINDINGS.md) |
@@ -18,25 +18,29 @@ Comprehensive reference catalog of silicon defects, kernel driver bugs, userspac
 
 ---
 
-## HW-01 — Die 0 NPU `1.50 GHz` Timing Margin Hazard (`W16A16` `down_proj`, PEC Column #2: `t % 8 in {4, 5}`)
+## HW-01 — Die 0 NPU `1.50 GHz` Dynamic Timing Margin Hazard (`W16A16` `down_proj`, PEC Columns #0 & #2: `t % 8 in {0, 1, 4, 5}`)
 
 - **Severity**: **CRITICAL** (silent intermittent numerical corruption at full stock `1.50 GHz` clock).
-- **Affected Hardware**: `roma` Die 0 NPU (`51c00000.eswin-npu`). Identical Die 1 NPU (`71c00000.eswin-npu`) exhibited **zero** errors (`0 / 2,000`) on bit-identical weights and inputs.
+- **Affected Hardware**: `roma` Die 0 NPU (`51c00000.eswin-npu`). Identical Die 1 NPU (`71c00000.eswin-npu`) exhibited **zero** errors (`0 / 2,000` and `0 / 356` experts in Stage 1B) on bit-identical weights and inputs.
 - **Operating Environment Observed**:
-  - `/sys/class/devfreq/51c00000.eswin-npu`: OPP table `520000000 / 750000000 / 1040000000 / 1500000000` Hz (`simple_ondemand` governor, stock `cur_freq = max_freq = 1500000000`).
-  - Operating board temperatures: `~47–50°C` (no thermal throttling involved).
+  - `/proc/device-tree/opp-table@npu` & devfreq (`51c00000.eswin-npu` / `71c00000.eswin-npu`, `simple_ondemand` governor, stock `cur_freq = max_freq = 1500000000`):
+    - `520 MHz @ 800 mV`
+    - `750 MHz @ 800 mV`
+    - `1.04 GHz @ 900 mV` (`llc clk rate: 800000000` per `dmesg`)
+    - `1.50 GHz @ 1050 mV` (`llc clk rate: 1188000000` per `dmesg`)
+  - Regulators (read-only): `/sys/class/regulator/regulator.5` (`NPU_SVCC`, Die 0) and `/sys/class/regulator/regulator.6` (`NPU_SVCC2`, Die 1), both `uV=1050000` (`min=700000`, `max=1120000`) at `1.50 GHz`.
+  - Operating board temperatures across Stage 1–2 sustained loads: `tz0 = 47.2–52.8°C`, `tz1 = 41.8–49.0°C` (no thermal throttling).
   - `/sys/module/eic7700_npu/parameters/*`: `frame_timeout=1000000`, `loop_buf_cnt=1500`, `loop_buf_enable=0`, `npu_debug_control=1`, `npu_dump_data_enable=1`.
 
-### Exact Failure Signature
+### Initial Failure Signature (`3,818`-Token `LFM2.5` Determinism Probe)
 During 4K-token (`3,818` tokens) prefix-cache determinism testing of `LFM2.5-8B-A1B` (`lfm2_moe`), two consecutive cold prefill passes diverged intermittently at full `1.50 GHz` (`chunk=2, pos=128, L12, stage=EXP_D0, die=0, e=12`). Bit-level inspection of the `lfm2_expert_mlp_t8_classb.model` INT16 output (`[C=2048, T=8]`) showed:
-- Errors occur with **~1%–2.75% probability** on Die 0 `L12 e=12` `mlp_t8` (`ops 48..67`, the `W16A16` `down_proj` split-M blocks), while earlier `mlp_t64` diagnostics on Die 0 also hit slots `t=[12..13]` and `t=[28..29]` — **always `t % 8 in {4, 5}`**, corresponding to **PEC column #2**.
-- Every recorded mismatch struck **one** of three 256-channel `splitM` blocks:
+- Errors occur with **~1%–2.75% probability** on Die 0 `L12 e=12` `mlp_t8` (`ops 48..67`, the `W16A16` `down_proj` split-M blocks), while earlier `mlp_t64` diagnostics on Die 0 also hit slots `t=[12..13]` and `t=[28..29]` (`t % 8 in {4, 5}`, PEC column #2).
+- Every recorded `L12 e=12` mismatch struck **one** of three 256-channel `splitM` blocks:
   - `c=[0..255]`: `n_diff=179` in `t=[4..5]`
   - `c=[258..511]`: `n_diff=192`, `cnt_t=[0,0,0,0,96,96,0,0]`, `cnt_cg=4:52 5:50 6:47 7:43` (`diffs_t03 = 0`)
   - `c=[1024..1279]`: `n_diff=206`, `cnt_t=[0,0,0,0,103,103,0,0]`, `cnt_cg=16:46 17:48 18:55 19:57` (`diffs_t03 = 0`)
-- Zero mismatches were ever observed on token slots `t % 8 in {0, 1, 2, 3, 6, 7}`.
 
-### Controlled Isolation Matrix (`N = 2,000` Iterations Each)
+### Controlled Isolation Matrix (`L12 e=12`, `N = 2,000` Iterations Each)
 
 1. **Coherency & Archetype Isolation (`LFM2_STRESS_EXP` Conditions A–E, `5,000×2` at `1.50 GHz`)**:
    - `CondA` (`mlp_t8`, `CacheMode::Cached`, Dual-Die): `die0=4` (`id=12`, `t=[4..5]`, `reflush_diff=n_diff`, `resubmit_diff=0`), `die1=0`.
@@ -54,19 +58,43 @@ During 4K-token (`3,818` tokens) prefix-cache determinism testing of `LFM2.5-8B-
 | `T1c` | Dual-die alternating (`Die 0: e=10,12`, `Die 1: e=11,13`) | **`mis_target=55`**, `t03=0`, `t47=10918` | **`mis_target=0`**, `t47=0` | Higher toggle/switching stress increases `1.50 GHz` failure rate (`2.75%`) |
 | `T2` | Dual-die with `e=12` copied to fresh Node-0 `DmaBuffer` | **`mis_target=21`**, `t03=0`, `t47=4015` | **`mis_target=0`**, `t47=0` | Rules out `m_w_blob` DRAM bank/location corruption on Die 0 |
 | `T3` | Dual-die executing **identical** `e=12` copy on **Die 1** | **`mis_target=0`**, `t47=0` (`3853.5 ms`) | **`mis_target=0`**, `t47=0` | Die 1 PEC column #2 has sufficient margin at `1.50 GHz`; Die 0 does not |
-| `T4` | Dual-die `b_cnt=4` (`t=4..7` zeroed) on Die 0 | **`mis_target=0`**, `t47=0` (`3543.0 ms`) | **`mis_target=0`**, `t47=0` | Keeping PEC column #2 idle/zero eliminates Die 0 errors even at `1.50 GHz` |
-| `T5` | Dual-die `mlp_t1` (`W=1`) on Die 0 | **`mis_target=0`** (`3096.5 ms`) | **`mis_target=0`** | `T=1` single-column decode avoids PEC column #2 |
+| `T4` | Dual-die `b_cnt=4` (`t=4..7` zeroed) on Die 0 | **`mis_target=0`**, `t47=0` (`3543.0 ms`) | **`mis_target=0`**, `t47=0` | Keeping `t=4..7` idle/zero eliminates Die 0 errors even at `1.50 GHz` |
+| `T5` | Dual-die `mlp_t1` (`W=1`) on Die 0 | **`mis_target=0`** (`3096.5 ms`) | **`mis_target=0`** | `T=1` single-column decode avoids 8-slot switching load |
+
+### Full-SoC Milestone 18 / Phase G Silicon Sweep (2026-11-21)
+Using the standalone cross-compiled C++17 `stress_hw01_probe` (dual `64 MiB` staging buffers, Core `0`/`4` cache-flush pinning), we swept **all** `LFM3-1.7B` archetypes and **all 712** `LFM2.5-8B-A1B` experts + **48** `INT16` `T=64` operators across Die 0 and Die 1:
+
+1. **Stage 1A — `LFM3-1.7B` All-Archetype Sweep @ `1.50 GHz`**:
+   - `TP=2` `mlp_t64` all 24 layers (Die 0 & Die 1, `N=100`, 48 rows, `33.6 s`), `TP=2` `mlp_t64` cross-die (`L00/L06/L12/L22`, `N=1,000`, `44.3 s`), `TP=2` `mlp_t8` cross-die (`L00/L06/L12/L22`, `N=1,000`, `34.1 s`), `PP=2` `mlp_t64` cross-die (`L00/L06/L11` full 7680-width `63.9 MB`, `N=500`, `20.5 s`), plus `conv_in_t64` (`12.1 s`), `proj2048_t64` (`17.4 s`), and `attn_qkv_t64` (`10.1 s`, `N=300` each): **`0` failures everywhere** (`ref_diffs=0`).
+2. **Stage 1B — `LFM2.5-8B-A1B` All 48 `INT16` `T=64` Ops & All 712 Experts @ `1.50 GHz` (`slots=all`)**:
+   - All `48` `INT16` `T=64` operators (`18` `conv_in` `20.1 s`, `24` `proj2048` `18.5 s`, `6` `attn_qkv` `6.0 s`, `N=150` each): **`0` failures**.
+   - All **`712` experts** (`356` Die 0 even + `356` Die 1 odd, `N=100` each, `320.9 s`):
+     - **Die 1**: **`0 / 356` failing experts**.
+     - **Die 0**: **`3 / 356` failing experts**, proving `HW-01` ALSO strikes **PEC column #0 (`t=[0..1]`)**, not only PEC column #2 (`t=[4..5]`):
+       - `lfm2_l09_exp16`: `mis_act=1/100`, **`mod8_act=[106,107,0,0,0,0,0,0]` (`t=[0..1]`, PEC col #0!)**, `c=[0..255]`, `first=(c=0,t=1,ref=11494,cur=6797,resub=11494)`
+       - `lfm2_l11_exp08`: `mis_act=2/100`, `mod8_act=[0,0,0,0,202,210,0,0]` (`t=[4..5]`, PEC col #2), `c=[1281..1535]`, `first=(c=1281,t=4,ref=-7480,cur=-7881,resub=-7480)`
+       - `lfm2_l20_exp18`: `mis_act=4/100`, **`mod8_act=[684,676,0,0,0,0,0,0]` (`t=[0..1]`, PEC col #0!)**, `c=[0..255]`, `first=(c=0,t=1,ref=14148,cur=12822,resub=14148)`
+3. **Stage 1C / 1D — Deep Thermal Soak on Top-3 Die-0 Experts (`lfm2_l12_exp12`, `lfm2_l20_exp18`, `lfm2_l11_exp08`, alternating dual-die pairs, `tz0` up to `52.8°C`)**:
+   - `slots=all` @ `1.50 GHz` (`N=2,000`, `91.7 s`):
+     - `lfm2_l20_exp18_pair`: **`mis_act=61/2,000` (`3.05%`)**, `diffs_act=20,740`, **`mod8_act=[10263,10477,0,0,0,0,0,0]` (`t=[0..1]`, PEC col #0!)**, `c=[0..1278]`, `resub_mis=0`.
+     - `lfm2_l11_exp08_pair`: **`mis_act=6/2,000` (`0.30%`)**, `diffs_act=1,236`, `mod8_act=[0,0,0,0,606,630,0,0]` (`t=[4..5]`, PEC col #2), `c=[1281..1535]`, `resub_mis=0`.
+     - `lfm2_l12_exp12_pair` scored `0/2,000` on `stress_hw01_probe`'s deterministic activation vector (vs `55/2,000` on `lfm2_moe`'s seed — confirming strong activation-pattern dependence); all Die 1 pairs scored `0/2,000`.
+   - **`slots=safe6` (`{0,1,2,3,6,7}` active, `{4,5}` zeroed) @ `1.50 GHz` (`N=10,000` alternating pairs = `60,000` Die 0 submits + `60,000` Die 1 submits, `450.5 s`)**: **`0 / 10,000` active & `0 / 10,000` padded errors** across all 12 rows (`lfm2_l20_exp18`'s `t=[0..1]` failure rate dropped from `61/2,000` to **`0/10,000`** even with identical non-zero INT8 vectors in slots `{0, 1}`!).
+   - **`slots=safe4` (`{0..3}` active) @ `1.50 GHz` (`N=5,000`, `226.5 s`)**: **`0 / 5,000`** active & padded errors across all 12 rows.
+   - **`slots=all` @ `1.04 GHz` (`900 mV`, `llc=800 MHz`, `N=2,000`, `92.8 s`)**: **`0 / 2,000`** across all 12 rows (`restored_f0=1500000000`, `restored_f1=1500000000` verified).
+4. **Refined Physical Root-Cause Interpretation**: `HW-01` is **NOT** a single-column defect isolated to PEC column #2. Rather, it behaves as an **array-wide instantaneous dynamic IR-drop / Fmax timing droop on Die 0 at `1.50 GHz @ 1050 mV` (`llc=1188 MHz`)** when all `8/8` token slots switch simultaneously during `W16A16` `down_proj`, tripping multiple critical paths (`t=[0..1]` PEC col #0 and `t=[4..5]` PEC col #2). Cutting simultaneous active slot occupancy to `<= 6/8` (`75%` via `kT8SafeSlots`) or lowering OPP to `1.04 GHz @ 900 mV` restores margin across all columns.
 
 ### Verified Mitigation
-To preserve full `1.50 GHz` performance without downclocking the SoC (`1.04 GHz` cuts throughput by ~30%), [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) maps up to **6 gathered tokens** per `mlp_t8` dispatch onto **`kT8SafeSlots[6] = {0, 1, 2, 3, 6, 7}`** in `pack_gathered_int8_t8()` and `run_die_experts()`, explicitly **zero-padding slots `{4, 5}`** (PEC column #2) while stepping `base += 6` and unpacking `unpack_t = (b_cnt <= 4) ? b_cnt : 8`.
+To preserve full `1.50 GHz` performance without downclocking the SoC (`1.04 GHz` cuts throughput by ~30%), [`src/LFM2.5-8B-A1B/lfm2_moe.cpp`](file:///home/chri/aixigua/romanaccio/src/LFM2.5-8B-A1B/lfm2_moe.cpp) maps up to **6 gathered tokens** per `mlp_t8` dispatch onto **`kT8SafeSlots[6] = {0, 1, 2, 3, 6, 7}`** in `pack_gathered_int8_t8()` and `run_die_experts()`, explicitly **zero-padding slots `{4, 5}`** while stepping `base += 6` and unpacking `unpack_t = (b_cnt <= 4) ? b_cnt : 8`.
 - Verified on `roma` at full `1.50 GHz` (`cur_freq=1500000000`):
-  - **3,818-token `--verify-prefix-cache`**: **5/5 PASS**, **`max_abs=0.000000`**, **`cos=1.00000000`**, `4/4` greedy match.
-  - **`--verify-golden golden_ref.bin`**: **`0.97924192`** min-layer cosine, **`0.99837211`** 128K logits cosine, **`11.38 tok/s`** decode.
+  - **2× `3,818`-token `--verify-prefix-cache` (Stage 2)**: **5/5 PASS** both runs, **`max_abs=0.000000`**, **`cos=1.00000000`**, `4/4` greedy match.
+  - **`--verify-golden golden_ref.bin`**: **`0.97924192`** min-layer cosine, **`0.99837211`** 128K logits cosine, `4/4` greedy match, **`11.00–11.38 tok/s`** decode.
 
-### Open Silicon Investigation Items (Scheduled for Next Session)
-1. Whether `LFM3` `T=64` prefill graphs (`lfm3_mlp_t64_classb.model`, `mlp_tp2_t64`, `mlp_t8`) on Die 0 can also trigger PEC column #2 (`t % 8 in {4, 5}`) faults under heavy thermal/sustained stress at `1.50 GHz`.
-2. Long-soak verification (`N >= 10,000` pairs across all 712 experts) of `b_cnt=6` (`kT8SafeSlots`) vs `b_cnt=4` under elevated thermal load.
-3. Inspection of Die 0 vs Die 1 NPU OPP voltage/frequency tables in device-tree/PMIC (`regulator` voltage margin at `1.50 GHz`).
+### Open Silicon Investigation Items (Follow-Up Deep Dive)
+1. **Multi-seed randomized activation sweep on `kT8SafeSlots` (`b_cnt=6`) vs `b_cnt=4` vs `1.04 GHz` Die 0**: Since `HW-01` is data-pattern sensitive (`lfm2_l12_exp12` `55/2,000` vs `0/2,000`), test randomized multi-seed / captured real activations across `l20_exp18`, `l11_exp08`, `l12_exp12`, and `l09_exp16` to verify `safe6` carries zero residual `t=[0..1]` PEC col #0 risk on arbitrary worst-case inputs.
+2. **Multi-seed randomized soak on `LFM3-1.7B` `mlp_t64` / `mlp_t8`**: Confirm Stage 1A's `0`-error result holds under randomized multi-seed activation stress.
+3. **Die 0 vs. Die 1 `1.8×` wall-time asymmetry in `stress_hw01_probe`**: Investigate why Die 0 took `~1.87×` longer than Die 1 in dual-die Stage 1C runs (`29.9 s` vs `15.9 s` at `N=2,000`; `149.5 s` vs `79.5 s` at `N=10,000` — candidate: unpinned `out[0]->flush_cache()` thread / NUMA cache-flush contention vs Die 0 driver submission lock).
+4. **PMIC / OPP voltage margin**: `NPU_SVCC` and `NPU_SVCC2` both operate at `1050 mV` (`max=1120 mV`) at `1.50 GHz`; determine whether Die 0 vs Die 1 Fmax spread is pure silicon process variation or board power-rail droop.
 
 ---
 
