@@ -544,3 +544,71 @@ def test_cache_stats_and_clear_endpoints(harness: GatewayTestHarness) -> None:
     assert clr2["removed_blocks"] == 8
     assert harness.moe_mock.clear_calls[-1] is True
     assert harness.moe_mock.resident_blocks == 0
+
+
+def test_backend_disconnect_returns_clean_502_json(harness: GatewayTestHarness) -> None:
+    import struct
+
+    def _run_drop_server(mode: str, stop_ev: threading.Event, ready_port: List[int]) -> None:
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(16)
+        srv_sock.settimeout(0.05)
+        ready_port.append(int(srv_sock.getsockname()[1]))
+        try:
+            while not stop_ev.is_set():
+                try:
+                    conn, _ = srv_sock.accept()
+                except socket.timeout:
+                    continue
+                if mode == "rst":
+                    conn.settimeout(0.2)
+                    try:
+                        conn.recv(4096)
+                    except OSError:
+                        pass
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                conn.close()
+        finally:
+            srv_sock.close()
+
+    for mode in ("eof", "rst"):
+        stop_ev = threading.Event()
+        ports: List[int] = []
+        th = threading.Thread(target=_run_drop_server, args=(mode, stop_ev, ports), daemon=True)
+        th.start()
+        while not ports:
+            time.sleep(0.01)
+        drop_port = ports[0]
+        srv.config.backend_map["lfm3-drop"] = ("127.0.0.1", drop_port)
+        try:
+            for method, path, body in (
+                ("GET", "/v1/cache/stats?model=lfm3-drop", None),
+                ("POST", "/v1/chat/completions", {
+                    "model": "lfm3-drop",
+                    "messages": [{"role": "user", "content": f"disconnect test {mode}"}],
+                    "max_tokens": 8,
+                    "stream": False,
+                }),
+                ("POST", "/v1/chat/completions", {
+                    "model": "lfm3-drop",
+                    "messages": [{"role": "user", "content": f"stream disconnect test {mode}"}],
+                    "max_tokens": 8,
+                    "stream": True,
+                }),
+            ):
+                conn = http.client.HTTPConnection("127.0.0.1", harness.http_port, timeout=10)
+                headers = {"Content-Type": "application/json"} if body is not None else {}
+                raw_body = json.dumps(body).encode("utf-8") if body is not None else None
+                conn.request(method, path, body=raw_body, headers=headers)
+                resp = conn.getresponse()
+                payload = resp.read().decode("utf-8", errors="replace")
+                conn.close()
+                assert resp.status == 502, f"{mode} {method} {path} -> {resp.status}: {payload}"
+                parsed = json.loads(payload)
+                assert "detail" in parsed and parsed["detail"]
+        finally:
+            srv.config.backend_map.pop("lfm3-drop", None)
+            stop_ev.set()
+            th.join(timeout=2.0)

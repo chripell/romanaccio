@@ -532,6 +532,12 @@ async def query_backend_command(
         if event.get("type") == "error":
             raise HTTPException(status_code=500, detail=event.get("message", "Engine error"))
         return event
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError as e:
+        raise HTTPException(status_code=504, detail=f"Backend {host}:{port} timed out") from e
+    except (OSError, ConnectionError) as e:
+        raise HTTPException(status_code=502, detail=f"Backend {host}:{port} disconnected: {e}") from e
     finally:
         writer.close()
         try:
@@ -552,7 +558,10 @@ async def query_backend_stream(
     reader, writer = await _open_backend_connection(payload, h, p, image_bytes=image_bytes)
     try:
         while True:
-            event = await _read_next_event(reader)
+            try:
+                event = await _read_next_event(reader)
+            except (OSError, ConnectionError) as e:
+                raise HTTPException(status_code=502, detail=f"Backend {h}:{p} disconnected: {e}") from e
             if event is None:
                 break
             yield event
@@ -592,6 +601,27 @@ async def _start_sse_stream(
             "X-Cache-Restore-Ms": "0.00",
         }
         return reader, writer, fallback_headers, [first_event]
+    except HTTPException:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        raise
+    except asyncio.TimeoutError as e:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        raise HTTPException(status_code=504, detail=f"Backend {host}:{port} timed out") from e
+    except (OSError, ConnectionError) as e:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=f"Backend {host}:{port} disconnected: {e}") from e
     except Exception:
         writer.close()
         try:
