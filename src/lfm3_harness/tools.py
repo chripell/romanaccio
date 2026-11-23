@@ -18,6 +18,7 @@ from .config import (
     SafetyLimits,
 )
 from .paths import PathSandboxError, WorkspaceSandbox
+from .audio import inspect_wav_bytes
 from .vision import inspect_image_bytes
 
 _SKIP_DIR_NAMES = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"})
@@ -696,4 +697,18 @@ class ToolExecutor:
             payload["format"] = fmt
             payload["width"] = w
             payload["height"] = h
+        elif name == "transcribe":
+            if target.suffix.lower() == ".wav":
+                wav_info = inspect_wav_bytes(target.read_bytes())
+                if wav_info is not None:
+                    sr, ch, sw, dur = wav_info
+                    payload.update(
+                        {
+                            "format": "wav",
+                            "sample_rate": sr,
+                            "channels": ch,
+                            "bits_per_sample": sw * 8,
+                            "duration_s": round(dur, 3),
+                        }
+                    )
         return ToolResult(ok=True, tool_name=name, content=json.dumps(payload, indent=2))

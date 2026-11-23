@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .agent_loop import _normalize_tool_name
 from .approvals import ApprovalManager
-from .audio import AudioService
+from .audio import AudioClient, AudioMetadata, AudioService, format_audio_placeholder
 from .backend import (
     BackendDisconnectError,
     BackendError,
@@ -192,6 +192,7 @@ def create_app(
     store: Optional[HarnessStore] = None,
     audio_service: Optional[AudioService] = None,
     vision_client: Optional[VisionClient] = None,
+    audio_client: Optional[AudioClient] = None,
     calibration_path: Optional[Path] = None,
     allow_no_auth: bool = False,
 ) -> FastAPI:
@@ -201,9 +202,74 @@ def create_app(
     ws_row = state_store.register_workspace(ws_root.name or "workspace", ws_root)
     sandbox = WorkspaceSandbox(ws_root)
 
-    audio = audio_service or AudioService()
-    audio_caps = audio.capabilities()
+    audio = audio_service or AudioService(native_tts_default=config.native_tts_default)
     v_client: Optional[VisionClient] = vision_client or (VisionClient(config.vision_url) if config.vision_url else None)
+    a_client: Optional[AudioClient] = audio_client or (AudioClient(config.audio_url) if config.audio_url else None)
+    audio_ep = config.audio_daemon
+    audio_daemon_client = (
+        _build_daemon_client(audio_ep, calibration_path=calibration_path, load_tokenizer=False)
+        if audio_ep is not None
+        else None
+    )
+
+    if a_client is not None and audio_daemon_client is not None:
+        async def _live_asr_hook(meta: AudioMetadata) -> Tuple[Optional[str], Optional[str]]:
+            raw_bytes = Path(meta.normalized_path).read_bytes()
+            emb_bytes, n_tok, _ainfo = await a_client.encode(raw_bytes, filename=meta.filename)
+            asr_prompt = (
+                "<|startoftext|><|im_start|>system\nPerform ASR.<|im_end|>\n"
+                f"<|im_start|>user\n{format_audio_placeholder(n_tok)}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+            asr_req = GenerateRequest(
+                prompt=asr_prompt,
+                max_tokens=256,
+                temperature=0.0,
+                top_k=1,
+                repeat_penalty=1.0,
+                no_think=True,
+                raw=True,
+                cache=True,
+                prompt_cache_key=f"asr:{meta.sha256[:12]}",
+                image_bytes=emb_bytes,
+                embed_token_id=125031,
+                suppress_tokens=(125012, 125015, 125032),
+                session_id=f"asr:{secrets.token_hex(4)}",
+            )
+            chunks: List[str] = []
+            async for ev in audio_daemon_client.stream_generate(asr_req, read_timeout_s=60.0):
+                if ev.type == "token" and not ev.payload.get("thinking"):
+                    chunks.append(str(ev.payload.get("text") or ""))
+            return "".join(chunks).strip(), "lfm3-audio"
+
+        async def _live_native_tts_hook(
+            text: str,
+            *,
+            speed: float = 1.0,
+            language: str = "American English",
+            gender: str = "female",
+            max_frames: int = 250,
+        ) -> Tuple[bytes, str, Dict[str, Any]]:
+            _ = speed
+            wav_bytes, tts_meta = await a_client.synthesize_tts(
+                text,
+                language=language,
+                gender=gender,
+                max_frames=max_frames,
+            )
+            return wav_bytes, "lfm3-audio", tts_meta
+
+        audio.configure_native_audio(
+            asr_hook=_live_asr_hook,
+            asr_engine_name="lfm3-audio",
+            native_tts_hook=_live_native_tts_hook,
+            native_tts_engine_name="lfm3-audio",
+            native_tts_default=config.native_tts_default,
+        )
+    elif config.native_tts_default:
+        audio.native_tts_default = True
+
+    audio_caps = audio.capabilities()
     caps = Capabilities(
         vision=bool(config.capabilities.vision or config.vision_url or v_client is not None),
         voice_asr=bool(config.capabilities.voice_asr or audio_caps["voice_asr"]),
@@ -430,6 +496,26 @@ def create_app(
             except Exception:
                 vision_reachable = False
 
+        audio_daemon_reachable = False
+        audio_stats: Dict[str, Any] = {}
+        if audio_daemon_client is not None:
+            try:
+                audio_stats = await asyncio.wait_for(audio_daemon_client.cache_stats(timeout_s=1.2), timeout=1.5)
+                audio_daemon_reachable = True
+            except Exception:
+                audio_daemon_reachable = False
+
+        audio_sidecar_reachable = False
+        audio_model = ""
+        if a_client is not None:
+            try:
+                ah = await asyncio.wait_for(a_client.health(), timeout=2.0)
+                audio_sidecar_reachable = bool(ah.get("status") == "ok")
+                audio_model = str(ah.get("model") or "")
+            except Exception:
+                audio_sidecar_reachable = False
+
+        cur_audio_caps = audio.capabilities()
         return {
             "default_model": actor_ep.name,
             "models": out,
@@ -441,15 +527,33 @@ def create_app(
                 "reachable": d1_reachable,
                 "cache": d1_stats,
             },
+            "audio": {
+                "name": audio_ep.name if audio_ep is not None else "lfm3-audio-2b",
+                "host": audio_ep.host if audio_ep is not None else None,
+                "port": audio_ep.port if audio_ep is not None else None,
+                "configured": bool(audio_ep is not None),
+                "reachable": bool(audio_daemon_reachable and (a_client is None or audio_sidecar_reachable)),
+                "daemon_reachable": audio_daemon_reachable,
+                "sidecar_reachable": audio_sidecar_reachable,
+                "sidecar_url": config.audio_url or (getattr(a_client, "base_url", None) if a_client else None),
+                "model": audio_model,
+                "cache": audio_stats,
+            },
             "capabilities": {
                 "vision": caps.vision,
                 "vision_url": config.vision_url or (getattr(v_client, "base_url", None) if v_client else None),
                 "vision_reachable": vision_reachable,
                 "vision_model": vision_model,
                 "voice_asr": caps.voice_asr,
+                "asr_engine": cur_audio_caps["asr_engine"],
+                "asr_reachable": bool(audio_daemon_reachable and audio_sidecar_reachable) if (a_client and audio_daemon_client) else caps.voice_asr,
                 "voice_tts": caps.voice_tts,
                 "tts_engine": audio.tts_engine,
-                "ffmpeg_available": audio_caps["ffmpeg_available"],
+                "tts_engines": audio.tts_engines,
+                "native_tts": audio.native_tts_available,
+                "native_tts_default": audio.native_tts_default,
+                "audio_url": config.audio_url or (getattr(a_client, "base_url", None) if a_client else None),
+                "ffmpeg_available": cur_audio_caps["ffmpeg_available"],
             },
         }
 
@@ -914,6 +1018,38 @@ def create_app(
                             yield _sse("tool_result", {"round": round_idx, "call_id": ntc.call_id, "name": ntc.name, "ok": look_ok, "result": out_str})
                             history.append({"role": "tool", "tool_call_id": ntc.call_id, "content": out_str})
                             last_tool_row = state_store.add_message(sid, "tool", out_str, tool_call_id=ntc.call_id)
+                        elif ntc.name == "transcribe" and caps.voice_asr and audio.asr_available:
+                            rel_aud = str(ntc.arguments.get("path") or "").strip()
+                            aud_ok = False
+                            try:
+                                target_aud = sandbox.resolve_read(rel_aud)
+                                raw_aud = target_aud.read_bytes()
+                                aud_meta = await audio.inspect_and_normalize(raw_aud, target_aud.name, audio_tmp_dir)
+                                transcript, asr_eng = await audio.transcribe(aud_meta)
+                                aud_ok = transcript is not None
+                                out_str = json.dumps(
+                                    {
+                                        "status": "ok" if aud_ok else "asr_unavailable",
+                                        "path": sandbox.relativize(target_aud),
+                                        "bytes": aud_meta.bytes,
+                                        "sha256": aud_meta.sha256,
+                                        "duration_s": aud_meta.duration_s,
+                                        "sample_rate": aud_meta.sample_rate,
+                                        "channels": aud_meta.channels,
+                                        "asr_engine": asr_eng,
+                                        "transcript": transcript or "",
+                                    },
+                                    indent=2,
+                                )
+                            except PathSandboxError as exc:
+                                out_str = json.dumps({"ok": False, "error": f"Sandbox violation ({exc.reason}): {exc}"})
+                            except Exception as exc:
+                                out_str = json.dumps({"ok": False, "error": f"Audio transcribe failed: {exc}"})
+                            if aud_ok:
+                                ro_observations.append(f"[transcribe]\n{out_str}")
+                            yield _sse("tool_result", {"round": round_idx, "call_id": ntc.call_id, "name": ntc.name, "ok": aud_ok, "result": out_str})
+                            history.append({"role": "tool", "tool_call_id": ntc.call_id, "content": out_str})
+                            last_tool_row = state_store.add_message(sid, "tool", out_str, tool_call_id=ntc.call_id)
                         elif ntc.name in _READ_ONLY_CHAT_TOOLS:
                             res = executor.execute(ntc.name, ntc.arguments, allowed_tools=tuple(allowed_names))
                             out_str = res.content if res.ok else json.dumps({"ok": False, "error": res.error})
@@ -1180,6 +1316,11 @@ def create_app(
                 per_model["d1"] = {"reachable": True, **(await asyncio.wait_for(d1_client.cache_stats(timeout_s=2.0), timeout=2.5))}
             except Exception as exc:
                 per_model["d1"] = {"reachable": False, "error": str(exc)}
+        if audio_daemon_client is not None:
+            try:
+                per_model["audio"] = {"reachable": True, **(await asyncio.wait_for(audio_daemon_client.cache_stats(timeout_s=2.0), timeout=2.5))}
+            except Exception as exc:
+                per_model["audio"] = {"reachable": False, "error": str(exc)}
         return {"models": per_model}
 
     @app.post("/api/cache/clear")
@@ -1191,6 +1332,8 @@ def create_app(
         all_targets: List[Tuple[str, DaemonClient]] = list(clients.items())
         if d1_separate and d1_client is not None:
             all_targets.append(("d1", d1_client))
+        if audio_daemon_client is not None:
+            all_targets.append(("audio", audio_daemon_client))
 
         if target == "all":
             targets = all_targets
@@ -1205,9 +1348,42 @@ def create_app(
                 results[name] = {"ok": False, "error": str(exc)}
         return {"include_pinned": include_pinned, "results": results}
 
+    @app.get("/api/health")
     @app.get("/api/system/health")
     async def system_health() -> Dict[str, Any]:
-        return _collect_system_health(len(active_chat_cancels), len(active_mission_cancels), audio.capabilities())
+        payload = _collect_system_health(len(active_chat_cancels), len(active_mission_cancels), audio.capabilities())
+        payload["status"] = "ok"
+        return payload
+
+    @app.get("/api/audio/status")
+    async def audio_status() -> Dict[str, Any]:
+        sidecar_reachable = False
+        sidecar_health: Dict[str, Any] = {}
+        if a_client is not None:
+            try:
+                sidecar_health = await asyncio.wait_for(a_client.health(), timeout=2.0)
+                sidecar_reachable = bool(sidecar_health.get("status") == "ok")
+            except Exception:
+                sidecar_reachable = False
+        daemon_reachable = False
+        if audio_daemon_client is not None:
+            try:
+                await asyncio.wait_for(audio_daemon_client.cache_stats(timeout_s=1.2), timeout=1.5)
+                daemon_reachable = True
+            except Exception:
+                daemon_reachable = False
+        return {
+            **audio.capabilities(),
+            "sidecar_url": config.audio_url or (getattr(a_client, "base_url", None) if a_client else None),
+            "sidecar_reachable": sidecar_reachable,
+            "sidecar_health": sidecar_health,
+            "daemon": {
+                "name": audio_ep.name if audio_ep else None,
+                "host": audio_ep.host if audio_ep else None,
+                "port": audio_ep.port if audio_ep else None,
+                "reachable": daemon_reachable,
+            },
+        }
 
     @app.post("/api/images/upload")
     async def upload_image(request: Request, filename: str = "image.png", max_dim: int = 512) -> Dict[str, Any]:
@@ -1299,18 +1475,43 @@ def create_app(
         body = await _json_body(request, required=True)
         text = str(body.get("text") or "").strip()
         speed = float(body.get("speed", 1.0))
+        engine = str(body.get("engine") or "auto").strip() or "auto"
+        language = str(body.get("language") or "American English").strip() or "American English"
+        gender = str(body.get("gender") or "female").strip() or "female"
+        max_frames = max(1, min(600, int(body.get("max_frames") or 250)))
         if not text:
             raise HTTPException(status_code=400, detail="TTS 'text' must not be empty")
         try:
-            wav_bytes, eng, lat_ms = await audio.synthesize_tts(text, speed=speed)
+            wav_bytes, eng, lat_ms, meta = await audio.synthesize_tts_detailed(
+                text,
+                speed=speed,
+                engine=engine,
+                language=language,
+                gender=gender,
+                max_frames=max_frames,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        headers = {"X-TTS-Engine": eng, "X-TTS-Latency-Ms": f"{lat_ms:.2f}"}
+        hdr_map = {
+            "frames": "X-TTS-Frames",
+            "duration_s": "X-TTS-Duration-S",
+            "total_ms": "X-TTS-Total-Ms",
+            "rtf": "X-TTS-RTF",
+            "prefill_ms": "X-TTS-Prefill-Ms",
+            "depth_ms": "X-TTS-Depth-Ms",
+            "codec_ms": "X-TTS-Codec-Ms",
+            "eos": "X-TTS-EOS",
+        }
+        for k, hname in hdr_map.items():
+            if meta.get(k) not in (None, ""):
+                headers[hname] = str(meta[k])
         return Response(
             content=wav_bytes,
             media_type="audio/wav",
-            headers={"X-TTS-Engine": eng, "X-TTS-Latency-Ms": f"{lat_ms:.2f}"},
+            headers=headers,
         )
 
     return app
@@ -1387,6 +1588,19 @@ def build_config_from_args(ns: argparse.Namespace) -> Tuple[HarnessConfig, bool,
             tokenizer_path=Path(d1_tok) if d1_tok else None,
         )
 
+    audio_ep = None
+    if getattr(ns, "audio_port", 0) > 0:
+        aud_tok = getattr(ns, "audio_tokenizer", "") or ns.lfm3_tokenizer
+        audio_ep = BackendEndpoint(
+            name="lfm3-audio-2b",
+            host=ns.audio_host,
+            port=ns.audio_port,
+            family="lfm3",
+            supports_thinking=False,
+            supports_audio=True,
+            tokenizer_path=Path(aud_tok) if aud_tok else None,
+        )
+
     cal_file: Optional[Path] = Path(ns.calibration_json) if ns.calibration_json else None
     if cal_file is None:
         default_d1_cal = Path("/home/chri/models/d1-2B_TP2/calibration.json")
@@ -1404,16 +1618,20 @@ def build_config_from_args(ns: argparse.Namespace) -> Tuple[HarnessConfig, bool,
     if ns.self_signed_tls and (ssl_cert is None or ssl_key is None):
         ssl_cert, ssl_key = _ensure_self_signed_tls(state_dir / "tls")
 
+    audio_url = (getattr(ns, "audio_url", "") or "").strip() or None
+    native_tts_default = bool(getattr(ns, "native_tts_default", False))
+    native_audio_ready = bool(audio_url and audio_ep is not None)
     audio_svc = AudioService(
         piper_bin=ns.piper_bin or None,
         piper_model=ns.piper_model or None,
+        native_tts_default=native_tts_default,
     )
     audio_caps = audio_svc.capabilities()
     caps = Capabilities(
         vision=bool(ns.vision_url),
-        voice_asr=bool(audio_caps["voice_asr"]),
-        voice_tts=bool(audio_caps["voice_tts"]),
-        tts_engine=audio_caps["tts_engine"],
+        voice_asr=bool(audio_caps["voice_asr"] or native_audio_ready),
+        voice_tts=bool(audio_caps["voice_tts"] or native_audio_ready),
+        tts_engine=("lfm3-audio" if (native_audio_ready and (native_tts_default or not audio_caps["tts_engine"])) else audio_caps["tts_engine"]),
     )
     cfg = HarnessConfig(
         workspace_root=ws,
@@ -1422,6 +1640,9 @@ def build_config_from_args(ns: argparse.Namespace) -> Tuple[HarnessConfig, bool,
         secondary_actor=secondary,
         d1=d1_ep,
         vision_url=ns.vision_url or None,
+        audio_daemon=audio_ep,
+        audio_url=audio_url,
+        native_tts_default=native_tts_default,
         capabilities=caps,
         limits=SafetyLimits(),
         auth_token=tok,
@@ -1447,6 +1668,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--d1-port", type=int, default=0, help="Dedicated d1 port (0 = reuse lfm3 actor)")
     parser.add_argument("--d1-tokenizer", default="", help="Optional tokenizer.json for dedicated d1-2B package")
     parser.add_argument("--vision-url", default="")
+    parser.add_argument("--audio-host", default="127.0.0.1")
+    parser.add_argument("--audio-port", type=int, default=0, help="LFM3-Audio-2B daemon port (0 to disable)")
+    parser.add_argument("--audio-tokenizer", default="", help="Optional tokenizer.json for LFM3-Audio-2B")
+    parser.add_argument("--audio-url", default="", help="Host ONNX audio sidecar URL (e.g. http://127.0.0.1:8096)")
+    parser.add_argument("--native-tts-default", action="store_true", help="Prefer LFM3-Audio native TTS over espeak-ng")
     parser.add_argument("--calibration-json", default="")
     parser.add_argument("--piper-bin", default="")
     parser.add_argument("--piper-model", default="")
@@ -1458,15 +1684,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     ns = parser.parse_args(argv)
 
     cfg, allow_no_auth, piper_bin, piper_model, cal_path = build_config_from_args(ns)
-    audio_svc = AudioService(piper_bin=piper_bin, piper_model=piper_model)
+    audio_svc = AudioService(
+        piper_bin=piper_bin,
+        piper_model=piper_model,
+        native_tts_default=cfg.native_tts_default,
+    )
     app = create_app(cfg, audio_service=audio_svc, calibration_path=cal_path, allow_no_auth=allow_no_auth)
 
     scheme = "https" if (cfg.ssl_certfile and cfg.ssl_keyfile) else "http"
     print(f"[romanaccio-harness] {scheme}://{ns.bind}:{ns.port} | workspace={cfg.workspace_root}")
     print(f"[romanaccio-harness] actors: {cfg.actor.name}={cfg.actor.host}:{cfg.actor.port}"
           + (f", {cfg.secondary_actor.name}={cfg.secondary_actor.host}:{cfg.secondary_actor.port}" if cfg.secondary_actor else "")
-          + (f", {cfg.d1.name}={cfg.d1.host}:{cfg.d1.port}" if cfg.d1 else ""))
-    print(f"[romanaccio-harness] vision={cfg.vision_url or 'disabled'} | audio={audio_svc.capabilities()}")
+          + (f", {cfg.d1.name}={cfg.d1.host}:{cfg.d1.port}" if cfg.d1 else "")
+          + (f", {cfg.audio_daemon.name}={cfg.audio_daemon.host}:{cfg.audio_daemon.port}" if cfg.audio_daemon else ""))
+    print(f"[romanaccio-harness] vision={cfg.vision_url or 'disabled'} | audio_sidecar={cfg.audio_url or 'disabled'} | audio={audio_svc.capabilities()}")
     if cfg.auth_token:
         print(f"[romanaccio-harness] auth_token={cfg.auth_token}")
     else:

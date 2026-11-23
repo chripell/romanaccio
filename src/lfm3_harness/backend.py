@@ -159,6 +159,9 @@ class GenerateRequest:
     pin_blocks_up_to: int = 0
     stop: List[str] = field(default_factory=list)
     image_bytes: Optional[bytes] = None
+    audio_bytes: Optional[bytes] = None
+    embed_token_id: Optional[int] = None
+    suppress_tokens: Optional[Tuple[int, ...]] = None
     session_id: Optional[str] = None
 
 
@@ -209,7 +212,14 @@ class DaemonClient:
         self._lock = asyncio.Lock()
         self._active_sessions: set[str] = set()
 
-    async def _open(self, payload: Dict[str, Any], image_bytes: Optional[bytes] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def _open(
+        self,
+        payload: Dict[str, Any],
+        image_bytes: Optional[bytes] = None,
+        *,
+        audio_bytes: Optional[bytes] = None,
+        embed_token_id: Optional[int] = None,
+    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
@@ -222,11 +232,18 @@ class DaemonClient:
 
         try:
             body = dict(payload)
-            if image_bytes:
-                body["image_bytes"] = len(image_bytes)
+            media_bytes = audio_bytes if audio_bytes is not None else image_bytes
+            if embed_token_id is not None:
+                body["embed_token_id"] = int(embed_token_id)
+            if media_bytes:
+                if audio_bytes is not None or body.get("embed_token_id") == 125031:
+                    body["audio_bytes"] = len(media_bytes)
+                    body["embed_token_id"] = int(body.get("embed_token_id") or 125031)
+                else:
+                    body["image_bytes"] = len(media_bytes)
             writer.write((json.dumps(body) + "\n").encode("utf-8"))
-            if image_bytes:
-                writer.write(image_bytes)
+            if media_bytes:
+                writer.write(media_bytes)
             await writer.drain()
             return reader, writer
         except (OSError, ConnectionError) as exc:
@@ -315,8 +332,17 @@ class DaemonClient:
                     payload["prompt_cache_key"] = req.prompt_cache_key
                 if req.stop:
                     payload["stop"] = list(req.stop)
+                if req.embed_token_id is not None:
+                    payload["embed_token_id"] = int(req.embed_token_id)
+                if req.suppress_tokens:
+                    payload["suppress_tokens"] = [int(t) for t in req.suppress_tokens]
 
-                reader, writer = await self._open(payload, image_bytes=req.image_bytes)
+                reader, writer = await self._open(
+                    payload,
+                    image_bytes=req.image_bytes,
+                    audio_bytes=req.audio_bytes,
+                    embed_token_id=req.embed_token_id,
+                )
                 try:
                     while True:
                         if cancel_event is not None and cancel_event.is_set():

@@ -56,6 +56,7 @@
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -1345,6 +1346,11 @@ public:
     uint64_t tier0_hits() const { return m_tier0_hits; }
     uint64_t tier0_tokens_saved() const { return m_tier0_tokens_saved; }
     size_t live_tokens_count() const { return m_live_tokens.size(); }
+    const float *last_hidden() const { return m_last_h.data(); }
+    void compute_normed_last_hidden(float *out) const {
+        rms_norm_f32(m_last_h.data(), m_emb_norm_weight, out, 1, kHidden);
+    }
+    void set_active_cache_write(bool enabled) { m_active_cache_write = enabled; }
 
     eswin::prefix_cache::CacheStatsSnapshot prefix_cache_stats() const {
         if (!m_prefix_cache_enabled) return eswin::prefix_cache::CacheStatsSnapshot{};
@@ -2034,7 +2040,8 @@ public:
                        size_t max_visual_tokens = 0,
                        std::vector<float> *debug_layer_outs = nullptr,
                        std::vector<float> *debug_emb_norm = nullptr,
-                       bool use_t8_verify = false) {
+                       bool use_t8_verify = false,
+                       int32_t embed_token_id = 125030) {
         if (T_valid < 1 || T_valid > kChunk) {
             std::printf("FAIL: forward_chunk requires 1 <= T_valid <= %d (got %d)\n", kChunk, T_valid);
             return false;
@@ -2065,7 +2072,7 @@ public:
                            static_cast<size_t>(T_valid) * kHidden);
         if (visual_embeds && visual_idx_io) {
             for (int t = 0; t < T_valid; ++t) {
-                if (token_ids[t] == 125030 && *visual_idx_io < max_visual_tokens) {
+                if (token_ids[t] == embed_token_id && *visual_idx_io < max_visual_tokens) {
                     std::memcpy(h + static_cast<size_t>(t) * kHidden,
                                 visual_embeds + (*visual_idx_io) * kHidden,
                                 kHidden * sizeof(float));
@@ -2769,7 +2776,9 @@ public:
     bool prefill_multimodal(const std::vector<int32_t> &tokens, StageTimers &timers,
                             const float *visual_embeds, size_t num_visual_tokens,
                             std::vector<float> *debug_layer_outs = nullptr,
-                            std::vector<float> *debug_emb_norm = nullptr) {
+                            std::vector<float> *debug_emb_norm = nullptr,
+                            bool compute_logits = true,
+                            int32_t embed_token_id = 125030) {
         m_tier0_eligible = false;
         const bool force_t1 = std::getenv("LFM3_PREFILL_T1") != nullptr;
         int n = static_cast<int>(tokens.size());
@@ -2781,10 +2790,11 @@ public:
             while (idx < n) {
                 int step = std::min(kPrefillBatch, n - idx);
                 bool is_last = (idx + step == n);
-                if (!forward_chunk(tokens.data() + idx, step, is_last, timers,
+                if (!forward_chunk(tokens.data() + idx, step, is_last && compute_logits, timers,
                                    visual_embeds, &visual_idx, num_visual_tokens,
                                    is_last ? debug_layer_outs : nullptr,
-                                   is_last ? debug_emb_norm : nullptr)) {
+                                   is_last ? debug_emb_norm : nullptr,
+                                   false, embed_token_id)) {
                     return false;
                 }
                 idx += step;
@@ -2803,10 +2813,11 @@ public:
         }
         while (idx < n) {
             bool is_last = (idx + 1 == n);
-            if (!forward_chunk(tokens.data() + idx, 1, is_last, timers,
+            if (!forward_chunk(tokens.data() + idx, 1, is_last && compute_logits, timers,
                                visual_embeds, &visual_idx, num_visual_tokens,
                                is_last ? debug_layer_outs : nullptr,
-                               is_last ? debug_emb_norm : nullptr)) {
+                               is_last ? debug_emb_norm : nullptr,
+                               false, embed_token_id)) {
                 return false;
             }
             idx++;
@@ -2841,7 +2852,8 @@ public:
 
     bool prefill_cached(const std::vector<int32_t> &tokens, StageTimers &timers,
                         const PrefixCacheOptions &opts, PrefixCacheTelemetry &tel,
-                        const float *visual_embeds = nullptr, size_t num_visual_tokens = 0) {
+                        const float *visual_embeds = nullptr, size_t num_visual_tokens = 0,
+                        bool compute_logits = true, int32_t embed_token_id = 125030) {
         tel = PrefixCacheTelemetry{};
         if (tokens.empty()) return false;
         const int n = static_cast<int>(tokens.size());
@@ -2868,7 +2880,8 @@ public:
             tel.status = "BYPASS";
             tel.tier = "none";
             tel.computed_prompt_tokens = n;
-            bool ok = prefill_multimodal(tokens, timers, visual_embeds, num_visual_tokens, nullptr, nullptr);
+            bool ok = prefill_multimodal(tokens, timers, visual_embeds, num_visual_tokens,
+                                         nullptr, nullptr, compute_logits, embed_token_id);
             if (!ok) {
                 invalidate_tier0();
                 return false;
@@ -2911,7 +2924,7 @@ public:
         if (need_lookup) {
             hit = m_prefix_cache.lookup(tokens.data(), tokens.size(),
                                         visual_embeds, num_visual_tokens,
-                                        125030, opts.cache_namespace);
+                                        embed_token_id, opts.cache_namespace);
         }
         tel.lookup_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_lkp0).count();
@@ -2979,7 +2992,7 @@ public:
             m_turn_snap_conv = m_conv_state;
             m_turn_snap_last_h = m_last_h;
             m_turn_snap_valid = true;
-            if (!compute_logits_from_ptr(m_last_h.data(), timers)) {
+            if (compute_logits && !compute_logits_from_ptr(m_last_h.data(), timers)) {
                 invalidate_tier0();
                 return false;
             }
@@ -2989,7 +3002,7 @@ public:
         size_t visual_idx = 0;
         if (visual_embeds && num_visual_tokens > 0) {
             for (int i = 0; i < start_idx; ++i) {
-                if (tokens[i] == 125030 && visual_idx < num_visual_tokens) visual_idx++;
+                if (tokens[i] == embed_token_id && visual_idx < num_visual_tokens) visual_idx++;
             }
         }
 
@@ -3009,9 +3022,9 @@ public:
                 int to_boundary = kChunk - (idx % kChunk);
                 int step = std::min(to_boundary, n - idx);
                 bool is_last = (idx + step == n);
-                if (!forward_chunk(tokens.data() + idx, step, is_last, timers,
+                if (!forward_chunk(tokens.data() + idx, step, is_last && compute_logits, timers,
                                    visual_embeds, &visual_idx, num_visual_tokens,
-                                   nullptr, nullptr)) {
+                                   nullptr, nullptr, false, embed_token_id)) {
                     invalidate_tier0();
                     return false;
                 }
@@ -3039,9 +3052,9 @@ public:
         } else {
             while (idx < n) {
                 bool is_last = (idx + 1 == n);
-                if (!forward_chunk(tokens.data() + idx, 1, is_last, timers,
+                if (!forward_chunk(tokens.data() + idx, 1, is_last && compute_logits, timers,
                                    visual_embeds, &visual_idx, num_visual_tokens,
-                                   nullptr, nullptr)) {
+                                   nullptr, nullptr, false, embed_token_id)) {
                     invalidate_tier0();
                     return false;
                 }
@@ -4869,6 +4882,46 @@ static bool send_nosig(int fd, const std::string &data) {
     return true;
 }
 
+static bool send_nosig_bytes(int fd, const void *data, size_t len) {
+    const char *ptr = reinterpret_cast<const char *>(data);
+    size_t sent = 0;
+    while (sent < len) {
+#if defined(MSG_NOSIGNAL)
+        ssize_t n = send(fd, ptr + sent, len - sent, MSG_NOSIGNAL);
+#else
+        ssize_t n = send(fd, ptr + sent, len - sent, 0);
+#endif
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool recv_exact_with_leftover(int fd, const std::vector<char> &leftover, size_t &leftover_off,
+                                     void *dst, size_t len) {
+    char *out = reinterpret_cast<char *>(dst);
+    size_t got = 0;
+    if (leftover_off < leftover.size()) {
+        size_t avail = leftover.size() - leftover_off;
+        size_t take = std::min(avail, len);
+        std::memcpy(out, leftover.data() + leftover_off, take);
+        leftover_off += take;
+        got += take;
+    }
+    while (got < len && !g_interrupt_flag.load()) {
+        ssize_t r = recv(fd, out + got, len - got, 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return false;
+        }
+        got += static_cast<size_t>(r);
+    }
+    return got == len;
+}
+
 static bool is_client_disconnected(int fd) {
     char peek = 0;
     ssize_t r = recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
@@ -4920,6 +4973,8 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        int nodelay = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         std::printf("[Daemon] Client connected from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
 
         std::string req_line;
@@ -5004,6 +5059,134 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
                 send_nosig(client_fd, clr);
                 close(client_fd);
                 continue;
+            } else if (cmd == "tts_session") {
+                std::string prompt = j["prompt"].as_string("");
+                int max_frames = std::max(1, j["max_frames"].as_int(250));
+                bool raw_tts = j["raw"].as_bool(true);
+                bool no_think_tts = j["no_think"].as_bool(true);
+                int32_t audio_out_id = static_cast<int32_t>(j["audio_out_token_id"].as_int(125032));
+                Lfm3Engine::PrefixCacheOptions tts_cache_opts;
+                tts_cache_opts.enabled = j.has("cache") ? j["cache"].as_bool(true) : true;
+                tts_cache_opts.cache_namespace = j["prompt_cache_key"].as_string("");
+                tts_cache_opts.pin_blocks_up_to = j["pin_blocks_up_to"].as_int(0);
+
+                std::string formatted_tts = prompt;
+                if (!raw_tts && prompt.find("<|im_start|>") == std::string::npos) {
+                    formatted_tts = format_lfm3_chat(prompt, "You are a helpful AI assistant.", !no_think_tts);
+                }
+                std::vector<int32_t> tts_prompt_ids = encode_lfm3_text(engine.tokenizer(), formatted_tts);
+                if (tts_prompt_ids.empty()) {
+                    send_nosig(client_fd, "{\"type\":\"error\",\"message\":\"Empty prompt for tts_session\"}\n");
+                    close(client_fd);
+                    continue;
+                }
+
+                StageTimers tts_prefill_t, tts_decode_t;
+                Lfm3Engine::PrefixCacheTelemetry tts_cache_tel;
+                g_in_generation.store(true);
+                if (!engine.prefill_cached(tts_prompt_ids, tts_prefill_t, tts_cache_opts, tts_cache_tel,
+                                           nullptr, 0, false, audio_out_id)) {
+                    send_nosig(client_fd, "{\"type\":\"error\",\"message\":\"TTS prefill failed on NPU\"}\n");
+                    g_in_generation.store(false);
+                    close(client_fd);
+                    continue;
+                }
+                // Generated speech frames have dynamic codebook embeddings, so do not checkpoint them to NVMe cache.
+                engine.set_active_cache_write(false);
+
+                int max_ctx_rem = std::max(0, engine.max_ctx() - 8 - engine.pos());
+                int eff_max_frames = std::min(max_frames, max_ctx_rem);
+                if (eff_max_frames <= 0) {
+                    send_nosig(client_fd, "{\"type\":\"error\",\"message\":\"Context limit reached for tts_session\"}\n");
+                    g_in_generation.store(false);
+                    close(client_fd);
+                    continue;
+                }
+
+                std::vector<float> norm_h(Lfm3Engine::kHidden);
+                std::vector<float> next_emb(Lfm3Engine::kHidden);
+                engine.compute_normed_last_hidden(norm_h.data());
+
+                std::ostringstream ready_ss;
+                ready_ss << std::fixed << std::setprecision(2)
+                         << "{\"type\":\"tts_ready\""
+                         << ",\"prompt_tokens\":" << tts_prompt_ids.size()
+                         << ",\"cached_tokens\":" << tts_cache_tel.cached_tokens()
+                         << ",\"cache_status\":\"" << tts_cache_tel.status << "\""
+                         << ",\"cache_tier\":\"" << tts_cache_tel.tier << "\""
+                         << ",\"prefill_ms\":" << tts_prefill_t.total_ms()
+                         << ",\"effective_max_frames\":" << eff_max_frames
+                         << "}\n";
+                bool tts_ok = send_nosig(client_fd, ready_ss.str()) &&
+                              send_nosig_bytes(client_fd, norm_h.data(), Lfm3Engine::kHidden * sizeof(float));
+
+                size_t leftover_off = 0;
+                int steps = 0;
+                auto t_dec0 = std::chrono::steady_clock::now();
+                while (tts_ok && steps < eff_max_frames && engine.pos() < engine.max_ctx() - 8) {
+                    if (g_interrupt_flag.load()) {
+                        tts_ok = false;
+                        break;
+                    }
+                    uint8_t op = 0;
+                    if (!recv_exact_with_leftover(client_fd, leftover, leftover_off, &op, 1)) {
+                        tts_ok = false;
+                        break;
+                    }
+                    if (op == 0) {
+                        break;
+                    }
+                    if (op != 1) {
+                        tts_ok = false;
+                        break;
+                    }
+                    if (!recv_exact_with_leftover(client_fd, leftover, leftover_off,
+                                                  next_emb.data(), Lfm3Engine::kHidden * sizeof(float))) {
+                        tts_ok = false;
+                        break;
+                    }
+                    size_t one_idx = 0;
+                    if (!engine.forward_chunk(&audio_out_id, 1, false, tts_decode_t,
+                                              next_emb.data(), &one_idx, 1,
+                                              nullptr, nullptr, false, audio_out_id)) {
+                        engine.invalidate_tier0();
+                        tts_ok = false;
+                        break;
+                    }
+                    steps++;
+                    if (steps < eff_max_frames && engine.pos() < engine.max_ctx() - 8) {
+                        engine.compute_normed_last_hidden(norm_h.data());
+                        if (!send_nosig_bytes(client_fd, norm_h.data(), Lfm3Engine::kHidden * sizeof(float))) {
+                            tts_ok = false;
+                            break;
+                        }
+                    }
+                }
+                double dec_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_dec0).count();
+                g_in_generation.store(false);
+                if (tts_ok) {
+                    double fps = (dec_ms > 0.0) ? (1000.0 * steps / dec_ms) : 0.0;
+                    std::ostringstream done_ss;
+                    done_ss << std::fixed << std::setprecision(2)
+                            << "{\"type\":\"tts_done\""
+                            << ",\"steps\":" << steps
+                            << ",\"prefill_ms\":" << tts_prefill_t.total_ms()
+                            << ",\"decode_ms\":" << dec_ms
+                            << ",\"npu_decode_ms\":" << tts_decode_t.total_ms()
+                            << ",\"fps\":" << fps
+                            << "}\n";
+                    send_nosig(client_fd, done_ss.str());
+                    std::printf("[Daemon] TTS session completed: %zu prompt tok, %d NPU steps (%.1f ms = %.2f fps)\n",
+                                tts_prompt_ids.size(), steps, dec_ms, fps);
+                } else {
+                    std::printf("[Daemon] TTS session aborted at step %d\n", steps);
+                }
+                if (steps > 0) {
+                    engine.invalidate_tier0();
+                }
+                close(client_fd);
+                continue;
             } else {
                 std::string err_resp = "{\"type\":\"error\",\"message\":\"Unknown cmd: " +
                                        escape_json_str(cmd) + "\"}\n";
@@ -5023,7 +5206,18 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         bool no_think = j["no_think"].as_bool(true);
         bool raw = j["raw"].as_bool(false);
         bool return_logits = j["return_logits"].as_bool(false) || (max_new_tokens == 0);
-        int image_bytes = j["image_bytes"].as_int(0);
+        int image_bytes = j.has("audio_bytes") ? j["audio_bytes"].as_int(0) : j["image_bytes"].as_int(0);
+        int32_t embed_token_id = static_cast<int32_t>(j["embed_token_id"].as_int(125030));
+        std::vector<int32_t> suppress_tokens;
+        if (j["suppress_tokens"].is_array()) {
+            for (const auto &sv : j["suppress_tokens"].as_array()) {
+                int32_t tid = static_cast<int32_t>(sv.as_int(-1));
+                if (tid >= 0 && tid < Lfm3Engine::kVocab) {
+                    suppress_tokens.push_back(tid);
+                    if (suppress_tokens.size() >= 64) break;
+                }
+            }
+        }
 
         std::vector<std::string> stop_seqs;
         if (j["stop"].is_string()) {
@@ -5086,7 +5280,8 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         const float *vis_ptr = visual_embeds.empty() ? nullptr : visual_embeds.data();
         size_t num_vis_tok = visual_embeds.size() / Lfm3Engine::kHidden;
 
-        if (!engine.prefill_cached(prompt_ids, prefill_t, cache_opts, cache_tel, vis_ptr, num_vis_tok)) {
+        if (!engine.prefill_cached(prompt_ids, prefill_t, cache_opts, cache_tel,
+                                   vis_ptr, num_vis_tok, true, embed_token_id)) {
             std::string err_resp = "{\"type\":\"error\",\"message\":\"Prefill failed on NPU\"}\n";
             send_nosig(client_fd, err_resp);
             g_in_generation.store(false);
@@ -5193,6 +5388,9 @@ static void run_daemon_server(Lfm3Engine &engine, int port) {
         auto apply_think_logit_rules = [&]() {
             float *lg = engine.logits_mut();
             lg[124901] = -1e30f;
+            for (int32_t sid : suppress_tokens) {
+                lg[sid] = -1e30f;
+            }
             if (!in_think) {
                 lg[124902] = -1e30f;
                 return;

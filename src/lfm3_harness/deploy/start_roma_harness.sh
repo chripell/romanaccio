@@ -10,8 +10,13 @@ PORT="${PORT:-8000}"
 LFM3_PORT="${LFM3_PORT:-8088}"
 MOE_PORT="${MOE_PORT:-8089}"
 D1_PORT="${D1_PORT:-8090}"
+AUDIO_PORT="${AUDIO_PORT:-0}"
 ENABLE_TLS="${ENABLE_TLS:-0}"
 VISION_URL="${VISION_URL:-}"
+AUDIO_URL="${AUDIO_URL:-}"
+NATIVE_TTS_DEFAULT="${NATIVE_TTS_DEFAULT:-0}"
+# Co-resident NPU budget note: run :8091 (LFM3-Audio-2B_TP2) WITHOUT --speculative-pld
+# so all 4 daemons stay at 16 + 16 + 12 + 12 = 56 < 62 models per die.
 
 mkdir -p "$WORKSPACE_ROOT" "$STATE_DIR"
 export PYTHONPATH="${HARNESS_ROOT}:${PYTHONPATH:-}"
@@ -33,6 +38,18 @@ if [ -f "/home/chri/models/d1-2B_TP2/calibration.json" ]; then
 fi
 if [ -n "$VISION_URL" ]; then
   EXTRA_ARGS+=(--vision-url "$VISION_URL")
+fi
+if [ "$AUDIO_PORT" != "0" ] && [ -n "$AUDIO_PORT" ]; then
+  EXTRA_ARGS+=(--audio-host 127.0.0.1 --audio-port "$AUDIO_PORT")
+  if [ -f "/home/chri/models/LFM3-Audio-2B_TP2/tokenizer.json" ]; then
+    EXTRA_ARGS+=(--audio-tokenizer "/home/chri/models/LFM3-Audio-2B_TP2/tokenizer.json")
+  fi
+fi
+if [ -n "$AUDIO_URL" ]; then
+  EXTRA_ARGS+=(--audio-url "$AUDIO_URL")
+fi
+if [ "$NATIVE_TTS_DEFAULT" = "1" ]; then
+  EXTRA_ARGS+=(--native-tts-default)
 fi
 if [ "$ENABLE_TLS" = "1" ]; then
   EXTRA_ARGS+=(--self-signed-tls)

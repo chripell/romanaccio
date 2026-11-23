@@ -112,16 +112,20 @@ export async function uploadAudioBlob(blob, filename) {
 
 let activeAudioEl = null;
 
-export async function speakText(text) {
+export async function speakText(text, opts = {}) {
   if (activeAudioEl) {
     activeAudioEl.pause();
     activeAudioEl = null;
   }
+  const bodyObj = { text };
+  if (opts.engine) bodyObj.engine = opts.engine;
+  if (opts.language) bodyObj.language = opts.language;
+  if (opts.gender) bodyObj.gender = opts.gender;
   const resp = await fetch("/api/tts", {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(bodyObj),
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
@@ -136,5 +140,9 @@ export async function speakText(text) {
   return {
     engine: resp.headers.get("X-TTS-Engine") || "unknown",
     latencyMs: resp.headers.get("X-TTS-Latency-Ms") || "?",
+    frames: resp.headers.get("X-TTS-Frames") || "",
+    durationS: resp.headers.get("X-TTS-Duration-S") || "",
+    rtf: resp.headers.get("X-TTS-RTF") || "",
+    eos: resp.headers.get("X-TTS-EOS") || "",
   };
 }

@@ -71,17 +71,19 @@ def _unlink_if_exists(path: Path) -> None:
 
 
 def get_model_text_meta(model_dir: Path) -> tuple[dict, str]:
-    """Return (text_config_dict, safetensors_key_prefix) for causal LFM3 or multimodal LFM3-VL/d1 checkpoints."""
+    """Return (text_config_dict, safetensors_key_prefix) for causal LFM3 or multimodal LFM3-VL/d1/Audio checkpoints."""
     cfg = json.loads((model_dir / "config.json").read_text())
     if "text_config" in cfg and isinstance(cfg["text_config"], dict):
         return cfg["text_config"], "model.language_model."
+    if "lfm" in cfg and isinstance(cfg["lfm"], dict):
+        return cfg["lfm"], "lfm.model."
     return cfg, "model."
 
 
 def load_lfm3_text_model_and_tokenizer(model_dir: Path):
     """Load causal FP32 text backbone and fast tokenizer without importing torchvision-dependent VL auto_map."""
     text_cfg, w_prefix = get_model_text_meta(model_dir)
-    if w_prefix == "model.language_model.":
+    if w_prefix != "model.":
         tok = PreTrainedTokenizerFast(
             tokenizer_file=str(model_dir / "tokenizer.json"),
             bos_token="<|startoftext|>",
@@ -153,6 +155,19 @@ def extract_cpu_sidecar_and_embedding(model_dir: Path, pkg_out_dir: Path) -> Non
             curr_offset += len(raw)
     cpu_json_path.write_text(json.dumps(index, indent=2))
     print(f"[+] Extracted cpu_weights.bin ({curr_offset / 1024:.1f} KiB, {len(cpu_tensors)} tensors) -> {pkg_out_dir}")
+
+    with safe_open(str(model_dir / "model.safetensors"), framework="pt") as st:
+        if "codebook_embedding.weight" in st.keys():
+            cb_np = np.ascontiguousarray(st.get_tensor("codebook_embedding.weight").to(torch.float32).numpy())
+            for cb_dst in (model_dir / "audio_codebook_embed.bin", pkg_out_dir / "audio_codebook_embed.bin"):
+                _unlink_if_exists(cb_dst)
+            cb_model_path = model_dir / "audio_codebook_embed.bin"
+            cb_model_path.write_bytes(cb_np.tobytes())
+            try:
+                os.link(cb_model_path, pkg_out_dir / "audio_codebook_embed.bin")
+            except OSError:
+                shutil.copy2(cb_model_path, pkg_out_dir / "audio_codebook_embed.bin")
+            print(f"[+] Extracted audio_codebook_embed.bin {tuple(cb_np.shape)} ({cb_model_path.stat().st_size / (1024 * 1024):.1f} MiB)")
 
     cal_src = model_dir / "calibration.json"
     if cal_src.is_file():
@@ -701,12 +716,15 @@ def main():
     templates_dir = args.templates_dir.resolve()
     lm_tmpl_path = args.lm_head_tmpl.resolve()
     text_cfg, w_prefix = get_model_text_meta(model_dir)
+    lm_calib_cache = args.lm_calib_cache
+    if model_dir != DEFAULT_MODEL_DIR.resolve() and lm_calib_cache == DEFAULT_LM_CALIB_PT:
+        lm_calib_cache = pkg_out_dir / "lm_head_calib_fp32.pt"
 
     if args.patch_lm_head_only:
         st = safe_open(str(model_dir / "model.safetensors"), framework="pt")
         w_key = f"{w_prefix}embed_tokens.weight" if f"{w_prefix}embed_tokens.weight" in st.keys() else "lm_head.weight"
         emb_w = st.get_tensor(w_key).float()
-        x_cal_lm = collect_lm_head_calibration_activations(model_dir, args.lm_calib_cache, args.recalibrate_lm_head)
+        x_cal_lm = collect_lm_head_calibration_activations(model_dir, lm_calib_cache, args.recalibrate_lm_head)
         lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_int16_slices(
             emb_w, x_cal_lm, lm_tmpl_path, pkg_out_dir / "models"
         )
@@ -776,7 +794,7 @@ def main():
     with safe_open(str(model_dir / "model.safetensors"), framework="pt") as st_lm:
         w_key = f"{w_prefix}embed_tokens.weight" if f"{w_prefix}embed_tokens.weight" in st_lm.keys() else "lm_head.weight"
         emb_w = st_lm.get_tensor(w_key).float()
-    x_cal_lm = collect_lm_head_calibration_activations(model_dir, args.lm_calib_cache, args.recalibrate_lm_head)
+    x_cal_lm = collect_lm_head_calibration_activations(model_dir, lm_calib_cache, args.recalibrate_lm_head)
     lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_int16_slices(
         emb_w, x_cal_lm, lm_tmpl_path, pkg_out_dir / "models"
     )

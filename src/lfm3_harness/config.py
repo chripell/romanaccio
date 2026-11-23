@@ -98,6 +98,7 @@ class BackendEndpoint:
     supports_vision: bool = False
     default_repeat_penalty: float = 1.1
     tokenizer_path: Optional[Path] = None
+    supports_audio: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,9 @@ class HarnessConfig:
     secondary_actor: Optional[BackendEndpoint] = None
     d1: Optional[BackendEndpoint] = None
     vision_url: Optional[str] = None
+    audio_daemon: Optional[BackendEndpoint] = None
+    audio_url: Optional[str] = None
+    native_tts_default: bool = False
     capabilities: Capabilities = field(default_factory=Capabilities)
     limits: SafetyLimits = field(default_factory=SafetyLimits)
     auth_token: Optional[str] = None

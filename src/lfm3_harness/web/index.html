@@ -68,6 +68,7 @@
           <span id="hud-cache-badge" class="badge">Cache: -</span>
           <span id="hud-d1-badge" class="badge subtle">d1: -</span>
           <span id="hud-vision-badge" class="badge subtle">Vision: off</span>
+          <span id="hud-asr-badge" class="badge subtle">ASR: off</span>
           <span id="hud-npu-badge" class="badge">NPU: -</span>
           <span id="hud-tts-badge" class="badge">Voice: -</span>
           <button id="logout-btn" class="btn tiny hidden">Lock</button>
@@ -89,6 +90,10 @@
               <input id="voice-reply-toggle" type="checkbox" />
               <span id="voice-reply-label">Voice replies</span>
             </label>
+            <select id="tts-engine-select" class="input-compact" title="TTS synthesis engine">
+              <option value="auto">TTS: Auto</option>
+              <option value="espeak-ng">espeak-ng</option>
+            </select>
             <span id="route-status-pill" class="badge subtle">d1 route: idle</span>
             <div class="spacer"></div>
             <label id="image-upload-btn" class="btn small file-btn hidden" title="Attach image via Vision Sidecar">

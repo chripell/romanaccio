@@ -99,7 +99,30 @@ async function initData() {
 
   $("voice-reply-label").textContent = state.ttsEngine ? `Voice (${state.ttsEngine})` : "Voice unavailable";
   $("voice-reply-toggle").disabled = !state.ttsEngine;
+  const ttsSel = $("tts-engine-select");
+  if (ttsSel) {
+    ttsSel.innerHTML = "";
+    const autoOpt = document.createElement("option");
+    autoOpt.value = "auto";
+    autoOpt.textContent = state.ttsEngine ? `TTS: Auto (${state.ttsEngine})` : "TTS: Auto";
+    ttsSel.appendChild(autoOpt);
+    for (const eng of state.capabilities.tts_engines || []) {
+      const o = document.createElement("option");
+      o.value = eng;
+      o.textContent = eng;
+      ttsSel.appendChild(o);
+    }
+    ttsSel.disabled = !state.ttsEngine;
+  }
   $("hud-tts-badge").textContent = state.ttsEngine ? `TTS: ${state.ttsEngine}` : "TTS: off";
+  if (state.capabilities.voice_asr) {
+    const asrOk = state.capabilities.asr_reachable !== false;
+    $("hud-asr-badge").textContent = asrOk ? `ASR: ${state.capabilities.asr_engine || "lfm3-audio"}` : "ASR: unreachable";
+    $("hud-asr-badge").className = `badge ${asrOk ? "ok" : "warn"}`;
+  } else {
+    $("hud-asr-badge").textContent = "ASR: off";
+    $("hud-asr-badge").className = "badge subtle";
+  }
   if (state.capabilities.vision) {
     $("image-upload-btn").classList.remove("hidden");
     $("hud-vision-badge").textContent = state.capabilities.vision_reachable ? `Vision: ${state.capabilities.vision_model || "on"}` : "Vision: unreachable";
@@ -427,7 +450,8 @@ async function sendChatMessage() {
       } else if (evName === "done") {
         bodyEl.innerHTML = renderSafeMarkdown(accText || (payload.status === "awaiting_approval" ? "Proposed file modification staged for approval." : ""));
         if ($("voice-reply-toggle").checked && state.ttsEngine && accText) {
-          speakText(accText).catch(() => {});
+          const eng = $("tts-engine-select")?.value || "auto";
+          speakText(accText, { engine: eng }).catch(() => {});
         }
       }
     };
@@ -666,9 +690,12 @@ function wireEvents() {
     try {
       const res = await uploadAudioBlob(f, f.name);
       const m = res.metadata;
-      $("audio-status-bar").textContent = `Normalized ${m.filename}: ${m.duration_s}s, ${m.sample_rate}Hz, ${m.channels}ch` + (res.transcript ? ` -> transcribed` : ` (ASR pending M19F.1)`);
-      if (res.transcript) {
-        $("chat-input").value = ($("chat-input").value ? $("chat-input").value + " " : "") + res.transcript;
+      const tr = (res.transcript || "").trim();
+      $("audio-status-bar").textContent =
+        `Normalized ${m.filename}: ${m.duration_s}s, ${m.sample_rate}Hz, ${m.channels}ch` +
+        (tr ? ` -> transcribed (${res.asr_engine || "asr"})` : state.capabilities.voice_asr ? " (no speech detected)" : " (ASR disabled)");
+      if (tr) {
+        $("chat-input").value = ($("chat-input").value ? $("chat-input").value + " " : "") + tr;
       }
     } catch (err) {
       $("audio-status-bar").textContent = `Audio error: ${err.message}`;
@@ -696,9 +723,12 @@ function wireEvents() {
       try {
         const wav = await state.recorder.stop();
         const res = await uploadAudioBlob(wav, "mic.wav");
-        $("audio-status-bar").textContent = `Mic clip ready: ${res.metadata.duration_s}s @ ${res.metadata.sample_rate}Hz` + (res.transcript ? ` -> transcribed` : ` (ASR pending M19F.1)`);
-        if (res.transcript) {
-          $("chat-input").value = ($("chat-input").value ? $("chat-input").value + " " : "") + res.transcript;
+        const tr = (res.transcript || "").trim();
+        $("audio-status-bar").textContent =
+          `Mic clip ready: ${res.metadata.duration_s}s @ ${res.metadata.sample_rate}Hz` +
+          (tr ? ` -> transcribed (${res.asr_engine || "asr"})` : state.capabilities.voice_asr ? " (no speech detected)" : " (ASR disabled)");
+        if (tr) {
+          $("chat-input").value = ($("chat-input").value ? $("chat-input").value + " " : "") + tr;
         }
       } catch (err) {
         $("audio-status-bar").textContent = `Mic error: ${err.message}`;
