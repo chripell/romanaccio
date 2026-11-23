@@ -63,9 +63,9 @@ class Lfm3VisionEncoder:
             providers=["CPUExecutionProvider"]
         )
 
-        # ImageNet normalization parameters
-        self.mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-        self.std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+        # Official Lfm3VlImageProcessor normalization (mean=std=[0.5, 0.5, 0.5] -> [-1, 1])
+        self.mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        self.std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
     def preprocess_image(
         self,
@@ -100,7 +100,7 @@ class Lfm3VisionEncoder:
         target_w = min(target_w, max_dim)
         target_h = min(target_h, max_dim)
 
-        img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+        img = img.resize((target_w, target_h), Image.Resampling.BICUBIC)
         arr = np.array(img, dtype=np.float32) / 255.0
         arr = (arr - self.mean) / self.std  # [H, W, 3]
         arr = np.transpose(arr, (2, 0, 1))  # [3, H, W]
@@ -120,8 +120,8 @@ class Lfm3VisionEncoder:
         # Permute to: [gh_blocks, gw_blocks, merge_h, merge_w, C, patch_h, patch_w]
         patches = np.transpose(patches, (1, 4, 2, 5, 0, 3, 6))
 
-        # Replicate along temporal dimension (temp_size=2)
-        patches = np.repeat(np.expand_dims(patches, axis=4), temp_size, axis=4)
+        # Replicate along temporal dimension (axis=5 -> [C, temp_size, patch_h, patch_w] matching Lfm3VlImageProcessor)
+        patches = np.repeat(np.expand_dims(patches, axis=5), temp_size, axis=5)
         patches = patches.reshape(gh_blocks, gw_blocks, merge_size, merge_size, C * temp_size * patch_size * patch_size)
         return patches.astype(np.float32), gh_blocks, gw_blocks
 

@@ -50,10 +50,11 @@ from .missions import (
     setup_desk_task_workspace,
 )
 from .paths import PathSandboxError, WorkspaceSandbox
-from .protocol import ParsedToolCall, parse_assistant_output, render_prompt
+from .protocol import ParsedToolCall, _format_suffix_note, parse_assistant_output, render_prompt
 from .router import IntentRouter
 from .store import HarnessStore
 from .tools import ToolExecutor, get_tool_schemas
+from .vision import ImageMetadata, VisionClient, build_image_metadata, format_vision_placeholder, inspect_image_bytes
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 _READ_ONLY_CHAT_TOOLS = frozenset({"list_files", "read_file", "search_files", "related_files", "look", "transcribe"})
@@ -120,16 +121,34 @@ def _stored_msgs_to_chatml(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in rows:
         role = str(r.get("role") or "user")
+        tel: Dict[str, Any] = {}
+        tel_raw = r.get("telemetry_json")
+        if isinstance(tel_raw, str) and tel_raw.strip() and tel_raw.strip() != "{}":
+            try:
+                parsed_tel = json.loads(tel_raw)
+                if isinstance(parsed_tel, dict):
+                    tel = parsed_tel
+            except json.JSONDecodeError:
+                tel = {}
         if role == "tool":
+            content_str = str(r.get("content") or "")
+            advs = tel.get("advisories") if isinstance(tel.get("advisories"), list) else None
+            if advs:
+                content_str += _format_suffix_note(advisories=[str(a) for a in advs])
             out.append(
                 {
                     "role": "tool",
                     "tool_call_id": str(r.get("tool_call_id") or ""),
-                    "content": str(r.get("content") or ""),
+                    "content": content_str,
                 }
             )
             continue
-        item: Dict[str, Any] = {"role": role, "content": str(r.get("content") or "")}
+        content_str = str(r.get("content") or "")
+        if role == "user":
+            rh = str(tel.get("route_hint") or "").strip() or None
+            if rh:
+                content_str += _format_suffix_note(route_hint=rh)
+        item: Dict[str, Any] = {"role": role, "content": content_str}
         if r.get("thinking"):
             item["thinking"] = str(r["thinking"])
         tcalls_raw = r.get("tool_calls_json")
@@ -149,11 +168,12 @@ def _build_daemon_client(
     *,
     tokenizer_override: Optional[TokenizerLookup] = None,
     calibration_path: Optional[Path] = None,
+    load_tokenizer: bool = True,
 ) -> Optional[DaemonClient]:
     if ep is None:
         return None
     tok = tokenizer_override
-    if tok is None and ep.tokenizer_path and Path(ep.tokenizer_path).exists():
+    if load_tokenizer and tok is None and ep.tokenizer_path and Path(ep.tokenizer_path).exists():
         tok = TokenizerLookup.from_file(ep.tokenizer_path)
     cal = Calibration.load(calibration_path) if calibration_path else Calibration()
     return DaemonClient(
@@ -171,6 +191,7 @@ def create_app(
     *,
     store: Optional[HarnessStore] = None,
     audio_service: Optional[AudioService] = None,
+    vision_client: Optional[VisionClient] = None,
     calibration_path: Optional[Path] = None,
     allow_no_auth: bool = False,
 ) -> FastAPI:
@@ -182,8 +203,9 @@ def create_app(
 
     audio = audio_service or AudioService()
     audio_caps = audio.capabilities()
+    v_client: Optional[VisionClient] = vision_client or (VisionClient(config.vision_url) if config.vision_url else None)
     caps = Capabilities(
-        vision=bool(config.capabilities.vision or config.vision_url),
+        vision=bool(config.capabilities.vision or config.vision_url or v_client is not None),
         voice_asr=bool(config.capabilities.voice_asr or audio_caps["voice_asr"]),
         voice_tts=bool(config.capabilities.voice_tts or audio_caps["voice_tts"]),
         tts_engine=config.capabilities.tts_engine or audio_caps["tts_engine"],
@@ -192,21 +214,47 @@ def create_app(
     clients: Dict[str, DaemonClient] = {}
     endpoints: Dict[str, BackendEndpoint] = {}
     actor_ep = config.actor
+    actor_native_vision = bool(actor_ep.supports_vision)
+    if actor_ep.family == "lfm3" and caps.vision and not actor_ep.supports_vision:
+        actor_ep = BackendEndpoint(
+            name=actor_ep.name,
+            host=actor_ep.host,
+            port=actor_ep.port,
+            family=actor_ep.family,
+            supports_thinking=actor_ep.supports_thinking,
+            supports_vision=True,
+            default_repeat_penalty=actor_ep.default_repeat_penalty,
+            tokenizer_path=actor_ep.tokenizer_path,
+        )
     endpoints[actor_ep.name] = actor_ep
-    c_primary = _build_daemon_client(actor_ep, calibration_path=calibration_path)
+    d1_ep = config.d1
+    d1_separate = bool(d1_ep is not None and (d1_ep.host != actor_ep.host or d1_ep.port != actor_ep.port))
+
+    c_primary = _build_daemon_client(actor_ep, calibration_path=calibration_path, load_tokenizer=not d1_separate)
     if c_primary is not None:
         clients[actor_ep.name] = c_primary
 
     if config.secondary_actor is not None:
         sec_ep = config.secondary_actor
         endpoints[sec_ep.name] = sec_ep
-        c_sec = _build_daemon_client(sec_ep, calibration_path=calibration_path)
+        c_sec = _build_daemon_client(sec_ep, calibration_path=calibration_path, load_tokenizer=False)
         if c_sec is not None:
             clients[sec_ep.name] = c_sec
 
-    d1_ep = config.d1
-    d1_client = _build_daemon_client(d1_ep, calibration_path=calibration_path) if d1_ep else c_primary
-    d1_separate = bool(d1_ep is not None and (d1_ep.host != actor_ep.host or d1_ep.port != actor_ep.port))
+    d1_client = (
+        _build_daemon_client(d1_ep, calibration_path=calibration_path, load_tokenizer=True)
+        if d1_separate
+        else c_primary
+    )
+    if actor_native_vision:
+        vision_daemon_client = clients[actor_ep.name]
+        vision_daemon_name = actor_ep.name
+    elif d1_separate and d1_client is not None:
+        vision_daemon_client = d1_client
+        vision_daemon_name = d1_ep.name if d1_ep is not None else "d1-2b"
+    else:
+        vision_daemon_client = clients[actor_ep.name]
+        vision_daemon_name = actor_ep.name
 
     router = IntentRouter(d1_client, capabilities=caps, limits=config.limits)
     write_gate = WriteGate(d1_client, limits=config.limits)
@@ -222,6 +270,8 @@ def create_app(
     mission_tasks: Dict[str, asyncio.Task] = {}
     mission_logs: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
     audio_tmp_dir = state_store.db_path.parent / "audio_uploads"
+    image_tmp_dir = state_store.db_path.parent / "image_uploads"
+    uploaded_images: Dict[str, Tuple[ImageMetadata, Path]] = {}
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -335,6 +385,7 @@ def create_app(
     @app.get("/api/models")
     async def get_models() -> Dict[str, Any]:
         out: List[Dict[str, Any]] = []
+        primary_reachable = False
         for name, ep in endpoints.items():
             cli = clients[name]
             reachable = False
@@ -344,6 +395,8 @@ def create_app(
                 reachable = True
             except Exception:
                 reachable = False
+            if name == actor_ep.name:
+                primary_reachable = reachable
             out.append(
                 {
                     "name": ep.name,
@@ -356,16 +409,43 @@ def create_app(
                     "cache": stats,
                 }
             )
+
+        d1_reachable = primary_reachable
+        d1_stats: Dict[str, Any] = {}
+        if d1_separate and d1_client is not None:
+            d1_reachable = False
+            try:
+                d1_stats = await asyncio.wait_for(d1_client.cache_stats(timeout_s=1.2), timeout=1.5)
+                d1_reachable = True
+            except Exception:
+                d1_reachable = False
+
+        vision_reachable = False
+        vision_model = ""
+        if v_client is not None:
+            try:
+                vh = await asyncio.wait_for(v_client.health(), timeout=2.0)
+                vision_reachable = bool(vh.get("status") == "ok")
+                vision_model = str(vh.get("model") or "")
+            except Exception:
+                vision_reachable = False
+
         return {
             "default_model": actor_ep.name,
             "models": out,
             "d1": {
+                "name": d1_ep.name if (d1_separate and d1_ep) else actor_ep.name,
                 "host": d1_ep.host if d1_ep else actor_ep.host,
                 "port": d1_ep.port if d1_ep else actor_ep.port,
                 "separate_daemon": d1_separate,
+                "reachable": d1_reachable,
+                "cache": d1_stats,
             },
             "capabilities": {
                 "vision": caps.vision,
+                "vision_url": config.vision_url or (getattr(v_client, "base_url", None) if v_client else None),
+                "vision_reachable": vision_reachable,
+                "vision_model": vision_model,
                 "voice_asr": caps.voice_asr,
                 "voice_tts": caps.voice_tts,
                 "tts_engine": audio.tts_engine,
@@ -478,11 +558,33 @@ def create_app(
         max_tokens = max(1, min(4096, int(body.get("max_tokens", 1024))))
         max_rounds = max(1, min(config.limits.max_tool_rounds, int(body.get("max_rounds", config.limits.max_tool_rounds))))
 
+        image_id = str(body.get("image_id") or "").strip()
+        turn_image_bytes: Optional[bytes] = None
+        attached_img_meta: Optional[ImageMetadata] = None
+        vision_prefix = ""
+        stored_user_content = content
+        if image_id:
+            if image_id not in uploaded_images:
+                raise HTTPException(status_code=404, detail=f"Unknown image_id '{image_id}'")
+            if ep.family != "lfm3":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{ep.name}' does not support direct vision input; switch to '{actor_ep.name}' or use workspace look()",
+                )
+            img_meta, img_embed_path = uploaded_images[image_id]
+            attached_img_meta = img_meta
+            turn_image_bytes = img_embed_path.read_bytes()
+            vision_prefix = format_vision_placeholder(img_meta.num_tokens) + "\n"
+            stored_user_content = (
+                f"[Image attached: {img_meta.filename} ({img_meta.width}x{img_meta.height}, {img_meta.num_tokens} vis tok)]\n"
+                f"{content}"
+            )
+
         prior_rows = state_store.list_messages(sid)
         if not prior_rows and (sess.get("title") or "").strip() in ("", "New Chat"):
             state_store.update_session_title(sid, content.splitlines()[0][:64])
 
-        user_row = state_store.add_message(sid, "user", content)
+        user_row = state_store.add_message(sid, "user", stored_user_content)
         asst_placeholder = state_store.add_message(sid, "assistant", "", status="streaming")
         cancel_ev = asyncio.Event()
         active_chat_cancels[sid] = cancel_ev
@@ -507,26 +609,88 @@ def create_app(
 
             watcher = asyncio.create_task(_watch_disconnect())
             try:
-                # 1. Single-pass 7-intent routing (skip only if user explicitly passed enable_d1=False)
+                # 1. Single-pass 7-intent routing
                 route = await router.route(content, prompt_cache_key=f"d1:router:{sid}")
                 state_store.log_event("session", sid, "route_decision", route.to_dict())
                 yield _sse("route", route.to_dict())
 
+                stored_user_txt = stored_user_content
+                active_image_bytes = turn_image_bytes
+                user_prompt_content = f"{vision_prefix}{content}" if vision_prefix else content
+                if (
+                    turn_image_bytes is not None
+                    and attached_img_meta is not None
+                    and not actor_native_vision
+                    and d1_separate
+                    and d1_client is not None
+                ):
+                    vis_prompt = (
+                        f"<|startoftext|><|im_start|>user\n"
+                        f"{vision_prefix}{content}"
+                        f"<|im_end|>\n<|im_start|>assistant\n<think></think>"
+                    )
+                    vis_req = GenerateRequest(
+                        prompt=vis_prompt,
+                        max_tokens=192,
+                        temperature=0.1,
+                        repeat_penalty=actor_ep.default_repeat_penalty,
+                        think_budget=0,
+                        no_think=True,
+                        raw=True,
+                        cache=True,
+                        prompt_cache_key=f"vision:{sid}",
+                        image_bytes=turn_image_bytes,
+                        session_id=f"{sid}:img",
+                    )
+                    vis_ans: List[str] = []
+                    try:
+                        async for vev in vision_daemon_client.stream_generate(vis_req, cancel_event=cancel_ev, read_timeout_s=60.0):
+                            if vev.type == "token" and not vev.payload.get("thinking"):
+                                vis_ans.append(str(vev.payload.get("text") or ""))
+                    except (BackendUnavailableError, BackendDisconnectError, BackendTimeoutError, BackendError) as exc:
+                        terminal_status = "error"
+                        yield _sse("error", {"status_code": getattr(exc, "status_code", 502), "message": str(exc)})
+                        return
+                    vis_obs = "".join(vis_ans).strip()
+                    yield _sse(
+                        "vision_decode",
+                        {
+                            "vision_actor": vision_daemon_name,
+                            "filename": attached_img_meta.filename,
+                            "visual_tokens": attached_img_meta.num_tokens,
+                            "observation": vis_obs,
+                        },
+                    )
+                    stored_user_txt = (
+                        f"[Image attached: {attached_img_meta.filename} ({attached_img_meta.width}x{attached_img_meta.height}, "
+                        f"{attached_img_meta.num_tokens} vis tok) | {vision_daemon_name} vision: {vis_obs}]\n{content}"
+                    )
+                    user_prompt_content = stored_user_txt
+                    active_image_bytes = None
+
+                if route.route_hint or stored_user_txt != stored_user_content:
+                    state_store.update_message(
+                        user_row["id"],
+                        content=stored_user_txt,
+                        telemetry={"route_hint": route.route_hint} if route.route_hint else None,
+                    )
+                user_note = _format_suffix_note(route_hint=route.route_hint)
+
                 history = _stored_msgs_to_chatml(prior_rows)
-                history.append({"role": "user", "content": content})
+                history.append({"role": "user", "content": f"{user_prompt_content}{user_note}"})
 
                 tool_schemas = get_tool_schemas(caps, include_job_tools=False)
                 executor = ToolExecutor(sandbox, caps, config.limits)
                 allowed_names = {s["function"]["name"] for s in tool_schemas if isinstance(s.get("function"), dict)}
                 ro_observations: List[str] = []
                 evidence_sent = False
+                last_tool_row: Optional[Dict[str, Any]] = None
 
                 for round_idx in range(1, max_rounds + 1):
                     if cancel_ev.is_set():
                         terminal_status = "cancelled"
                         break
 
-                    advisories: List[str] = []
                     if round_idx >= 2 and ro_observations and not evidence_sent:
                         ev_verdict = await evidence_gate.evaluate(
                             content,
@@ -537,7 +701,15 @@ def create_app(
                         yield _sse("evidence_gate", ev_verdict.to_dict())
                         evidence_sent = True
                         if ev_verdict.advisory:
-                            advisories.append(ev_verdict.advisory)
+                            adv_note = _format_suffix_note(advisories=[ev_verdict.advisory])
+                            if adv_note and history:
+                                history[-1]["content"] = f"{str(history[-1].get('content') or '')}{adv_note}"
+                            if last_tool_row is not None:
+                                state_store.update_message(
+                                    last_tool_row["id"],
+                                    content=str(last_tool_row.get("content") or ""),
+                                    telemetry={"advisories": [ev_verdict.advisory]},
+                                )
 
                     rendered = render_prompt(
                         history,
@@ -546,8 +718,6 @@ def create_app(
                         tool_schemas=tool_schemas,
                         family=ep.family,
                         enable_thinking=enable_thinking,
-                        route_hint=route.route_hint,
-                        advisories=advisories or None,
                     )
                     gen_req = GenerateRequest(
                         prompt=rendered.prompt,
@@ -561,6 +731,7 @@ def create_app(
                         prompt_cache_key=f"chat:{sid}:{ep.name}",
                         pin_blocks_up_to=rendered.pin_blocks_up_to,
                         stop=rendered.stop_sequences,
+                        image_bytes=active_image_bytes if round_idx == 1 else None,
                         session_id=f"{sid}:r{round_idx}",
                     )
 
@@ -684,6 +855,65 @@ def create_app(
                                     tool_call_id=ntc.call_id,
                                 )
                                 awaiting_approval = True
+                        elif ntc.name == "look" and v_client is not None and caps.vision:
+                            rel_img = str(ntc.arguments.get("path") or "").strip()
+                            v_question = str(
+                                ntc.arguments.get("question")
+                                or "Describe this image accurately, noting shapes, colors, layout, and any readable text."
+                            ).strip()
+                            look_ok = False
+                            try:
+                                target_img = sandbox.resolve_read(rel_img)
+                                raw_img = target_img.read_bytes()
+                                img_meta_tool = build_image_metadata(raw_img, target_img.name)
+                                emb_bytes, n_vis_tok, _vinfo = await v_client.encode(raw_img, filename=target_img.name)
+                                vis_prompt = (
+                                    f"<|startoftext|><|im_start|>user\n"
+                                    f"{format_vision_placeholder(n_vis_tok)}\n{v_question}"
+                                    f"<|im_end|>\n<|im_start|>assistant\n<think></think>"
+                                )
+                                vis_req = GenerateRequest(
+                                    prompt=vis_prompt,
+                                    max_tokens=256,
+                                    temperature=0.1,
+                                    repeat_penalty=actor_ep.default_repeat_penalty,
+                                    think_budget=0,
+                                    no_think=True,
+                                    raw=True,
+                                    cache=True,
+                                    prompt_cache_key=f"vision:{sid}",
+                                    image_bytes=emb_bytes,
+                                    session_id=f"{sid}:r{round_idx}:look",
+                                )
+                                vis_ans: List[str] = []
+                                async for vev in vision_daemon_client.stream_generate(vis_req, cancel_event=cancel_ev, read_timeout_s=60.0):
+                                    if vev.type == "token" and not vev.payload.get("thinking"):
+                                        vis_ans.append(str(vev.payload.get("text") or ""))
+                                look_ok = True
+                                out_str = json.dumps(
+                                    {
+                                        "status": "ok",
+                                        "path": sandbox.relativize(target_img),
+                                        "bytes": img_meta_tool.bytes,
+                                        "sha256": img_meta_tool.sha256,
+                                        "format": img_meta_tool.format,
+                                        "width": img_meta_tool.width,
+                                        "height": img_meta_tool.height,
+                                        "visual_tokens": n_vis_tok,
+                                        "vision_actor": vision_daemon_name,
+                                        "description": "".join(vis_ans).strip(),
+                                    },
+                                    indent=2,
+                                )
+                            except PathSandboxError as exc:
+                                out_str = json.dumps({"ok": False, "error": f"Sandbox violation ({exc.reason}): {exc}"})
+                            except Exception as exc:
+                                out_str = json.dumps({"ok": False, "error": f"Vision look failed: {exc}"})
+                            if look_ok:
+                                ro_observations.append(f"[look]\n{out_str}")
+                            yield _sse("tool_result", {"round": round_idx, "call_id": ntc.call_id, "name": ntc.name, "ok": look_ok, "result": out_str})
+                            history.append({"role": "tool", "tool_call_id": ntc.call_id, "content": out_str})
+                            last_tool_row = state_store.add_message(sid, "tool", out_str, tool_call_id=ntc.call_id)
                         elif ntc.name in _READ_ONLY_CHAT_TOOLS:
                             res = executor.execute(ntc.name, ntc.arguments, allowed_tools=tuple(allowed_names))
                             out_str = res.content if res.ok else json.dumps({"ok": False, "error": res.error})
@@ -691,7 +921,7 @@ def create_app(
                                 ro_observations.append(f"[{ntc.name}]\n{out_str}")
                             yield _sse("tool_result", {"round": round_idx, "call_id": ntc.call_id, "name": ntc.name, "ok": res.ok, "result": out_str})
                             history.append({"role": "tool", "tool_call_id": ntc.call_id, "content": out_str})
-                            state_store.add_message(sid, "tool", out_str, tool_call_id=ntc.call_id)
+                            last_tool_row = state_store.add_message(sid, "tool", out_str, tool_call_id=ntc.call_id)
                         else:
                             err_out = json.dumps({"ok": False, "error": f"Unknown/disabled tool '{ntc.name}'"})
                             yield _sse("tool_result", {"round": round_idx, "call_id": ntc.call_id, "name": ntc.name, "ok": False, "result": err_out})
@@ -958,9 +1188,16 @@ def create_app(
         target = str(body.get("model") or "all").strip()
         include_pinned = bool(body.get("include_pinned", False))
         results: Dict[str, Any] = {}
-        targets = list(clients.items()) if target == "all" else [(target, clients[target])] if target in clients else []
-        if target != "all" and not targets:
-            raise HTTPException(status_code=404, detail=f"Unknown model '{target}'")
+        all_targets: List[Tuple[str, DaemonClient]] = list(clients.items())
+        if d1_separate and d1_client is not None:
+            all_targets.append(("d1", d1_client))
+
+        if target == "all":
+            targets = all_targets
+        else:
+            targets = [(n, c) for n, c in all_targets if n == target]
+            if not targets:
+                raise HTTPException(status_code=404, detail=f"Unknown model '{target}'")
         for name, cli in targets:
             try:
                 results[name] = await asyncio.wait_for(cli.cache_clear(include_pinned=include_pinned, timeout_s=5.0), timeout=5.5)
@@ -971,6 +1208,57 @@ def create_app(
     @app.get("/api/system/health")
     async def system_health() -> Dict[str, Any]:
         return _collect_system_health(len(active_chat_cancels), len(active_mission_cancels), audio.capabilities())
+
+    @app.post("/api/images/upload")
+    async def upload_image(request: Request, filename: str = "image.png", max_dim: int = 512) -> Dict[str, Any]:
+        if v_client is None or not caps.vision:
+            raise HTTPException(status_code=503, detail="Vision sidecar is not configured (--vision-url)")
+        ctype = (request.headers.get("content-type") or "").lower()
+        chosen_name = filename
+        if "multipart/form-data" in ctype:
+            try:
+                form = await request.form()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Multipart upload unavailable: {exc}") from exc
+            up = form.get("file") or form.get("image")
+            if up is None:
+                raise HTTPException(status_code=400, detail="Missing 'file' form field")
+            chosen_name = getattr(up, "filename", None) or filename
+            raw_bytes = await up.read()
+        else:
+            raw_bytes = await request.body()
+
+        try:
+            pre_meta = build_image_metadata(raw_bytes, chosen_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            embed_bytes, n_tok, vinfo = await v_client.encode(raw_bytes, filename=pre_meta.filename, max_dim=max_dim)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        image_tmp_dir.mkdir(parents=True, exist_ok=True)
+        image_id = f"img_{secrets.token_hex(6)}"
+        raw_path = (image_tmp_dir / f"{image_id}_{pre_meta.filename}").resolve()
+        embed_path = (image_tmp_dir / f"{image_id}.f32").resolve()
+        raw_path.write_bytes(raw_bytes)
+        embed_path.write_bytes(embed_bytes)
+
+        meta = ImageMetadata(
+            filename=pre_meta.filename,
+            bytes=pre_meta.bytes,
+            sha256=pre_meta.sha256,
+            format=pre_meta.format,
+            width=pre_meta.width,
+            height=pre_meta.height,
+            num_tokens=n_tok,
+            saved_path=str(raw_path),
+        )
+        uploaded_images[image_id] = (meta, embed_path)
+        return {"ok": True, "image_id": image_id, "metadata": meta.to_dict(), "vision_info": vinfo}
 
     @app.post("/api/audio/upload")
     async def upload_audio(request: Request, filename: str = "clip.wav") -> Dict[str, Any]:
@@ -1074,6 +1362,7 @@ def build_config_from_args(ns: argparse.Namespace) -> Tuple[HarnessConfig, bool,
         port=ns.lfm3_port,
         family="lfm3",
         supports_thinking=True,
+        supports_vision=False,
         tokenizer_path=Path(ns.lfm3_tokenizer) if ns.lfm3_tokenizer else None,
     )
     secondary = None
@@ -1088,14 +1377,21 @@ def build_config_from_args(ns: argparse.Namespace) -> Tuple[HarnessConfig, bool,
         )
     d1_ep = None
     if ns.d1_port > 0:
+        d1_tok = ns.d1_tokenizer or ns.lfm3_tokenizer
         d1_ep = BackendEndpoint(
             name="d1-2b",
             host=ns.d1_host,
             port=ns.d1_port,
             family="lfm3",
             supports_thinking=True,
-            tokenizer_path=Path(ns.lfm3_tokenizer) if ns.lfm3_tokenizer else None,
+            tokenizer_path=Path(d1_tok) if d1_tok else None,
         )
+
+    cal_file: Optional[Path] = Path(ns.calibration_json) if ns.calibration_json else None
+    if cal_file is None:
+        default_d1_cal = Path("/home/chri/models/d1-2B_TP2/calibration.json")
+        if default_d1_cal.is_file():
+            cal_file = default_d1_cal
 
     tok: Optional[str] = ns.auth_token
     if ns.no_auth:
@@ -1132,13 +1428,11 @@ def build_config_from_args(ns: argparse.Namespace) -> Tuple[HarnessConfig, bool,
         ssl_certfile=ssl_cert,
         ssl_keyfile=ssl_key,
     )
-    return cfg, bool(ns.no_auth), ns.piper_bin or None, (Path(ns.piper_model) if ns.piper_model else None), (
-        Path(ns.calibration_json) if ns.calibration_json else None
-    )
+    return cfg, bool(ns.no_auth), ns.piper_bin or None, (Path(ns.piper_model) if ns.piper_model else None), cal_file
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Romanaccio Zero-Build LAN Harness Web Server (Milestone 19D)")
+    parser = argparse.ArgumentParser(description="Romanaccio Zero-Build LAN Harness Web Server (Milestone 19E)")
     parser.add_argument("--workspace-root", default="/home/chri/workspace", help="Confined root directory for tools/edits")
     parser.add_argument("--state-dir", default="", help="SQLite/TLS/audio state directory")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind host (127.0.0.1 or 0.0.0.0 for LAN)")
@@ -1151,6 +1445,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--moe-tokenizer", default="")
     parser.add_argument("--d1-host", default="127.0.0.1")
     parser.add_argument("--d1-port", type=int, default=0, help="Dedicated d1 port (0 = reuse lfm3 actor)")
+    parser.add_argument("--d1-tokenizer", default="", help="Optional tokenizer.json for dedicated d1-2B package")
     parser.add_argument("--vision-url", default="")
     parser.add_argument("--calibration-json", default="")
     parser.add_argument("--piper-bin", default="")
@@ -1169,8 +1464,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     scheme = "https" if (cfg.ssl_certfile and cfg.ssl_keyfile) else "http"
     print(f"[romanaccio-harness] {scheme}://{ns.bind}:{ns.port} | workspace={cfg.workspace_root}")
     print(f"[romanaccio-harness] actors: {cfg.actor.name}={cfg.actor.host}:{cfg.actor.port}"
-          + (f", {cfg.secondary_actor.name}={cfg.secondary_actor.host}:{cfg.secondary_actor.port}" if cfg.secondary_actor else ""))
-    print(f"[romanaccio-harness] audio: {audio_svc.capabilities()}")
+          + (f", {cfg.secondary_actor.name}={cfg.secondary_actor.host}:{cfg.secondary_actor.port}" if cfg.secondary_actor else "")
+          + (f", {cfg.d1.name}={cfg.d1.host}:{cfg.d1.port}" if cfg.d1 else ""))
+    print(f"[romanaccio-harness] vision={cfg.vision_url or 'disabled'} | audio={audio_svc.capabilities()}")
     if cfg.auth_token:
         print(f"[romanaccio-harness] auth_token={cfg.auth_token}")
     else:

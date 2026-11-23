@@ -75,6 +75,7 @@ from .protocol import (
 from .router import INTENTS, INTENT_CRITERIA, IntentRouter, RouteDecision, heuristic_route
 from .store import HarnessStore
 from .tools import StagedWriteProposal, ToolExecutor, ToolResult, ToolSpec, get_tool_schemas
+from .vision import ImageMetadata, VisionClient, build_image_metadata, format_vision_placeholder, inspect_image_bytes
 
 __version__ = "0.1.0"
 
@@ -109,6 +110,7 @@ __all__ = [
     "HarnessStore",
     "INTENTS",
     "INTENT_CRITERIA",
+    "ImageMetadata",
     "IntentRouter",
     "JobRunResult",
     "MAX_GATE_EVIDENCE_CHARS",
@@ -141,18 +143,22 @@ __all__ = [
     "ToolExecutor",
     "ToolResult",
     "ToolSpec",
+    "VisionClient",
     "WRITE_GATE_FLOOR",
     "WorkspaceSandbox",
     "WriteGate",
     "WriteGateVerdict",
     "WriteReceipt",
     "__version__",
+    "build_image_metadata",
     "build_pinned_system_prefix",
     "check_numeric_grounding",
     "evaluate_acceptance_check",
     "evaluate_todo_check",
+    "format_vision_placeholder",
     "get_tool_schemas",
     "heuristic_route",
+    "inspect_image_bytes",
     "make_doc_extract_spec",
     "make_screen_qa_spec",
     "parse_assistant_output",

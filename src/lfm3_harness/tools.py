@@ -18,6 +18,7 @@ from .config import (
     SafetyLimits,
 )
 from .paths import PathSandboxError, WorkspaceSandbox
+from .vision import inspect_image_bytes
 
 _SKIP_DIR_NAMES = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache", "node_modules"})
 _STOP_WORDS = frozenset({"the", "and", "for", "with", "this", "that", "from", "return", "true", "false", "none"})
@@ -684,10 +685,15 @@ class ToolExecutor:
     def _run_sense_probe(self, name: str, args: Dict[str, Any]) -> ToolResult:
         rel = args.get("path", "")
         target = self.sandbox.resolve_read(rel)
-        payload = {
+        payload: Dict[str, Any] = {
             "status": "verified_file_metadata",
             "path": self.sandbox.relativize(target),
             "bytes": target.stat().st_size,
             "sha256": self.sandbox.sha256_file(target),
         }
+        if name == "look":
+            fmt, w, h = inspect_image_bytes(target.read_bytes(), target.name)
+            payload["format"] = fmt
+            payload["width"] = w
+            payload["height"] = h
         return ToolResult(ok=True, tool_name=name, content=json.dumps(payload, indent=2))

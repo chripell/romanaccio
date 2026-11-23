@@ -66,6 +66,8 @@
 
         <div class="hud-bar">
           <span id="hud-cache-badge" class="badge">Cache: -</span>
+          <span id="hud-d1-badge" class="badge subtle">d1: -</span>
+          <span id="hud-vision-badge" class="badge subtle">Vision: off</span>
           <span id="hud-npu-badge" class="badge">NPU: -</span>
           <span id="hud-tts-badge" class="badge">Voice: -</span>
           <button id="logout-btn" class="btn tiny hidden">Lock</button>
@@ -89,6 +91,10 @@
             </label>
             <span id="route-status-pill" class="badge subtle">d1 route: idle</span>
             <div class="spacer"></div>
+            <label id="image-upload-btn" class="btn small file-btn hidden" title="Attach image via Vision Sidecar">
+              +Img
+              <input id="image-file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,image/*" hidden />
+            </label>
             <button id="mic-btn" class="btn small" title="Record 16kHz WAV">Mic</button>
             <label class="btn small file-btn">
               +Audio
@@ -96,6 +102,7 @@
             </label>
           </div>
 
+          <div id="attached-image-bar" class="attached-chip hidden"></div>
           <div class="composer-row">
             <textarea id="chat-input" rows="2" placeholder="Ask about files, request edits (staged for approval), or attach audio..."></textarea>
             <div class="composer-buttons">

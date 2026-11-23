@@ -43,9 +43,11 @@ from build_lfm3_int8_pkg import (
     COMPILER_PY,
     VENV_PY,
     SDP_SIG,
+    _unlink_if_exists,
     tile_int8_slice,
     tile_int16_slice,
     collect_calibration_activations,
+    get_model_text_meta,
 )
 
 DEFAULT_PKG_TP2 = DEFAULT_MODEL_DIR / "eswin_pkg_tp2"
@@ -181,24 +183,29 @@ def main():
     (pkg_out_dir / "models").mkdir(parents=True, exist_ok=True)
 
     # 1. Copy static runtime files
-    for fname in ["cpu_weights.bin", "cpu_weights.json", "manifest.json"]:
-        for src_dir in [base_pkg_dir, fp16_pkg_dir]:
+    for fname in ["cpu_weights.bin", "cpu_weights.json", "manifest.json", "calibration.json", "golden_ref.bin"]:
+        for src_dir in [model_dir, base_pkg_dir, fp16_pkg_dir]:
             if (src_dir / fname).exists():
+                _unlink_if_exists(pkg_out_dir / fname)
                 shutil.copy2(src_dir / fname, pkg_out_dir / fname)
                 break
 
     if (model_dir / "tokenizer.json").exists():
+        _unlink_if_exists(pkg_out_dir / "tokenizer.json")
         shutil.copy2(model_dir / "tokenizer.json", pkg_out_dir / "tokenizer.json")
     elif (base_pkg_dir / "tokenizer.json").exists():
+        _unlink_if_exists(pkg_out_dir / "tokenizer.json")
         shutil.copy2(base_pkg_dir / "tokenizer.json", pkg_out_dir / "tokenizer.json")
 
     for src_dir in [base_pkg_dir, fp16_pkg_dir]:
         emb = src_dir / "embedding.bin"
-        if emb.exists() and not (pkg_out_dir / "embedding.bin").exists():
+        if emb.exists():
+            dst_emb = pkg_out_dir / "embedding.bin"
+            _unlink_if_exists(dst_emb)
             try:
-                os.link(emb, pkg_out_dir / "embedding.bin")
+                os.link(emb, dst_emb)
             except OSError:
-                shutil.copy2(emb, pkg_out_dir / "embedding.bin")
+                shutil.copy2(emb, dst_emb)
             break
 
     if (pkg_out_dir / "manifest.json").exists():
@@ -252,8 +259,8 @@ def main():
     calib_x, _ = collect_calibration_activations(model_dir)
 
     st = safe_open(str(model_dir / "model.safetensors"), framework="pt")
-    cfg = json.loads((model_dir / "config.json").read_text())
-    layer_types = cfg["layer_types"]
+    text_cfg, w_prefix = get_model_text_meta(model_dir)
+    layer_types = text_cfg["layer_types"]
     sh_mlp_tbl = json.loads((tables_dir / "shared_mlp_table.json").read_text())
 
     base_w_map = json.loads((base_pkg_dir / "weights_map.json").read_text())
@@ -319,7 +326,7 @@ def main():
                 )
 
     for l in range(24):
-        pfx = f"model.layers.{l}."
+        pfx = f"{w_prefix}layers.{l}."
         lt = layer_types[l]
         d_pp = 0 if l < 12 else 1
         if lt == "conv":

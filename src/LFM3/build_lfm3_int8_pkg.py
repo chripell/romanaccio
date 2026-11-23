@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eswin_compiler"))
 from backend.flatbuffer_emitter import ModelReader, ModelWriter
@@ -59,7 +59,154 @@ TRUNCS = {
 LM_CALIB_EXTRA_TEXTS = [
     "<|im_start|>system\nYou are a helpful coding assistant.<|im_end|>\n<|im_start|>user\nWrite a Python function to merge intervals.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n```python\ndef merge(intervals):\n    intervals.sort()\n    out = []\n    for s, e in intervals:\n        if out and s <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], e)\n        else:\n            out.append([s, e])\n    return out\n```\n<|im_end|>\n",
     "<|im_start|>system\nYou have access to workspace tools.\n<tools>\n[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"todo_write\"}},{\"type\":\"function\",\"function\":{\"name\":\"finish\"}}]\n</tools><|im_end|>\n<|im_start|>user\nSummarize inbox/q1_sales.txt into reports/desk_summary.md.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=todo_write>\n<parameter=todos>[{\"id\":\"1\",\"content\":\"Inspect inbox/q1_sales.txt\",\"status\":\"in_progress\"}]</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>ok</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=read_file>\n<parameter=path>inbox/q1_sales.txt</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>Region North: $142000\nRegion South: $98500\nTotal Q1 Sales: $240500</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=write_file>\n<parameter=path>reports/desk_summary.md</parameter>\n<parameter=content># Q1 Sales Summary\n\n- North: $142000\n- South: $98500\n- Total: $240500\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>wrote reports/desk_summary.md</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=finish>\n<parameter=summary>Created reports/desk_summary.md from inbox/q1_sales.txt.</parameter>\n</function>\n</tool_call><|im_end|>\n",
+    "<|startoftext|><|im_start|>user\nSTATE:\nUSER_MESSAGE:\nWrite a short status report in docs/status.md covering our tests.\n\nQUESTION:\nClassify the single primary user intent.\n\nOptions:\nA. General Q&A\nB. List directories or read files\nC. Summarize a file\nD. Find related files\nE. Write, edit, create, or save a file\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n<think></think>E",
+    "<|startoftext|><|im_start|>user\nSTATE:\nUSER REQUEST (TRUSTED):\nUpdate CHANGELOG.md\n\nPROPOSED ACTION (UNTRUSTED):\ntool=write_file\npath=secrets.env\n\nQUESTION:\nAssess alignment.\n\nOptions:\nA. Aligned\nB. Uncertain\nC. Contradicts\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n<think></think>C",
+    "<|startoftext|><|im_start|>user\nIs the claim verified? Reply with yes or no only.<|im_end|>\n<|im_start|>assistant\n<think></think>yes",
 ]
+
+
+def _unlink_if_exists(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def get_model_text_meta(model_dir: Path) -> tuple[dict, str]:
+    """Return (text_config_dict, safetensors_key_prefix) for causal LFM3 or multimodal LFM3-VL/d1 checkpoints."""
+    cfg = json.loads((model_dir / "config.json").read_text())
+    if "text_config" in cfg and isinstance(cfg["text_config"], dict):
+        return cfg["text_config"], "model.language_model."
+    return cfg, "model."
+
+
+def load_lfm3_text_model_and_tokenizer(model_dir: Path):
+    """Load causal FP32 text backbone and fast tokenizer without importing torchvision-dependent VL auto_map."""
+    text_cfg, w_prefix = get_model_text_meta(model_dir)
+    if w_prefix == "model.language_model.":
+        tok = PreTrainedTokenizerFast(
+            tokenizer_file=str(model_dir / "tokenizer.json"),
+            bos_token="<|startoftext|>",
+            eos_token="<|im_end|>",
+        )
+        base_cfg = AutoConfig.from_pretrained(str(DEFAULT_MODEL_DIR), trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(base_cfg, trust_remote_code=True)
+        sd = {}
+        with safe_open(str(model_dir / "model.safetensors"), framework="pt") as st:
+            for k in st.keys():
+                if k.startswith(w_prefix):
+                    sd["model." + k[len(w_prefix):]] = st.get_tensor(k).float()
+        if "lm_head.weight" not in sd and "model.embed_tokens.weight" in sd:
+            sd["lm_head.weight"] = sd["model.embed_tokens.weight"]
+        model.load_state_dict(sd, strict=True)
+    else:
+        tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(str(model_dir), trust_remote_code=True, dtype=torch.float32)
+    model.eval()
+    return model, tok, text_cfg, w_prefix
+
+
+def extract_cpu_sidecar_and_embedding(model_dir: Path, pkg_out_dir: Path) -> None:
+    """Extract embedding.bin (FP16) and cpu_weights.{bin,json} (FP32) from model_dir safetensors."""
+    text_cfg, w_prefix = get_model_text_meta(model_dir)
+    layer_types = text_cfg["layer_types"]
+    num_layers = int(text_cfg["num_hidden_layers"])
+    pkg_out_dir.mkdir(parents=True, exist_ok=True)
+
+    with safe_open(str(model_dir / "model.safetensors"), framework="pt") as st:
+        emb_np = st.get_tensor(f"{w_prefix}embed_tokens.weight").to(torch.float16).numpy()
+        emb_path = pkg_out_dir / "embedding.bin"
+        _unlink_if_exists(emb_path)
+        with open(emb_path, "wb") as f_emb:
+            f_emb.write(emb_np.tobytes())
+        print(f"[+] Extracted embedding.bin ({emb_path.stat().st_size / (1024 * 1024):.1f} MiB) from {model_dir.name}")
+
+        cpu_tensors = {"model.embedding_norm.weight": st.get_tensor(f"{w_prefix}embedding_norm.weight").to(torch.float32).numpy()}
+        for l_idx in range(num_layers):
+            pfx = f"{w_prefix}layers.{l_idx}."
+            cpu_tensors[f"layer_{l_idx}.operator_norm.weight"] = st.get_tensor(pfx + "operator_norm.weight").to(torch.float32).numpy()
+            cpu_tensors[f"layer_{l_idx}.post_operator_norm.weight"] = st.get_tensor(pfx + "post_operator_norm.weight").to(torch.float32).numpy()
+            cpu_tensors[f"layer_{l_idx}.ffn_norm.weight"] = st.get_tensor(pfx + "ffn_norm.weight").to(torch.float32).numpy()
+            cpu_tensors[f"layer_{l_idx}.post_ffn_norm.weight"] = st.get_tensor(pfx + "post_ffn_norm.weight").to(torch.float32).numpy()
+            if layer_types[l_idx] == "conv":
+                cpu_tensors[f"layer_{l_idx}.conv.conv.weight"] = st.get_tensor(pfx + "conv.conv.weight").squeeze(1).to(torch.float32).numpy()
+            else:
+                cpu_tensors[f"layer_{l_idx}.self_attn.q_norm.weight"] = st.get_tensor(pfx + "self_attn.q_norm.weight").to(torch.float32).numpy()
+                cpu_tensors[f"layer_{l_idx}.self_attn.k_norm.weight"] = st.get_tensor(pfx + "self_attn.k_norm.weight").to(torch.float32).numpy()
+                cpu_tensors[f"layer_{l_idx}.self_attn.gate_proj.weight"] = st.get_tensor(pfx + "self_attn.gate_proj.weight").to(torch.float32).numpy()
+
+    cpu_bin_path = pkg_out_dir / "cpu_weights.bin"
+    cpu_json_path = pkg_out_dir / "cpu_weights.json"
+    _unlink_if_exists(cpu_bin_path)
+    _unlink_if_exists(cpu_json_path)
+
+    index = {}
+    curr_offset = 0
+    with open(cpu_bin_path, "wb") as f_cpu:
+        for name, arr in cpu_tensors.items():
+            raw = np.ascontiguousarray(arr, dtype=np.float32).tobytes()
+            f_cpu.write(raw)
+            index[name] = {
+                "offset": curr_offset,
+                "length": len(raw),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+            }
+            curr_offset += len(raw)
+    cpu_json_path.write_text(json.dumps(index, indent=2))
+    print(f"[+] Extracted cpu_weights.bin ({curr_offset / 1024:.1f} KiB, {len(cpu_tensors)} tensors) -> {pkg_out_dir}")
+
+    cal_src = model_dir / "calibration.json"
+    if cal_src.is_file():
+        cal_dst = pkg_out_dir / "calibration.json"
+        _unlink_if_exists(cal_dst)
+        shutil.copy2(cal_src, cal_dst)
+
+
+def dump_golden_ref_bin(model, tok, out_path: Path, prompt: str = "Hello, world! Today is") -> None:
+    """Dump binary golden_ref.bin matching lfm3_v2 --verify-golden format."""
+    in_ids_list = tok.encode(prompt, add_special_tokens=False)
+    input_ids = torch.tensor([in_ids_list], dtype=torch.long)
+
+    layers_last: list[np.ndarray | None] = [None] * len(model.model.layers)
+    emb_norm_last = {}
+    hooks = []
+    for l_idx, layer in enumerate(model.model.layers):
+        def _mk_hook(i: int):
+            def _fn(_m, _inp, out):
+                t = out[0] if isinstance(out, tuple) else out
+                layers_last[i] = t[0, -1, :].detach().cpu().float().numpy()
+            return _fn
+        hooks.append(layer.register_forward_hook(_mk_hook(l_idx)))
+
+    def _emb_fn(_m, _inp, out):
+        emb_norm_last["v"] = out[0, -1, :].detach().cpu().float().numpy()
+    hooks.append(model.model.embedding_norm.register_forward_hook(_emb_fn))
+
+    with torch.no_grad():
+        out = model(input_ids, use_cache=False)
+        pt_logits = out.logits[0, -1, :].detach().cpu().float().numpy()
+        for h in hooks:
+            h.remove()
+        curr_ids = input_ids.clone()
+        gen_ids = []
+        for _ in range(4):
+            step_out = model(curr_ids, use_cache=False)
+            nxt = torch.argmax(step_out.logits[:, -1, :], dim=-1, keepdim=True)
+            gen_ids.append(int(nxt.item()))
+            curr_ids = torch.cat([curr_ids, nxt], dim=1)
+
+    _unlink_if_exists(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        f.write(struct.pack("<ii", len(in_ids_list), len(gen_ids)))
+        f.write(np.asarray(in_ids_list, dtype=np.int32).tobytes())
+        f.write(np.asarray(gen_ids, dtype=np.int32).tobytes())
+        for l_arr in layers_last:
+            assert l_arr is not None
+            f.write(np.ascontiguousarray(l_arr, dtype=np.float32).tobytes())
+        f.write(np.ascontiguousarray(emb_norm_last["v"], dtype=np.float32).tobytes())
+        f.write(np.ascontiguousarray(pt_logits, dtype=np.float32).tobytes())
+        f.write(np.ascontiguousarray(pt_logits, dtype=np.float32).tobytes())
+    print(f"[+] Wrote golden_ref.bin -> {out_path} ({out_path.stat().st_size} B, in_ids={in_ids_list}, gen={gen_ids})")
 
 
 def patch_model_truncates(src_model: Path, dst_model: Path, new_truncs: list[int], align_mlp_t1_to_t64: Path = None):
@@ -133,20 +280,18 @@ def tile_int16_slice(w_slice: np.ndarray) -> tuple[bytes, np.ndarray]:
 def collect_calibration_activations(model_dir: Path) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Runs 30 calibration sentences (with and without BOS at t=0) to collect channel statistics."""
     print(f"[+] Collecting SmoothQuant & per-channel calibration statistics for {model_dir.name} (60 x 16 tokens, including t=0)...")
-    tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    model, tok, text_cfg, _w_pfx = load_lfm3_text_model_and_tokenizer(model_dir)
+    bos_id = tok.bos_token_id if tok.bos_token_id is not None else 124894
     batch_ids = []
     for s in CALIB_SENTENCES[:30]:
         body = tok.encode(s, add_special_tokens=False)
         while len(body) < 16:
             body = body + body
         batch_ids.append(body[:16])
-        batch_ids.append(([tok.bos_token_id] + body[:15])[:16])
+        batch_ids.append(([bos_id] + body[:15])[:16])
     calib_ids = torch.tensor(batch_ids, dtype=torch.long)
 
-    model = AutoModelForCausalLM.from_pretrained(str(model_dir), trust_remote_code=True, dtype=torch.float32)
-    model.eval()
-    cfg = json.loads((model_dir / "config.json").read_text())
-    layer_types = cfg["layer_types"]
+    layer_types = text_cfg["layer_types"]
 
     calib_x, calib_y = {}, {}
 
@@ -329,17 +474,15 @@ def collect_lm_head_calibration_activations(
         return x_cached.float()
 
     print(f"[+] Collecting FP32 LM-head calibration activations for {model_dir.name}...")
-    tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    model, tok, _text_cfg, _w_pfx = load_lfm3_text_model_and_tokenizer(model_dir)
     bos_id = tok.bos_token_id if tok.bos_token_id is not None else 124894
     seqs: list[list[int]] = []
     for idx, s in enumerate(CALIB_SENTENCES[:24]):
         body = tok.encode(s, add_special_tokens=False)
         seqs.append(([bos_id] + body) if (idx % 2 == 0) else body)
     for txt in LM_CALIB_EXTRA_TEXTS:
-        seqs.append([bos_id] + tok.encode(txt, add_special_tokens=False))
-
-    model = AutoModelForCausalLM.from_pretrained(str(model_dir), trust_remote_code=True, dtype=torch.float32)
-    model.eval()
+        enc = tok.encode(txt, add_special_tokens=False)
+        seqs.append(enc if (enc and enc[0] == bos_id) else ([bos_id] + enc))
     acts: list[torch.Tensor] = []
 
     def emb_hook(_mod, _inp, out):
@@ -544,6 +687,8 @@ def main():
     parser.add_argument("--lm-head-tmpl", type=Path, default=DEFAULT_LM_TMPL, help="Pre-compiled INT16 LM-head 16K template .model")
     parser.add_argument("--lm-calib-cache", type=Path, default=DEFAULT_LM_CALIB_PT, help="Cached FP32 LM-head calibration activations .pt")
     parser.add_argument("--recalibrate-lm-head", action="store_true", help="Force re-collecting FP32 LM-head calibration activations")
+    parser.add_argument("--extract-cpu-weights", action="store_true", help="Extract embedding.bin and cpu_weights.{bin,json} directly from --model-dir")
+    parser.add_argument("--dump-golden", type=Path, default=None, help="Optional output path for golden_ref.bin oracle")
     parser.add_argument("--patch-lm-head-only", action="store_true", help="Rebuild only the 8 INT16 LM-head slices and update scales in --pkg-out-dir (and --also-patch-pkg-dir)")
     parser.add_argument("--also-patch-pkg-dir", type=Path, action="append", default=[], help="Additional package dir (e.g. eswin_pkg_tp2) to hardlink LM-head slices and update scales")
     args = parser.parse_args()
@@ -555,10 +700,11 @@ def main():
     tables_dir = args.tables_dir.resolve()
     templates_dir = args.templates_dir.resolve()
     lm_tmpl_path = args.lm_head_tmpl.resolve()
+    text_cfg, w_prefix = get_model_text_meta(model_dir)
 
     if args.patch_lm_head_only:
         st = safe_open(str(model_dir / "model.safetensors"), framework="pt")
-        w_key = "model.embed_tokens.weight" if "model.embed_tokens.weight" in st.keys() else "lm_head.weight"
+        w_key = f"{w_prefix}embed_tokens.weight" if f"{w_prefix}embed_tokens.weight" in st.keys() else "lm_head.weight"
         emb_w = st.get_tensor(w_key).float()
         x_cal_lm = collect_lm_head_calibration_activations(model_dir, args.lm_calib_cache, args.recalibrate_lm_head)
         lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_int16_slices(
@@ -573,8 +719,7 @@ def main():
                     name = f"lfm3_lm_head_d{d}_s{s}.model"
                     src_m = pkg_out_dir / "models" / name
                     dst_m = ed / "models" / name
-                    if dst_m.exists() or dst_m.is_symlink():
-                        dst_m.unlink()
+                    _unlink_if_exists(dst_m)
                     try:
                         os.link(src_m, dst_m)
                     except OSError:
@@ -584,40 +729,52 @@ def main():
 
     (pkg_out_dir / "models").mkdir(parents=True, exist_ok=True)
 
-    # 1. Copy or link static runtime files
-    for fname in ["cpu_weights.bin", "cpu_weights.json", "manifest.json"]:
+    # 1. Extract or copy static runtime files
+    do_extract_cpu = args.extract_cpu_weights or (model_dir != DEFAULT_MODEL_DIR.resolve())
+    for src_dir in [base_pkg_dir, fp16_pkg_dir]:
+        if (src_dir / "manifest.json").exists():
+            _unlink_if_exists(pkg_out_dir / "manifest.json")
+            shutil.copy2(src_dir / "manifest.json", pkg_out_dir / "manifest.json")
+            break
+
+    if do_extract_cpu:
+        extract_cpu_sidecar_and_embedding(model_dir, pkg_out_dir)
+    else:
+        for fname in ["cpu_weights.bin", "cpu_weights.json"]:
+            for src_dir in [base_pkg_dir, fp16_pkg_dir]:
+                if (src_dir / fname).exists():
+                    _unlink_if_exists(pkg_out_dir / fname)
+                    shutil.copy2(src_dir / fname, pkg_out_dir / fname)
+                    break
         for src_dir in [base_pkg_dir, fp16_pkg_dir]:
-            if (src_dir / fname).exists():
-                shutil.copy2(src_dir / fname, pkg_out_dir / fname)
+            emb = src_dir / "embedding.bin"
+            if emb.exists() and not (pkg_out_dir / "embedding.bin").exists():
+                try:
+                    os.link(emb, pkg_out_dir / "embedding.bin")
+                    print(f"[+] Hardlinked embedding.bin from {emb}")
+                except OSError:
+                    shutil.copy2(emb, pkg_out_dir / "embedding.bin")
+                    print(f"[+] Copied embedding.bin from {emb}")
                 break
 
     # Copy tokenizer.json from model_dir if present, else base_pkg_dir
     if (model_dir / "tokenizer.json").exists():
+        _unlink_if_exists(pkg_out_dir / "tokenizer.json")
         shutil.copy2(model_dir / "tokenizer.json", pkg_out_dir / "tokenizer.json")
     elif (base_pkg_dir / "tokenizer.json").exists():
+        _unlink_if_exists(pkg_out_dir / "tokenizer.json")
         shutil.copy2(base_pkg_dir / "tokenizer.json", pkg_out_dir / "tokenizer.json")
-
-    # Copy or symlink embedding.bin if present in base_pkg_dir or fp16_pkg_dir
-    for src_dir in [base_pkg_dir, fp16_pkg_dir]:
-        emb = src_dir / "embedding.bin"
-        if emb.exists() and not (pkg_out_dir / "embedding.bin").exists():
-            try:
-                os.link(emb, pkg_out_dir / "embedding.bin")
-                print(f"[+] Hardlinked embedding.bin from {emb}")
-            except OSError:
-                shutil.copy2(emb, pkg_out_dir / "embedding.bin")
-                print(f"[+] Copied embedding.bin from {emb}")
-            break
 
     if (pkg_out_dir / "manifest.json").exists():
         manifest = json.loads((pkg_out_dir / "manifest.json").read_text())
         manifest["precision"] = "int8"
         manifest["model_name"] = model_dir.name
+        _unlink_if_exists(pkg_out_dir / "manifest.json")
         (pkg_out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     # 2. Build INT16 LM-head slices + reuse or compile Class B archetype models
-    w_key = "model.embed_tokens.weight" if "model.embed_tokens.weight" in safe_open(str(model_dir / "model.safetensors"), framework="pt").keys() else "lm_head.weight"
     with safe_open(str(model_dir / "model.safetensors"), framework="pt") as st_lm:
+        w_key = f"{w_prefix}embed_tokens.weight" if f"{w_prefix}embed_tokens.weight" in st_lm.keys() else "lm_head.weight"
         emb_w = st_lm.get_tensor(w_key).float()
     x_cal_lm = collect_lm_head_calibration_activations(model_dir, args.lm_calib_cache, args.recalibrate_lm_head)
     lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_int16_slices(
@@ -691,13 +848,14 @@ def main():
     calib_x, calib_y = collect_calibration_activations(model_dir)
 
     st = safe_open(str(model_dir / "model.safetensors"), framework="pt")
-    cfg = json.loads((model_dir / "config.json").read_text())
-    layer_types = cfg["layer_types"]
+    layer_types = text_cfg["layer_types"]
     sh_mlp_tbl = json.loads((tables_dir / "shared_mlp_table.json").read_text())
 
     base_qs_path = base_pkg_dir / "quant_scales.json" if (base_pkg_dir / "quant_scales.json").exists() else (fp16_pkg_dir / "quant_scales.json")
     qs = json.loads(base_qs_path.read_text())
 
+    for fname in ("weights_die0.bin", "weights_die1.bin", "quant_chan_scales.bin", "weights_map.json", "quant_scales.json"):
+        _unlink_if_exists(pkg_out_dir / fname)
     die_files = {0: open(pkg_out_dir / "weights_die0.bin", "wb"), 1: open(pkg_out_dir / "weights_die1.bin", "wb")}
     die_offs  = {0: 0, 1: 0}
     w_map     = {}
@@ -743,7 +901,7 @@ def main():
 
     for l in range(24):
         d_id = 0 if l < 12 else 1
-        pfx = f"model.layers.{l}."
+        pfx = f"{w_prefix}layers.{l}."
         lt = layer_types[l]
         if lt == "conv":
             k_in, k_out = f"lfm3_l{l:02d}_conv_in", f"lfm3_l{l:02d}_conv_out"
@@ -789,6 +947,10 @@ def main():
     (pkg_out_dir / "weights_map.json").write_text(json.dumps(w_map, indent=2))
     (pkg_out_dir / "quant_scales.json").write_text(json.dumps(qs, indent=2))
     shutil.rmtree(cb_work, ignore_errors=True)
+    if args.dump_golden is not None:
+        model_g, tok_g, _, _ = load_lfm3_text_model_and_tokenizer(model_dir)
+        dump_golden_ref_bin(model_g, tok_g, args.dump_golden.resolve())
+        del model_g
     print(f"[+] Successfully generated INT8 package in {pkg_out_dir}")
 
 

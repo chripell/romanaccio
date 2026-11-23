@@ -1,6 +1,7 @@
 """Pure-stdlib async TCP client and tokenizer/d1 readout engine for NPU daemons."""
 
 import asyncio
+import gc
 import json
 import math
 from bisect import bisect_left
@@ -68,8 +69,10 @@ class TokenizerLookup:
     def from_file(cls, tokenizer_json_path: Union[str, Path]) -> "TokenizerLookup":
         path = Path(tokenizer_json_path)
         data = json.loads(path.read_text(encoding="utf-8"))
-        vocab = data.get("model", {}).get("vocab", {})
+        vocab = dict(data.get("model", {}).get("vocab", {}))
         added = {item["content"]: int(item["id"]) for item in data.get("added_tokens", []) if "content" in item and "id" in item}
+        del data
+        gc.collect()
         return cls(vocab=vocab, added_tokens=added)
 
     def single_token_id(self, piece: str) -> Optional[int]:

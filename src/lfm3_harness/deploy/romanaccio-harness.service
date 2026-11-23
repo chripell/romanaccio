@@ -11,7 +11,10 @@ Environment=HARNESS_ROOT=/home/chri/lfm3_harness_pkg
 Environment=WORKSPACE_ROOT=/home/chri/workspace
 Environment=BIND_HOST=0.0.0.0
 Environment=PORT=8000
+Environment=D1_PORT=8090
 Environment=ENABLE_TLS=1
+# Optional host x86_64 vision sidecar URL (e.g. http://192.168.1.100:8095):
+# Environment=VISION_URL=http://host:8095
 ExecStart=/bin/bash /home/chri/lfm3_harness_pkg/lfm3_harness/deploy/start_roma_harness.sh
 Restart=on-failure
 RestartSec=3

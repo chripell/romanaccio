@@ -202,6 +202,19 @@ details summary { cursor: pointer; color: var(--muted); font-weight: 600; }
   padding: 10px 16px;
 }
 .composer-toolbar { display: flex; align-items: center; gap: 10px; max-width: 880px; margin: 0 auto 8px auto; flex-wrap: wrap; }
+.attached-chip {
+  max-width: 880px;
+  margin: 0 auto 8px auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #1a283c;
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
 .composer-row { display: flex; gap: 8px; max-width: 880px; margin: 0 auto; }
 .composer-row textarea { flex: 1; resize: vertical; min-height: 44px; font-family: inherit; }
 .composer-buttons { display: flex; flex-direction: column; gap: 6px; }

@@ -6,6 +6,9 @@ const state = {
   sessionId: null,
   models: [],
   defaultModel: "lfm3-1.7b",
+  capabilities: {},
+  d1Info: {},
+  attachedImage: null,
   streaming: false,
   ttsEngine: null,
   sessions: [],
@@ -70,6 +73,8 @@ async function initData() {
 
   state.models = modRes.models || [];
   state.defaultModel = modRes.default_model || "lfm3-1.7b";
+  state.capabilities = modRes.capabilities || {};
+  state.d1Info = modRes.d1 || {};
   state.ttsEngine = modRes.capabilities?.tts_engine || null;
 
   const actorSel = $("actor-select");
@@ -81,6 +86,7 @@ async function initData() {
     actorSel.appendChild(opt);
   }
   actorSel.value = state.defaultModel;
+  syncActorControls();
 
   const tmplSel = $("mission-template-select");
   tmplSel.innerHTML = "";
@@ -94,11 +100,56 @@ async function initData() {
   $("voice-reply-label").textContent = state.ttsEngine ? `Voice (${state.ttsEngine})` : "Voice unavailable";
   $("voice-reply-toggle").disabled = !state.ttsEngine;
   $("hud-tts-badge").textContent = state.ttsEngine ? `TTS: ${state.ttsEngine}` : "TTS: off";
+  if (state.capabilities.vision) {
+    $("image-upload-btn").classList.remove("hidden");
+    $("hud-vision-badge").textContent = state.capabilities.vision_reachable ? `Vision: ${state.capabilities.vision_model || "on"}` : "Vision: unreachable";
+    $("hud-vision-badge").className = `badge ${state.capabilities.vision_reachable ? "ok" : "warn"}`;
+  } else {
+    $("image-upload-btn").classList.add("hidden");
+    $("hud-vision-badge").textContent = "Vision: off";
+    $("hud-vision-badge").className = "badge subtle";
+  }
+  if (state.d1Info.separate_daemon) {
+    $("hud-d1-badge").textContent = `d1 :${state.d1Info.port}${state.d1Info.reachable ? "" : " offline"}`;
+    $("hud-d1-badge").className = `badge ${state.d1Info.reachable ? "ok" : "danger"}`;
+  } else {
+    $("hud-d1-badge").textContent = `d1: shared`;
+    $("hud-d1-badge").className = "badge subtle";
+  }
   if (!canRecordInBrowser()) {
     $("mic-btn").title = "Mic requires HTTPS/localhost Secure Context; use +Audio on plain HTTP";
   }
 
   await Promise.all([refreshSessions(), refreshFiles(), refreshMissions(), refreshHud()]);
+}
+
+function syncActorControls() {
+  const chosen = state.models.find((m) => m.name === ($("actor-select").value || state.defaultModel));
+  const supportsThink = chosen ? Boolean(chosen.supports_thinking) : true;
+  $("think-toggle").disabled = !supportsThink;
+  if (!supportsThink) {
+    $("think-toggle").checked = false;
+  }
+}
+
+function renderAttachedImage() {
+  const bar = $("attached-image-bar");
+  if (!state.attachedImage) {
+    bar.classList.add("hidden");
+    bar.innerHTML = "";
+    return;
+  }
+  const im = state.attachedImage;
+  bar.classList.remove("hidden");
+  bar.innerHTML = `<span>Image attached: <strong class="mono">${escHtml(im.filename)}</strong> (${im.width}x${im.height}, ${im.num_tokens} vis tok)</span>`;
+  const rm = document.createElement("button");
+  rm.className = "btn tiny";
+  rm.textContent = "Remove";
+  rm.onclick = () => {
+    state.attachedImage = null;
+    renderAttachedImage();
+  };
+  bar.appendChild(rm);
 }
 
 async function refreshFiles() {
@@ -162,6 +213,7 @@ async function loadSession(sid) {
   const data = await apiJson(`/api/sessions/${sid}`);
   if (data.session?.model_name) {
     $("actor-select").value = data.session.model_name;
+    syncActorControls();
   }
   const tl = $("chat-timeline");
   tl.innerHTML = "";
@@ -188,6 +240,12 @@ function appendMessageCard(msg) {
     telemetry = typeof msg.telemetry_json === "string" ? JSON.parse(msg.telemetry_json || "{}") : msg.telemetry || {};
   } catch {
     telemetry = {};
+  }
+  if (telemetry.model) {
+    const mb = document.createElement("span");
+    mb.className = "badge subtle";
+    mb.textContent = telemetry.model;
+    header.appendChild(mb);
   }
   if (telemetry.cache_status) {
     const cb = document.createElement("span");
@@ -271,8 +329,14 @@ function renderPendingActions(actions) {
 async function sendChatMessage() {
   const text = $("chat-input").value.trim();
   if (!text || !state.sessionId || state.streaming) return;
+  const attachedImg = state.attachedImage;
+  state.attachedImage = null;
+  renderAttachedImage();
   $("chat-input").value = "";
-  appendMessageCard({ role: "user", content: text });
+  appendMessageCard({
+    role: "user",
+    content: attachedImg ? `[Image attached: ${attachedImg.filename}]\n${text}` : text,
+  });
 
   state.streaming = true;
   $("send-btn").disabled = true;
@@ -298,15 +362,19 @@ async function sendChatMessage() {
   let accThink = "";
 
   try {
+    const reqBody = {
+      content: text,
+      model_name: $("actor-select").value || state.defaultModel,
+      enable_thinking: $("think-toggle").checked,
+    };
+    if (attachedImg?.image_id) {
+      reqBody.image_id = attachedImg.image_id;
+    }
     const resp = await fetch(`/api/sessions/${state.sessionId}/messages`, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        content: text,
-        model_name: $("actor-select").value || state.defaultModel,
-        enable_thinking: $("think-toggle").checked,
-      }),
+      body: JSON.stringify(reqBody),
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
@@ -473,7 +541,7 @@ async function refreshHud() {
     const cards = $("cache-cards");
     cards.innerHTML = "";
     const models = cacheRes.models || {};
-    let hudSummary = "Cache: offline";
+    const summaryParts = [];
     for (const [name, st] of Object.entries(models)) {
       const c = document.createElement("div");
       c.className = "card";
@@ -481,7 +549,7 @@ async function refreshHud() {
         c.innerHTML = `<div class="section-row"><strong>${escHtml(name)}</strong><span class="badge danger">offline</span></div>`;
       } else {
         const mb = ((st.disk_bytes_used || 0) / (1024 * 1024)).toFixed(1);
-        hudSummary = `${name}: ${st.resident_blocks || 0} blk (${mb} MiB)`;
+        summaryParts.push(`${name}: ${st.resident_blocks || 0}b (${mb}M)`);
         c.innerHTML = `
           <div class="section-row"><strong>${escHtml(name)}</strong><span class="badge ok">online</span></div>
           <div class="tool-body">resident=${st.resident_blocks || 0} (pinned=${st.pinned_blocks || 0})
@@ -491,7 +559,7 @@ tokens_saved=${st.total_tokens_saved || 0} | lookups=${st.total_lookups || 0}</d
       }
       cards.appendChild(c);
     }
-    $("hud-cache-badge").textContent = hudSummary;
+    $("hud-cache-badge").textContent = summaryParts.length ? summaryParts.join(" | ") : "Cache: offline";
     const f0 = sysRes.npu_freq_hz?.die0 ? `${(sysRes.npu_freq_hz.die0 / 1e9).toFixed(2)}G` : "-";
     const f1 = sysRes.npu_freq_hz?.die1 ? `${(sysRes.npu_freq_hz.die1 / 1e9).toFixed(2)}G` : "-";
     $("hud-npu-badge").textContent = `NPU: ${f0}/${f1} | RSS ${sysRes.rss_mib} MiB`;
@@ -537,6 +605,45 @@ function wireEvents() {
     });
     state.sessionId = res.session.id;
     await refreshSessions();
+  };
+  $("actor-select").onchange = async () => {
+    syncActorControls();
+    const chosen = $("actor-select").value;
+    if (state.sessionId && chosen) {
+      await apiJson(`/api/sessions/${state.sessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_name: chosen }),
+      }).catch(() => {});
+      const row = state.sessions.find((s) => s.id === state.sessionId);
+      if (row) row.model_name = chosen;
+      renderSessionList();
+    }
+  };
+  $("image-file-input").onchange = async (ev) => {
+    const f = ev.target.files?.[0];
+    if (!f) return;
+    $("audio-status-bar").textContent = `Encoding image ${f.name}...`;
+    try {
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      const res = await apiJson(`/api/images/upload?filename=${encodeURIComponent(f.name)}`, {
+        method: "POST",
+        body: fd,
+      });
+      state.attachedImage = { image_id: res.image_id, ...res.metadata };
+      renderAttachedImage();
+      const visActor = state.models.find((m) => m.supports_vision);
+      if (visActor && $("actor-select").value !== visActor.name) {
+        $("actor-select").value = visActor.name;
+        $("actor-select").onchange();
+      }
+      $("audio-status-bar").textContent = `Vision encoded ${res.metadata.filename}: ${res.metadata.width}x${res.metadata.height} -> ${res.metadata.num_tokens} tokens`;
+    } catch (err) {
+      $("audio-status-bar").textContent = `Image error: ${err.message}`;
+    } finally {
+      ev.target.value = "";
+    }
   };
   $("refresh-files-btn").onclick = refreshFiles;
   $("send-btn").onclick = sendChatMessage;
