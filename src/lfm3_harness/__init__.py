@@ -12,6 +12,7 @@ from .agent_loop import (
     evaluate_todo_check,
 )
 from .approvals import ApprovalManager, ApprovalOutcome, StageOutcome
+from .audio import AudioMetadata, AudioService, clean_text_for_tts
 from .backend import (
     BackendDisconnectError,
     BackendError,
@@ -85,6 +86,8 @@ __all__ = [
     "AgentLoop",
     "ApprovalManager",
     "ApprovalOutcome",
+    "AudioMetadata",
+    "AudioService",
     "BackendDisconnectError",
     "BackendEndpoint",
     "BackendError",

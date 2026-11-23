@@ -1,0 +1,20 @@
+[Unit]
+Description=Romanaccio LFM3 / LFM2.5 Harness LAN Web Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chri
+WorkingDirectory=/home/chri
+Environment=HARNESS_ROOT=/home/chri/lfm3_harness_pkg
+Environment=WORKSPACE_ROOT=/home/chri/workspace
+Environment=BIND_HOST=0.0.0.0
+Environment=PORT=8000
+Environment=ENABLE_TLS=1
+ExecStart=/bin/bash /home/chri/lfm3_harness_pkg/lfm3_harness/deploy/start_roma_harness.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

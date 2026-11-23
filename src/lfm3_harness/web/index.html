@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Romanaccio Harness — LFM3 / LFM2.5 on EIC7700X</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="auth-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h2>LAN Access Token</h2>
+      <p class="muted">Enter the harness token printed at server startup.</p>
+      <input id="auth-token-input" type="password" placeholder="Access token..." autocomplete="off" />
+      <div class="modal-actions">
+        <button id="auth-login-btn" class="btn primary">Unlock</button>
+      </div>
+      <div id="auth-error" class="error-text"></div>
+    </div>
+  </div>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <div>
+          <div class="brand-title">Romanaccio</div>
+          <div class="brand-sub">EIC7700X Dual-Die Harness</div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <label class="label">Workspace</label>
+        <div id="workspace-pill" class="pill mono">-</div>
+      </div>
+
+      <div class="sidebar-section">
+        <label class="label" for="actor-select">Actor Model</label>
+        <select id="actor-select" class="select"></select>
+      </div>
+
+      <div class="sidebar-section sidebar-sessions">
+        <div class="section-row">
+          <span class="label">Sessions</span>
+          <button id="new-session-btn" class="btn small primary">+ New</button>
+        </div>
+        <div id="session-list" class="session-list"></div>
+      </div>
+
+      <div class="sidebar-section workspace-files-box">
+        <div class="section-row">
+          <span class="label">Workspace Files</span>
+          <button id="refresh-files-btn" class="btn tiny">Refresh</button>
+        </div>
+        <div id="workspace-files" class="file-list mono"></div>
+      </div>
+    </aside>
+
+    <main class="main-pane">
+      <header class="topbar">
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="chat">Chat &amp; Diffs</button>
+          <button class="tab" data-tab="tasks">Verified Tasks</button>
+          <button class="tab" data-tab="cache">Cache &amp; NPU HUD</button>
+        </nav>
+
+        <div class="hud-bar">
+          <span id="hud-cache-badge" class="badge">Cache: -</span>
+          <span id="hud-npu-badge" class="badge">NPU: -</span>
+          <span id="hud-tts-badge" class="badge">Voice: -</span>
+          <button id="logout-btn" class="btn tiny hidden">Lock</button>
+        </div>
+      </header>
+
+      <!-- TAB 1: CHAT & APPROVALS -->
+      <section id="tab-chat" class="tab-panel active">
+        <div id="chat-timeline" class="chat-timeline"></div>
+        <div id="actions-dock" class="actions-dock"></div>
+
+        <div class="composer">
+          <div class="composer-toolbar">
+            <label class="check-inline">
+              <input id="think-toggle" type="checkbox" />
+              <span>Thinking</span>
+            </label>
+            <label class="check-inline">
+              <input id="voice-reply-toggle" type="checkbox" />
+              <span id="voice-reply-label">Voice replies</span>
+            </label>
+            <span id="route-status-pill" class="badge subtle">d1 route: idle</span>
+            <div class="spacer"></div>
+            <button id="mic-btn" class="btn small" title="Record 16kHz WAV">Mic</button>
+            <label class="btn small file-btn">
+              +Audio
+              <input id="audio-file-input" type="file" accept=".wav,.mp3,.flac,.ogg,.m4a,.webm,.opus,audio/*" hidden />
+            </label>
+          </div>
+
+          <div class="composer-row">
+            <textarea id="chat-input" rows="2" placeholder="Ask about files, request edits (staged for approval), or attach audio..."></textarea>
+            <div class="composer-buttons">
+              <button id="send-btn" class="btn primary">Send</button>
+              <button id="stop-btn" class="btn danger hidden">Stop</button>
+            </div>
+          </div>
+          <div id="audio-status-bar" class="muted tiny-note"></div>
+        </div>
+      </section>
+
+      <!-- TAB 2: VERIFIED TASKS -->
+      <section id="tab-tasks" class="tab-panel">
+        <div class="panel-header">
+          <div>
+            <h3>Isolated Verified Tasks</h3>
+            <p class="muted">SHA-256 frozen AcceptanceSpec contracts executed via bounded 3-phase plan/work/review loop.</p>
+          </div>
+          <div class="row-gap">
+            <select id="mission-template-select" class="select"></select>
+            <button id="run-mission-btn" class="btn primary">Run Verified Task</button>
+          </div>
+        </div>
+        <div id="mission-live-box" class="card hidden"></div>
+        <div id="mission-list" class="mission-list"></div>
+      </section>
+
+      <!-- TAB 3: CACHE & NPU HUD -->
+      <section id="tab-cache" class="tab-panel">
+        <div class="panel-header">
+          <div>
+            <h3>RadixCache &amp; EIC7700X System HUD</h3>
+            <p class="muted">Live Tier-0 sticky RAM, Tier-1 NVMe prefix blocks, Die 0/1 frequencies, thermals, and Python RSS.</p>
+          </div>
+          <div class="row-gap">
+            <button id="refresh-hud-btn" class="btn">Refresh</button>
+            <button id="clear-unpinned-btn" class="btn warn">Clear Unpinned Cache</button>
+            <button id="clear-all-btn" class="btn danger">Clear All Cache</button>
+          </div>
+        </div>
+        <div id="cache-cards" class="grid-cards"></div>
+        <div id="system-health-card" class="card"></div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -220,6 +220,46 @@ class HarnessStore:
             )
         return dict(self.conn.execute("SELECT * FROM workspaces WHERE id = ?", (ws_id,)).fetchone())
 
+    def get_workspace(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_workspaces(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM workspaces ORDER BY created_at ASC, rowid ASC").fetchall()
+        return [dict(r) for r in rows]
+
+    def list_sessions(self, workspace_id: Optional[str] = None, *, limit: int = 100) -> List[Dict[str, Any]]:
+        if workspace_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM chat_sessions WHERE workspace_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (workspace_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM chat_sessions ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_session_title(self, session_id: str, title: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
+                (title, time.time(), session_id),
+            )
+
+    def update_session_model(self, session_id: str, model_name: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE chat_sessions SET model_name = ?, updated_at = ? WHERE id = ?",
+                (model_name, time.time(), session_id),
+            )
+
+    def delete_session(self, session_id: str) -> bool:
+        with self.conn:
+            cur = self.conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+            return cur.rowcount == 1
+
     def create_session(self, workspace_id: str, title: str, model_name: str = "lfm3-1.7b", status: str = "idle") -> Dict[str, Any]:
         sid = _new_id("sess")
         now = time.time()
@@ -383,6 +423,32 @@ class HarnessStore:
         with self.conn:
             self.conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", tuple(vals))
 
+    def list_jobs(self, workspace_id: Optional[str] = None, *, limit: int = 50) -> List[Dict[str, Any]]:
+        if workspace_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM jobs WHERE workspace_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (workspace_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM jobs ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_mission_runs(self, workspace_id: Optional[str] = None, *, limit: int = 50) -> List[Dict[str, Any]]:
+        if workspace_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM mission_runs WHERE workspace_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (workspace_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM mission_runs ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_acceptance_spec(self, spec_id: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute("SELECT * FROM acceptance_specs WHERE id = ?", (spec_id,)).fetchone()
         return dict(row) if row else None
@@ -444,12 +510,18 @@ class HarnessStore:
             run_row = self.conn.execute("SELECT * FROM mission_runs WHERE id = ?", (m_id,)).fetchone()
         return dict(spec_row), dict(run_row)
 
-    def list_events(self, entity_type: Optional[str] = None, entity_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_events(
+        self,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        *,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
         if entity_type and entity_id:
             rows = self.conn.execute(
-                "SELECT * FROM events WHERE entity_type = ? AND entity_id = ? ORDER BY id ASC",
-                (entity_type, entity_id),
+                "SELECT * FROM events WHERE entity_type = ? AND entity_id = ? ORDER BY id ASC LIMIT ?",
+                (entity_type, entity_id, int(limit)),
             ).fetchall()
         else:
-            rows = self.conn.execute("SELECT * FROM events ORDER BY id ASC").fetchall()
+            rows = self.conn.execute("SELECT * FROM events ORDER BY id ASC LIMIT ?", (int(limit),)).fetchall()
         return [dict(r) for r in rows]

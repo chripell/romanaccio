@@ -271,6 +271,7 @@ class MissionRunner:
         spec: AcceptanceSpec,
         *,
         cancel_event: Optional[asyncio.Event] = None,
+        on_started: Optional[Callable[[str, str], None]] = None,
     ) -> MissionRunResult:
         """Run a mission up to spec.max_attempts while verifying the frozen SHA-256 contract."""
         canonical_json = spec.canonical_json()
@@ -284,6 +285,8 @@ class MissionRunner:
         )
         spec_id = str(spec_row["id"])
         run_id = str(run_row["id"])
+        if on_started is not None:
+            on_started(run_id, frozen_sha)
         journal = MissionJournal(self.journal_dir / f"{run_id}.jsonl")
         journal.write(run_id, "mission_started", {"name": spec.name, "spec_sha256": frozen_sha, "mode": spec.semantic_mode})
 
