@@ -72,86 +72,86 @@ class ToolResult:
 _ALL_TOOL_SPECS: Dict[str, ToolSpec] = {
     "list_files": ToolSpec(
         name="list_files",
-        description="List workspace files and directories safely without following symlinks.",
+        description="List workspace files and dirs.",
         kind="read",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative directory path (default '.')."},
-                "max_depth": {"type": "integer", "description": "Maximum traversal depth (1-10, default 3)."},
-                "max_entries": {"type": "integer", "description": "Maximum entries to return (default 200)."},
+                "path": {"type": "string", "description": "Dir (default '.')."},
+                "max_depth": {"type": "integer", "description": "Depth 1-10."},
+                "max_entries": {"type": "integer", "description": "Max entries."},
             },
         },
     ),
     "read_file": ToolSpec(
         name="read_file",
-        description="Read a UTF-8 workspace file (with optional 1-based inclusive line range).",
+        description="Read a UTF-8 workspace file.",
         kind="read",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative path to the file."},
-                "start_line": {"type": "integer", "description": "1-based start line (inclusive)."},
-                "end_line": {"type": "integer", "description": "1-based end line (inclusive)."},
+                "path": {"type": "string", "description": "Relative file path."},
+                "start_line": {"type": "integer", "description": "1-based start line."},
+                "end_line": {"type": "integer", "description": "1-based end line."},
             },
             "required": ["path"],
         },
     ),
     "search_files": ToolSpec(
         name="search_files",
-        description="Search workspace filenames and UTF-8 text lines for a substring query.",
+        description="Search workspace filenames and text.",
         kind="read",
         parameters={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Substring to search for."},
-                "path": {"type": "string", "description": "Relative search directory (default '.')."},
-                "case_sensitive": {"type": "boolean", "description": "Case-sensitive match (default false)."},
-                "max_results": {"type": "integer", "description": "Maximum matches to return (default 40)."},
+                "query": {"type": "string", "description": "Substring query."},
+                "path": {"type": "string", "description": "Dir (default '.')."},
+                "case_sensitive": {"type": "boolean", "description": "Case-sensitive."},
+                "max_results": {"type": "integer", "description": "Max matches."},
             },
             "required": ["query"],
         },
     ),
     "related_files": ToolSpec(
         name="related_files",
-        description="Find workspace files related by shared code or text identifiers.",
+        description="Find related workspace files.",
         kind="read",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Reference relative file path."},
-                "query": {"type": "string", "description": "Optional fallback query string if path omitted."},
-                "limit": {"type": "integer", "description": "Maximum related paths to return (default 10)."},
+                "path": {"type": "string", "description": "Reference file path."},
+                "query": {"type": "string", "description": "Fallback query."},
+                "limit": {"type": "integer", "description": "Max paths."},
             },
         },
     ),
     "write_file": ToolSpec(
         name="write_file",
-        description="Propose creating or overwriting a workspace file (staged for human approval; never writes directly).",
+        description="Create or overwrite a workspace file.",
         kind="staged_write",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Target relative file path."},
-                "content": {"type": "string", "description": "Complete proposed UTF-8 file content."},
-                "reason": {"type": "string", "description": "Short rationale shown in the approval card."},
+                "path": {"type": "string", "description": "Relative file path."},
+                "content": {"type": "string", "description": "Full UTF-8 content."},
+                "reason": {"type": "string", "description": "Short reason."},
             },
             "required": ["path", "content"],
         },
     ),
     "edit_file": ToolSpec(
         name="edit_file",
-        description="Propose a targeted search-and-replace edit on an existing file (staged for human approval).",
+        description="Replace exact text in an existing file.",
         kind="staged_write",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path to modify."},
-                "target": {"type": "string", "description": "Exact existing text block (must match uniquely)."},
-                "replacement": {"type": "string", "description": "Replacement text block."},
-                "start_line": {"type": "integer", "description": "Optional 1-based start line constraint."},
-                "end_line": {"type": "integer", "description": "Optional 1-based end line constraint."},
-                "reason": {"type": "string", "description": "Short rationale shown in the approval card."},
+                "path": {"type": "string", "description": "Relative file path."},
+                "target": {"type": "string", "description": "Exact unique text."},
+                "replacement": {"type": "string", "description": "New text."},
+                "start_line": {"type": "integer", "description": "Start line."},
+                "end_line": {"type": "integer", "description": "End line."},
+                "reason": {"type": "string", "description": "Short reason."},
             },
             "required": ["path", "target", "replacement"],
         },
@@ -186,13 +186,64 @@ _ALL_TOOL_SPECS: Dict[str, ToolSpec] = {
     ),
 }
 
+_JOB_TOOL_SPECS: Dict[str, ToolSpec] = {
+    "todo_write": ToolSpec(
+        name="todo_write",
+        description="Create/update job checklist (3-6 steps).",
+        kind="job",
+        parameters={
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "List of {id, title, status}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                        },
+                        "required": ["id", "title", "status"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    ),
+    "finish": ToolSpec(
+        name="finish",
+        description="Finish job after reading back deliverables.",
+        kind="job",
+        parameters={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Grounded summary."},
+                "deliverables": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relative file paths.",
+                },
+            },
+            "required": ["summary", "deliverables"],
+        },
+    ),
+}
 
-def get_tool_specs(capabilities: Optional[Capabilities] = None) -> List[ToolSpec]:
+
+def get_tool_specs(
+    capabilities: Optional[Capabilities] = None,
+    *,
+    include_job_tools: bool = False,
+) -> List[ToolSpec]:
     """Return enabled tool specifications in canonical sorted order."""
     caps = capabilities or Capabilities()
+    combined: Dict[str, ToolSpec] = dict(_ALL_TOOL_SPECS)
+    if include_job_tools:
+        combined.update(_JOB_TOOL_SPECS)
     specs: List[ToolSpec] = []
-    for name in sorted(_ALL_TOOL_SPECS):
-        spec = _ALL_TOOL_SPECS[name]
+    for name in sorted(combined):
+        spec = combined[name]
         if spec.required_capability == "vision" and not caps.vision:
             continue
         if spec.required_capability == "voice_asr" and not caps.voice_asr:
@@ -201,9 +252,13 @@ def get_tool_specs(capabilities: Optional[Capabilities] = None) -> List[ToolSpec
     return specs
 
 
-def get_tool_schemas(capabilities: Optional[Capabilities] = None) -> List[Dict[str, Any]]:
+def get_tool_schemas(
+    capabilities: Optional[Capabilities] = None,
+    *,
+    include_job_tools: bool = False,
+) -> List[Dict[str, Any]]:
     """Return canonical sorted OpenAI-style function tool schemas for prefix stability."""
-    return [spec.to_openai_schema() for spec in get_tool_specs(capabilities)]
+    return [spec.to_openai_schema() for spec in get_tool_specs(capabilities, include_job_tools=include_job_tools)]
 
 
 def _clip_text(text: str, limit: int = MAX_OUTPUT_CHARS) -> Tuple[str, bool]:
@@ -373,11 +428,29 @@ class ToolExecutor:
             "truncated": truncated,
             "entries": entries,
         }
-        return ToolResult(ok=True, tool_name="list_files", content=json.dumps(payload, indent=2))
+        return ToolResult(ok=True, tool_name="list_files", content=json.dumps(payload))
 
     def _run_read_file(self, args: Dict[str, Any]) -> ToolResult:
-        rel = args.get("path", "")
-        target = self.sandbox.resolve_read(rel)
+        rel = str(args.get("path") or "").strip()
+        if not rel:
+            return ToolResult(
+                ok=False,
+                tool_name="read_file",
+                content="",
+                error="Missing required 'path' parameter. Pass relative file path, e.g. path='inbox/notes.txt'.",
+            )
+        try:
+            target = self.sandbox.resolve_read(rel)
+        except PathSandboxError as exc:
+            if exc.reason == "not_found":
+                avail = [self.sandbox.relativize(p) for p in self._iter_safe_files(self.sandbox.root, max_depth=4)][:12]
+                return ToolResult(
+                    ok=False,
+                    tool_name="read_file",
+                    content="",
+                    error=f"Sandbox violation (not_found): {exc}. Existing workspace files: {avail}",
+                )
+            raise
         text, err = self._read_utf8_capped(target)
         if err is not None or text is None:
             return ToolResult(ok=False, tool_name="read_file", content="", error=err or "Unreadable file")
@@ -404,7 +477,7 @@ class ToolExecutor:
             "truncated": was_clipped,
             "content": clipped,
         }
-        return ToolResult(ok=True, tool_name="read_file", content=json.dumps(payload, indent=2))
+        return ToolResult(ok=True, tool_name="read_file", content=json.dumps(payload))
 
     def _run_search_files(self, args: Dict[str, Any]) -> ToolResult:
         query = str(args.get("query") or "")
@@ -437,7 +510,7 @@ class ToolExecutor:
                 break
 
         payload = {"query": query, "count": len(matches), "matches": matches}
-        return ToolResult(ok=True, tool_name="search_files", content=json.dumps(payload, indent=2))
+        return ToolResult(ok=True, tool_name="search_files", content=json.dumps(payload))
 
     def _run_related_files(self, args: Dict[str, Any]) -> ToolResult:
         rel = str(args.get("path") or "").strip()
@@ -480,7 +553,7 @@ class ToolExecutor:
         return ToolResult(
             ok=True,
             tool_name="related_files",
-            content=json.dumps({"reference": ref_rel or query, "related": results}, indent=2),
+            content=json.dumps({"reference": ref_rel or query, "related": results}),
         )
 
     def _run_write_file(self, args: Dict[str, Any]) -> ToolResult:

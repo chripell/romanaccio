@@ -1,5 +1,16 @@
 """Local-first Python multi-model agent harness foundation for LFM3 / LFM2.5 on roma."""
 
+from .agent_loop import (
+    AgentLoop,
+    DeliverableProof,
+    JobRunResult,
+    NumericGroundingReport,
+    RoundTelemetry,
+    TodoCheck,
+    TodoItem,
+    check_numeric_grounding,
+    evaluate_todo_check,
+)
 from .approvals import ApprovalManager, ApprovalOutcome, StageOutcome
 from .backend import (
     BackendDisconnectError,
@@ -36,6 +47,21 @@ from .config import (
     validate_workspace_root,
 )
 from .gates import EvidenceGate, EvidenceGateVerdict, WriteGate, WriteGateVerdict
+from .missions import (
+    AcceptanceCheck,
+    AcceptanceReport,
+    AcceptanceSpec,
+    CheckResult,
+    MissionJournal,
+    MissionRunResult,
+    MissionRunner,
+    evaluate_acceptance_check,
+    make_doc_extract_spec,
+    make_screen_qa_spec,
+    setup_desk_task_workspace,
+    verify_acceptance_spec,
+    verify_json_schema_stdlib,
+)
 from .paths import PathSandboxError, WorkspaceSandbox, WriteReceipt
 from .protocol import (
     ParsedAssistantTurn,
@@ -53,6 +79,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "APPROVAL_TTL_S",
+    "AcceptanceCheck",
+    "AcceptanceReport",
+    "AcceptanceSpec",
+    "AgentLoop",
     "ApprovalManager",
     "ApprovalOutcome",
     "BackendDisconnectError",
@@ -62,10 +92,12 @@ __all__ = [
     "BackendUnavailableError",
     "Calibration",
     "Capabilities",
+    "CheckResult",
     "DECISION_TIMEOUT_S",
     "DaemonClient",
     "DaemonEvent",
     "DecisionResult",
+    "DeliverableProof",
     "EVIDENCE_GATE_FLOOR",
     "EvidenceGate",
     "EvidenceGateVerdict",
@@ -75,6 +107,7 @@ __all__ = [
     "INTENTS",
     "INTENT_CRITERIA",
     "IntentRouter",
+    "JobRunResult",
     "MAX_GATE_EVIDENCE_CHARS",
     "MAX_JOB_TURNS",
     "MAX_LIST_ENTRIES",
@@ -84,16 +117,23 @@ __all__ = [
     "MAX_SEARCH_RESULTS",
     "MAX_TOOL_ROUNDS",
     "MAX_WRITE_BYTES",
+    "MissionJournal",
+    "MissionRunResult",
+    "MissionRunner",
+    "NumericGroundingReport",
     "ParsedAssistantTurn",
     "ParsedToolCall",
     "PathSandboxError",
     "ROUTE_MIN_CONFIDENCE",
     "RenderedPrompt",
+    "RoundTelemetry",
     "RouteDecision",
     "SafetyLimits",
     "SessionBusyError",
     "StageOutcome",
     "StagedWriteProposal",
+    "TodoCheck",
+    "TodoItem",
     "TokenizerLookup",
     "ToolExecutor",
     "ToolResult",
@@ -105,9 +145,17 @@ __all__ = [
     "WriteReceipt",
     "__version__",
     "build_pinned_system_prefix",
+    "check_numeric_grounding",
+    "evaluate_acceptance_check",
+    "evaluate_todo_check",
     "get_tool_schemas",
     "heuristic_route",
+    "make_doc_extract_spec",
+    "make_screen_qa_spec",
     "parse_assistant_output",
     "render_prompt",
+    "setup_desk_task_workspace",
     "validate_workspace_root",
+    "verify_acceptance_spec",
+    "verify_json_schema_stdlib",
 ]

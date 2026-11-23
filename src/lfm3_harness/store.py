@@ -352,6 +352,68 @@ class HarnessStore:
             )
         return dict(self.conn.execute("SELECT * FROM jobs WHERE id = ?", (jid,)).fetchone())
 
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        phase: Optional[str] = None,
+        status: Optional[str] = None,
+        todo: Optional[List[Dict[str, Any]]] = None,
+        deliverable: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        sets: List[str] = ["updated_at = ?"]
+        vals: List[Any] = [time.time()]
+        if phase is not None:
+            sets.append("phase = ?")
+            vals.append(phase)
+        if status is not None:
+            sets.append("status = ?")
+            vals.append(status)
+        if todo is not None:
+            sets.append("todo_json = ?")
+            vals.append(json.dumps(todo))
+        if deliverable is not None:
+            sets.append("deliverable_json = ?")
+            vals.append(json.dumps(deliverable))
+        vals.append(job_id)
+        with self.conn:
+            self.conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", tuple(vals))
+
+    def get_acceptance_spec(self, spec_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM acceptance_specs WHERE id = ?", (spec_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_mission_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM mission_runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_mission_run(
+        self,
+        run_id: str,
+        *,
+        status: Optional[str] = None,
+        attempt: Optional[int] = None,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        sets: List[str] = ["updated_at = ?"]
+        vals: List[Any] = [time.time()]
+        if status is not None:
+            sets.append("status = ?")
+            vals.append(status)
+        if attempt is not None:
+            sets.append("attempt = ?")
+            vals.append(int(attempt))
+        if result is not None:
+            sets.append("result_json = ?")
+            vals.append(json.dumps(result))
+        vals.append(run_id)
+        with self.conn:
+            self.conn.execute(f"UPDATE mission_runs SET {', '.join(sets)} WHERE id = ?", tuple(vals))
+
     def create_mission_run(
         self,
         workspace_id: str,

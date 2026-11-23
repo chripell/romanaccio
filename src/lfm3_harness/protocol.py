@@ -293,10 +293,17 @@ def _coerce_param_value(raw_val: str) -> Any:
     if trimmed == "null":
         return None
     # Only JSON-decode structured containers or clean scalars, preserving multi-line code strings.
-    if (trimmed.startswith("{") and trimmed.endswith("}")) or (trimmed.startswith("[") and trimmed.endswith("]")):
+    cleaned = re.sub(r"\s*</[A-Za-z0-9_]+>\s*$", "", trimmed)
+    if (cleaned.startswith("{") and cleaned.endswith("}")) or (cleaned.startswith("[") and cleaned.endswith("]")):
         try:
-            return json.loads(trimmed)
+            return json.loads(cleaned)
         except json.JSONDecodeError:
+            try:
+                parsed_py = ast.literal_eval(cleaned)
+                if isinstance(parsed_py, (dict, list)):
+                    return parsed_py
+            except (ValueError, SyntaxError):
+                pass
             return raw_val
     if trimmed and trimmed.isdigit() and not (trimmed.startswith("0") and len(trimmed) > 1):
         return int(trimmed)
@@ -332,6 +339,28 @@ def _parse_lfm3_calls(text: str, calls: List[ParsedToolCall], errors: List[str])
         inner = match.group(1)
         fn_match = _LFM3_FUNC_RE.search(inner)
         if not fn_match:
+            # Safe JSON fallback inside <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+            try:
+                obj = json.loads(inner.strip())
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict) and isinstance(obj.get("name"), str) and obj["name"].strip():
+                raw_args = obj.get("arguments") or {}
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args) if raw_args.strip() else {}
+                    except json.JSONDecodeError:
+                        raw_args = {}
+                if isinstance(raw_args, dict):
+                    calls.append(
+                        ParsedToolCall(
+                            name=obj["name"].strip(),
+                            arguments=raw_args,
+                            raw=match.group(0),
+                            call_id=f"call_{len(calls) + 1}",
+                        )
+                    )
+                    return ""
             errors.append(f"Malformed LFM3 <tool_call> missing <function=...>: {inner[:120]}")
             return ""
         fn_name = fn_match.group(1).strip()
