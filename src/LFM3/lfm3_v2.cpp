@@ -1203,6 +1203,49 @@ static void unpack_npu_output_int8_dyntok(const int8_t *src_nchw, float *dst_tc,
     }
 }
 
+// Dynamic per-token INT16 output unpacker for homogeneous 1x1 linear projections (e.g., SmoothQuant dyntok LM Head)
+static void unpack_npu_output_int16_dyntok(const int16_t *src_nchw, float *dst_tc, int T, int C_out,
+                                           float out_step, const float *scale_ratios,
+                                           const float *out_step_chan = nullptr, int T_valid = -1,
+                                           int dst_stride = 0) {
+    if (T_valid < 0 || T_valid > T) T_valid = T;
+    if (dst_stride <= 0) dst_stride = C_out;
+    if (T == 1) {
+        if (out_step_chan) {
+            const float r0 = scale_ratios[0];
+            #pragma omp simd
+            for (int c = 0; c < C_out; ++c) {
+                dst_tc[c] = static_cast<float>(src_nchw[c]) * (r0 * out_step_chan[c]);
+            }
+        } else {
+            const float step_tok = scale_ratios[0] * out_step;
+            #pragma omp simd
+            for (int c = 0; c < C_out; ++c) {
+                dst_tc[c] = static_cast<float>(src_nchw[c]) * step_tok;
+            }
+        }
+        return;
+    }
+
+    #pragma omp parallel for collapse(2) if(T > 8) schedule(static)
+    for (int t0 = 0; t0 < T_valid; t0 += 16) {
+        for (int c0 = 0; c0 < C_out; c0 += 16) {
+            const int dt_end = std::min(16, T_valid - t0);
+            alignas(64) float tile[16][16];
+            for (int dc = 0; dc < 16; ++dc) {
+                const int16_t *s_row = src_nchw + static_cast<size_t>(c0 + dc) * T + t0;
+                const float st_c = out_step_chan ? out_step_chan[c0 + dc] : out_step;
+                for (int dt = 0; dt < dt_end; ++dt) {
+                    tile[dt][dc] = static_cast<float>(s_row[dt]) * (scale_ratios[t0 + dt] * st_c);
+                }
+            }
+            for (int dt = 0; dt < dt_end; ++dt) {
+                std::memcpy(dst_tc + static_cast<size_t>(t0 + dt) * dst_stride + c0, tile[dt], 16 * sizeof(float));
+            }
+        }
+    }
+}
+
 // Unified NPU Input Packer: routes FP32 [T_valid, C] -> FP16, INT8 (static or dyntok), or INT16 DmaBuffer
 static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C,
                            const SubgraphScaleInfo &sc, float *dyntok_ratios = nullptr, int T_valid = -1) {
@@ -1224,7 +1267,7 @@ static void pack_npu_input(const float *src_tc, DmaBuffer *dst_buf, int T, int C
     }
 }
 
-// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 DmaBuffer -> FP32 [T_valid, dst_stride]
+// Unified NPU Output Unpacker: routes FP16, INT8 (static or dyntok), or INT16 (static or dyntok) DmaBuffer -> FP32 [T_valid, dst_stride]
 static void unpack_npu_output(const DmaBuffer *src_buf, float *dst_tc, int T, int C_out,
                               const SubgraphScaleInfo &sc, const float *dyntok_ratios = nullptr,
                               int T_valid = -1, int dst_stride = 0) {
@@ -1237,7 +1280,11 @@ static void unpack_npu_output(const DmaBuffer *src_buf, float *dst_tc, int T, in
             }
             break;
         case BoundaryDtype::Int16:
-            unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid, dst_stride);
+            if (dyntok_ratios) {
+                unpack_npu_output_int16_dyntok(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step, dyntok_ratios, sc.out_step_chan, T_valid, dst_stride);
+            } else {
+                unpack_npu_output_int16(src_buf->as<int16_t>(), dst_tc, T, C_out, sc.out_step, sc.out_step_chan, T_valid, dst_stride);
+            }
             break;
         case BoundaryDtype::Fp16:
         default:
@@ -2572,7 +2619,21 @@ public:
         auto tfn0 = std::chrono::steady_clock::now();
         const SubgraphScaleInfo &lm_in_sc = m_die_models[0].lm_head_scale[0];
 
-        if (!m_emb_norm_scaled.empty()) {
+        float lm_dyn_ratio = 1.0f;
+        const bool use_lm_dyntok = (lm_in_sc.in_dtype == BoundaryDtype::Int8 &&
+                                    lm_in_sc.out_dtype == BoundaryDtype::Int16 &&
+                                    !m_emb_norm_smooth.empty());
+        if (use_lm_dyntok) {
+            float h_final_dbg[kHidden];
+            fused_rms_norm_pack_dyntok_t1(last_h, m_emb_norm_weight, m_emb_norm_smooth.data(),
+                                          m_act_t1[0]->as<int8_t>(), kHidden,
+                                          lm_in_sc.in_thresh, &lm_dyn_ratio,
+                                          debug_emb_norm ? h_final_dbg : nullptr);
+            if (debug_emb_norm) {
+                debug_emb_norm->assign(h_final_dbg, h_final_dbg + kHidden);
+            }
+            std::memcpy(m_act_t1[1]->data(), m_act_t1[0]->data(), static_cast<size_t>(kHidden) * sizeof(int8_t));
+        } else if (!m_emb_norm_scaled.empty()) {
             fused_emb_norm_broadcast_t1(last_h, m_emb_norm_scaled.data(),
                                         m_act_t1[0]->as<int8_t>(),
                                         m_act_t1[1]->as<int8_t>(),
@@ -2608,6 +2669,45 @@ public:
         auto run_die_lm_head = [&](uint16_t logical_die, bool &ok_flag) {
             uint16_t phys_die = (logical_die < m_num_dies) ? logical_die : 0;
             DmaBuffer *in_b = m_act_t1[logical_die].get();
+            if (!m_extent_probe) {
+                uint32_t m_ids[4];
+                DmaBufferSlice out_sl[4];
+                size_t in_surf = 0;
+                double w_bytes_sum = 0.0;
+                for (int s = 0; s < 4; ++s) {
+                    const LoadedArchetype   &lm_arch = m_die_models[logical_die].lm_head[s];
+                    const SubgraphScaleInfo &lm_sc   = m_die_models[logical_die].lm_head_scale[s];
+                    DmaBuffer *out_b = m_lm_out[logical_die][s].get();
+                    size_t in_raw   = static_cast<size_t>(kHidden) * dtype_elem_size(lm_sc.in_dtype);
+                    size_t out_raw  = static_cast<size_t>(16000)   * dtype_elem_size(lm_sc.out_dtype);
+                    bool lm_fit = false;
+                    in_surf = surface_descriptor(in_b, lm_arch.in_surface_bytes, in_raw, "lm_head act", lm_fit, prod_cap(in_b));
+                    size_t out_surf = surface_descriptor(out_b, lm_arch.out_surface_bytes, out_raw, "lm_head logits", lm_fit, prod_cap(out_b));
+                    if (lm_fit) { ok_flag = false; return; }
+                    m_ids[s] = lm_arch.id;
+                    out_sl[s] = DmaBufferSlice{out_b, 0, out_surf};
+                    w_bytes_sum += static_cast<double>(lm_arch.weight_bytes);
+                }
+                const auto s0 = std::chrono::steady_clock::now();
+                uint64_t driver_ns = 0;
+                const bool ok = m_pool.submit_lm_head_batch(phys_die, m_ids, DmaBufferSlice{in_b, 0, in_surf}, out_sl, &driver_ns);
+                if (!ok) { ok_flag = false; return; }
+                for (int s = 0; s < 4; ++s) {
+                    m_lm_out[logical_die][s]->flush_cache();
+                }
+                const auto s1 = std::chrono::steady_clock::now();
+                lm_master[logical_die] += std::chrono::duration<double, std::milli>(s1 - s0).count();
+                lm_driver[logical_die] += static_cast<double>(driver_ns) / 1e6;
+                lm_bytes[logical_die]  += w_bytes_sum;
+                lm_submits[logical_die] += 4;
+                for (int s = 0; s < 4; ++s) {
+                    const SubgraphScaleInfo &lm_sc = m_die_models[logical_die].lm_head_scale[s];
+                    float *dst_fp32 = m_logits.data() + (static_cast<size_t>(logical_die) * 64000 + s * 16000);
+                    unpack_npu_output(m_lm_out[logical_die][s].get(), dst_fp32, 1, 16000, lm_sc,
+                                      use_lm_dyntok ? &lm_dyn_ratio : nullptr);
+                }
+                return;
+            }
             for (int s = 0; s < 4; ++s) {
                 const LoadedArchetype   &lm_arch = m_die_models[logical_die].lm_head[s];
                 const SubgraphScaleInfo &lm_sc   = m_die_models[logical_die].lm_head_scale[s];
@@ -2643,7 +2743,7 @@ public:
                     return;
                 }
                 float *dst_fp32 = m_logits.data() + (static_cast<size_t>(logical_die) * 64000 + s * 16000);
-                unpack_npu_output(out_b, dst_fp32, 1, 16000, lm_sc);
+                unpack_npu_output(out_b, dst_fp32, 1, 16000, lm_sc, use_lm_dyntok ? &lm_dyn_ratio : nullptr);
             }
         };
 
@@ -2653,9 +2753,12 @@ public:
         );
         auto tlm1 = std::chrono::steady_clock::now();
         timers.npu_lmhead_ms += std::chrono::duration<double, std::milli>(tlm1 - tlm0).count();
-        for (int d = 0; d < 2; ++d)
-            if (lm_submits[d])
-                timers.add_arch(StageTimers::ARCH_LM_HEAD, lm_master[d], lm_driver[d], lm_bytes[d]);
+        if (lm_submits[0] || lm_submits[1]) {
+            timers.add_arch(StageTimers::ARCH_LM_HEAD,
+                            std::max(lm_master[0], lm_master[1]),
+                            std::max(lm_driver[0], lm_driver[1]),
+                            lm_bytes[0] + lm_bytes[1]);
+        }
 
         return ok_d0 && ok_d1;
     }
@@ -4379,7 +4482,8 @@ private:
                     use_shared ? "archetype_shared" : "per-subgraph",
                     m_chan_scales_buf.empty() ? "off" : "on",
                     (m_layer_npu[0].mlp_scale.out_dtype == BoundaryDtype::Int16) ? "int16" : "int8",
-                    (m_die_models[0].lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? "int8" : "fp16");
+                    (m_die_models[0].lm_head_scale[0].out_dtype == BoundaryDtype::Int16) ? "int16"
+                        : ((m_die_models[0].lm_head_scale[0].out_dtype == BoundaryDtype::Int8) ? "int8" : "fp16"));
 
         // Milestone 8 (Phase 1): Precompute fused SmoothQuant and scaled RMSNorm weights
         for (int l = 0; l < kNumLayers; ++l) {
@@ -4406,12 +4510,16 @@ private:
                 }
             }
         }
-        // 3. m_emb_norm_scaled for LM head
+        // 3. m_emb_norm_scaled (static INT8) & m_emb_norm_smooth (dyntok INT16) for LM head
         if (m_die_models[0].lm_head_scale[0].in_dtype == BoundaryDtype::Int8 && m_emb_norm_weight) {
             m_emb_norm_scaled.resize(kHidden);
+            m_emb_norm_smooth.resize(kHidden);
+            const float *sm = m_die_models[0].lm_head_scale[0].in_inv_smooth;
             float inv_step = 1.0f / m_die_models[0].lm_head_scale[0].in_step;
             for (int c = 0; c < kHidden; ++c) {
-                m_emb_norm_scaled[c] = m_emb_norm_weight[c] * inv_step;
+                float s = sm ? sm[c] : 1.0f;
+                m_emb_norm_smooth[c] = m_emb_norm_weight[c] * s;
+                m_emb_norm_scaled[c] = m_emb_norm_weight[c] * s * inv_step;
             }
         }
         return true;
@@ -4452,6 +4560,7 @@ private:
     std::vector<float> m_chan_scales_buf;
     const float *m_emb_norm_weight = nullptr;
     std::vector<float> m_emb_norm_scaled;
+    std::vector<float> m_emb_norm_smooth;
     LayerCpuWeights m_layer_cpu[kNumLayers];
     LayerNpuOffsets m_layer_npu[kNumLayers];
     DieModels m_die_models[2];

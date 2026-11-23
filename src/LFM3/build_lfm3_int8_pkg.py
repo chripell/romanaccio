@@ -37,6 +37,8 @@ from calibrate_lfm3_int8 import CALIB_SENTENCES
 DEFAULT_MODEL_DIR   = Path("/home/chri/aixigua/deep/models/LFM3-1.7B")
 DEFAULT_TABLES_DIR  = Path("/home/chri/aixigua/deep/artifacts/lfm3_quant_tables")
 DEFAULT_TEMPL_DIR   = Path("/home/chri/aixigua/deep/artifacts/lfm3_probe_templates")
+DEFAULT_LM_TMPL     = Path("/home/chri/aixigua/deep/artifacts/lfm2_moe_templates/ops_int16/lm_head_16k_int16_npu_b1.model")
+DEFAULT_LM_CALIB_PT = Path("/home/chri/aixigua/deep/artifacts/lfm3_golden/lfm3_lm_head_calib_fp32.pt")
 PROBE_DIR           = Path("/run/host-wayland/simulator-ipc/lfm3_probe_int8")
 DEFAULT_PKG_FP16    = DEFAULT_MODEL_DIR / "eswin_pkg"
 DEFAULT_PKG_INT8    = DEFAULT_MODEL_DIR / "eswin_pkg_int8"
@@ -51,7 +53,13 @@ TRUNCS = {
     "proj2048": [22] * 4,
     "attn_qkv": [23] * 6,
     "mlp":      [14] * 15 + [15] * 15 + [28] * 32,
+    "lm_head":  [16] * 63,
 }
+
+LM_CALIB_EXTRA_TEXTS = [
+    "<|im_start|>system\nYou are a helpful coding assistant.<|im_end|>\n<|im_start|>user\nWrite a Python function to merge intervals.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n```python\ndef merge(intervals):\n    intervals.sort()\n    out = []\n    for s, e in intervals:\n        if out and s <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], e)\n        else:\n            out.append([s, e])\n    return out\n```\n<|im_end|>\n",
+    "<|im_start|>system\nYou have access to workspace tools.\n<tools>\n[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"todo_write\"}},{\"type\":\"function\",\"function\":{\"name\":\"finish\"}}]\n</tools><|im_end|>\n<|im_start|>user\nSummarize inbox/q1_sales.txt into reports/desk_summary.md.<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=todo_write>\n<parameter=todos>[{\"id\":\"1\",\"content\":\"Inspect inbox/q1_sales.txt\",\"status\":\"in_progress\"}]</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>ok</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=read_file>\n<parameter=path>inbox/q1_sales.txt</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>Region North: $142000\nRegion South: $98500\nTotal Q1 Sales: $240500</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=write_file>\n<parameter=path>reports/desk_summary.md</parameter>\n<parameter=content># Q1 Sales Summary\n\n- North: $142000\n- South: $98500\n- Total: $240500\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>wrote reports/desk_summary.md</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=finish>\n<parameter=summary>Created reports/desk_summary.md from inbox/q1_sales.txt.</parameter>\n</function>\n</tool_call><|im_end|>\n",
+]
 
 
 def patch_model_truncates(src_model: Path, dst_model: Path, new_truncs: list[int], align_mlp_t1_to_t64: Path = None):
@@ -308,6 +316,223 @@ def build_mlp_region(
     return bytes(buf), in_t, in_s, in_inv_smooth, out_step_chan
 
 
+def collect_lm_head_calibration_activations(
+    model_dir: Path,
+    cache_pt_path: Path = DEFAULT_LM_CALIB_PT,
+    recalibrate: bool = False,
+) -> torch.Tensor:
+    """Collects FP32 embedding_norm output activations across prose, ChatML, and tool-calling turns."""
+    if not recalibrate and cache_pt_path.exists():
+        data = torch.load(str(cache_pt_path), map_location="cpu")
+        x_cached = data["lm_head"] if isinstance(data, dict) and "lm_head" in data else data
+        print(f"[+] Loaded cached LM-head calibration activations {tuple(x_cached.shape)} from {cache_pt_path}")
+        return x_cached.float()
+
+    print(f"[+] Collecting FP32 LM-head calibration activations for {model_dir.name}...")
+    tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    bos_id = tok.bos_token_id if tok.bos_token_id is not None else 124894
+    seqs: list[list[int]] = []
+    for idx, s in enumerate(CALIB_SENTENCES[:24]):
+        body = tok.encode(s, add_special_tokens=False)
+        seqs.append(([bos_id] + body) if (idx % 2 == 0) else body)
+    for txt in LM_CALIB_EXTRA_TEXTS:
+        seqs.append([bos_id] + tok.encode(txt, add_special_tokens=False))
+
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), trust_remote_code=True, dtype=torch.float32)
+    model.eval()
+    acts: list[torch.Tensor] = []
+
+    def emb_hook(_mod, _inp, out):
+        acts.append(out.detach().reshape(-1, out.shape[-1]).cpu())
+
+    handle = model.model.embedding_norm.register_forward_hook(emb_hook)
+    with torch.no_grad():
+        for ids in seqs:
+            model(torch.tensor([ids], dtype=torch.long), use_cache=False)
+    handle.remove()
+    del model
+
+    x_lm = torch.cat(acts, dim=0).float()
+    cache_pt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"lm_head": x_lm}, str(cache_pt_path))
+    print(f"[+] Saved LM-head calibration activations {tuple(x_lm.shape)} -> {cache_pt_path}")
+    return x_lm
+
+
+def build_lm_head_int16_slices(
+    emb_w: torch.Tensor,
+    x_cal_lm: torch.Tensor,
+    tmpl_lm_path: Path,
+    models_out_dir: Path,
+) -> tuple[float, float, np.ndarray, list[np.ndarray]]:
+    """
+    Calibrates and builds the 8 Class A LM head slices (lfm3_lm_head_d{0,1}_s{0..3}.model)
+    using DropBOS RMS SmoothQuant, dynamic per-token INT8 input packing, and per-channel
+    INT16 output steps (min bound >= 120.0 logits to prevent saturation clipping).
+    """
+    if not tmpl_lm_path.exists():
+        raise FileNotFoundError(f"Missing INT16 LM-head template: {tmpl_lm_path}")
+    sh = TRUNCS["lm_head"][0]
+    x_f32 = x_cal_lm.float()
+    emb_f32 = emb_w.float()
+
+    rm = x_f32.abs().amax(dim=1)
+    clean_mask = rm <= (torch.median(rm) * 3.0)
+    x_clean = x_f32[clean_mask] if int(clean_mask.sum().item()) >= 16 else x_f32
+
+    s_x = x_clean.pow(2).mean(dim=0).sqrt().clamp(min=1e-5)
+    s_w = emb_f32.abs().amax(dim=0).clamp(min=1e-5)
+    smooth = (s_x / s_w).sqrt().clamp(min=1e-3, max=1e3)
+    inv_smooth = 1.0 / smooth
+
+    X_sm_clean = x_clean * inv_smooth.unsqueeze(0)
+    amax_tok = X_sm_clean.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    in_t = float(amax_tok.max().item())
+    in_s = in_t / 127.0
+
+    X_sm_all = x_f32 * inv_smooth.unsqueeze(0)
+    amax_all = X_sm_all.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    x_q_all = torch.clamp(torch.round(X_sm_all * (127.0 / amax_all)), -127.0, 127.0).double()
+
+    W_sm = (emb_f32 * smooth.unsqueeze(0)).double()
+    w_s = W_sm.abs().amax(dim=1).clamp(min=1e-12) / 127.0
+    w_q_f64 = torch.clamp(torch.round(W_sm / w_s.unsqueeze(1)), -127.0, 127.0)
+
+    u_c = W_sm.norm(dim=1).clamp(min=1e-8)
+    y_norm_max = (F.linear(x_q_all, w_q_f64).abs().amax(dim=0)) * (in_s * w_s)
+    qf = torch.quantile(y_norm_max / u_c, 0.90)
+    y_bound = torch.maximum(
+        torch.maximum(y_norm_max * 2.0, qf * u_c * 2.0),
+        torch.full_like(y_norm_max, 120.0),
+    )
+    min_out_s = (in_s * w_s * (1 << sh)) / 32767.0
+    out_s_chan = torch.maximum(y_bound / 32767.0, min_out_s)
+    qm_raw = torch.round((in_s * w_s / out_s_chan) * (1 << sh))
+    n_hi = int((qm_raw > 32767.0).sum().item())
+    assert n_hi == 0, f"LM head qm_raw > 32767 on {n_hi} channels at sh={sh}"
+    qm_all_f = torch.clamp(qm_raw, 1.0, 32767.0)
+    out_step_all_t = (in_s * w_s * (1 << sh)) / qm_all_f
+    out_step_all = out_step_all_t.float().numpy()
+    qm_all_i16 = qm_all_f.to(torch.int16).numpy()
+
+    # Offline INT8xINT8->INT16 simulation check against FP32 reference logits
+    with torch.no_grad():
+        ratios = (amax_all[:, 0] / in_t).double()
+        int_acc = torch.trunc((F.linear(x_q_all, w_q_f64) * qm_all_f.unsqueeze(0)) / float(1 << sh))
+        int_q16 = torch.clamp(int_acc, -32768.0, 32767.0)
+        y_sim = int_q16 * (ratios.unsqueeze(1) * out_step_all_t.unsqueeze(0))
+        y_ref = F.linear(x_f32.double(), emb_f32.double())
+        cos = F.cosine_similarity(y_sim, y_ref, dim=-1).mean().item()
+        top1 = float((y_sim.argmax(dim=-1) == y_ref.argmax(dim=-1)).float().mean().item())
+        max_clip = int((int_acc.abs() >= 32767.0).sum().item())
+        ceil_vals = out_step_all * 32767.0
+        print(
+            f"[+] LMHead INT16 calibration: in_t={in_t:.4f} qm=[{qm_all_i16.min()}, "
+            f"p50={int(np.median(qm_all_i16))}, max={qm_all_i16.max()}] "
+            f"ceil=[{ceil_vals.min():.2f}, p50={np.median(ceil_vals):.2f}, max={ceil_vals.max():.2f}] "
+            f"sim_cos={cos:.6f} top1={top1*100:.2f}% clip_cnt={max_clip}"
+        )
+
+    w_q_all = w_q_f64.to(torch.int8)
+    w_pad_all = F.pad(w_q_all, (0, 64))  # K=2048 -> K_pad=2112
+
+    m = ModelReader.read_file(str(tmpl_lm_path))
+    reg = find_weight_regions(m)[0]
+    blob_dict = {b.name: b for b in m.blobs}
+
+    op_bytes = bytearray(blob_dict["kmd-task-op_list"].data)
+    n_recs = len(op_bytes) // 1984
+    hits = [r * 1984 + 82 for r in range(n_recs) if op_bytes[r * 1984 + 82 - 12:r * 1984 + 82] == SDP_SIG]
+    assert len(hits) == 63, f"Expected 63 SDP hits in {tmpl_lm_path.name}, got {len(hits)}"
+    for off in hits:
+        op_bytes[off] = sh
+    blob_dict["kmd-task-op_list"].data = bytes(op_bytes)
+
+    models_out_dir.mkdir(parents=True, exist_ok=True)
+    slice_out_steps: list[np.ndarray] = []
+    for d in range(2):
+        for s in range(4):
+            idx_16k = d * 4 + s
+            c_start = idx_16k * 16000
+            c_end = c_start + 16000
+            slice_out_steps.append(out_step_all[c_start:c_end])
+
+            w_sub = w_pad_all[c_start:c_end]
+            qm_sub = qm_all_i16[c_start:c_end]
+
+            w_62 = w_sub[:15872].view(62, 32, 8, 22, 3, 8, 4).permute(0, 1, 3, 4, 5, 2, 6).contiguous().numpy()
+            qm_62 = qm_sub[:15872].reshape(62, 256)
+            for b_i in range(62):
+                blob_dict[reg.contents[2 * b_i]].data = w_62[b_i].tobytes()
+                blob_dict[reg.contents[2 * b_i + 1]].data = qm_62[b_i].tobytes()
+
+            w_last = w_sub[15872:].view(16, 8, 22, 3, 8, 4).permute(0, 2, 3, 4, 1, 5).contiguous().numpy()
+            qm_last = qm_sub[15872:]
+            blob_dict[reg.contents[124]].data = w_last.tobytes()
+            blob_dict[reg.contents[125]].data = qm_last.tobytes()
+
+            dst_p = models_out_dir / f"lfm3_lm_head_d{d}_s{s}.model"
+            if dst_p.exists() or dst_p.is_symlink():
+                dst_p.unlink()  # avoid overwriting hardlinked packages in-place
+            ModelWriter.write_file(m, str(dst_p))
+            print(f"  [+] Built LM head INT16 slice {dst_p.name} ({dst_p.stat().st_size / 1e6:.2f} MB)")
+
+    return in_t, in_s, inv_smooth.float().numpy(), slice_out_steps
+
+
+def patch_pkg_lm_head_scales(
+    pkg_dir: Path,
+    lm_in_t: float,
+    lm_in_s: float,
+    lm_inv_smooth: np.ndarray,
+    lm_slice_out_steps: list[np.ndarray],
+) -> None:
+    """Updates quant_scales.json and quant_chan_scales.bin in-place for a package's 8 LM-head slices."""
+    qs_path = pkg_dir / "quant_scales.json"
+    chan_path = pkg_dir / "quant_chan_scales.bin"
+    qs = json.loads(qs_path.read_text())
+    chan_arr = np.fromfile(str(chan_path), dtype=np.float32) if chan_path.exists() else np.zeros(0, dtype=np.float32)
+    chan_list = chan_arr.astype(np.float32).tolist()
+
+    sc0 = qs["subgraphs"]["lfm3_lm_head_d0_s0"]
+    if sc0.get("in_smooth_count", 0) == lm_inv_smooth.size and sc0.get("in_smooth_offset", -1) >= 0 and sc0["in_smooth_offset"] + lm_inv_smooth.size <= len(chan_list):
+        lm_in_off = int(sc0["in_smooth_offset"])
+        chan_list[lm_in_off:lm_in_off + lm_inv_smooth.size] = lm_inv_smooth.tolist()
+    else:
+        lm_in_off = len(chan_list)
+        chan_list.extend(np.ascontiguousarray(lm_inv_smooth, dtype=np.float32).ravel().tolist())
+    lm_in_cnt = int(lm_inv_smooth.size)
+
+    for d in range(2):
+        for s in range(4):
+            k_lm = f"lfm3_lm_head_d{d}_s{s}"
+            osc = np.ascontiguousarray(lm_slice_out_steps[d * 4 + s], dtype=np.float32).ravel()
+            sc = qs["subgraphs"][k_lm]
+            if sc.get("out_step_count", 0) == osc.size and sc.get("out_step_offset", -1) >= 0 and sc["out_step_offset"] + osc.size <= len(chan_list):
+                out_off = int(sc["out_step_offset"])
+                chan_list[out_off:out_off + osc.size] = osc.tolist()
+            else:
+                out_off = len(chan_list)
+                chan_list.extend(osc.tolist())
+            out_s_med = float(np.median(osc))
+            qs["subgraphs"][k_lm] = {
+                "input_dtype": "int8",
+                "output_dtype": "int16",
+                "input_threshold": float(lm_in_t),
+                "input_step": float(lm_in_s),
+                "output_threshold": float(out_s_med * 32767.0),
+                "output_step": float(out_s_med),
+                "in_smooth_offset": lm_in_off,
+                "in_smooth_count": lm_in_cnt,
+                "out_step_offset": out_off,
+                "out_step_count": int(osc.size),
+            }
+
+    np.asarray(chan_list, dtype=np.float32).tofile(str(chan_path))
+    qs_path.write_text(json.dumps(qs, indent=2))
+    print(f"[+] Updated LM-head INT16 scales in {pkg_dir} (chan_scales={len(chan_list)} floats, {chan_path.stat().st_size} B)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Direct NVDLA INT8/INT16 Weight & CvtPrecision_QuantM Package Builder for LFM3-1.7B")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Path to HF model directory")
@@ -316,6 +541,11 @@ def main():
     parser.add_argument("--fp16-pkg-dir", type=Path, default=DEFAULT_PKG_FP16, help="Base FP16 package directory")
     parser.add_argument("--tables-dir", type=Path, default=DEFAULT_TABLES_DIR, help="Quant tables directory")
     parser.add_argument("--templates-dir", type=Path, default=DEFAULT_TEMPL_DIR, help="Archetype probe templates directory")
+    parser.add_argument("--lm-head-tmpl", type=Path, default=DEFAULT_LM_TMPL, help="Pre-compiled INT16 LM-head 16K template .model")
+    parser.add_argument("--lm-calib-cache", type=Path, default=DEFAULT_LM_CALIB_PT, help="Cached FP32 LM-head calibration activations .pt")
+    parser.add_argument("--recalibrate-lm-head", action="store_true", help="Force re-collecting FP32 LM-head calibration activations")
+    parser.add_argument("--patch-lm-head-only", action="store_true", help="Rebuild only the 8 INT16 LM-head slices and update scales in --pkg-out-dir (and --also-patch-pkg-dir)")
+    parser.add_argument("--also-patch-pkg-dir", type=Path, action="append", default=[], help="Additional package dir (e.g. eswin_pkg_tp2) to hardlink LM-head slices and update scales")
     args = parser.parse_args()
 
     model_dir = args.model_dir.resolve()
@@ -324,6 +554,33 @@ def main():
     fp16_pkg_dir = args.fp16_pkg_dir.resolve()
     tables_dir = args.tables_dir.resolve()
     templates_dir = args.templates_dir.resolve()
+    lm_tmpl_path = args.lm_head_tmpl.resolve()
+
+    if args.patch_lm_head_only:
+        st = safe_open(str(model_dir / "model.safetensors"), framework="pt")
+        w_key = "model.embed_tokens.weight" if "model.embed_tokens.weight" in st.keys() else "lm_head.weight"
+        emb_w = st.get_tensor(w_key).float()
+        x_cal_lm = collect_lm_head_calibration_activations(model_dir, args.lm_calib_cache, args.recalibrate_lm_head)
+        lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_int16_slices(
+            emb_w, x_cal_lm, lm_tmpl_path, pkg_out_dir / "models"
+        )
+        patch_pkg_lm_head_scales(pkg_out_dir, lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps)
+        for extra_dir in args.also_patch_pkg_dir:
+            ed = extra_dir.resolve()
+            (ed / "models").mkdir(parents=True, exist_ok=True)
+            for d in range(2):
+                for s in range(4):
+                    name = f"lfm3_lm_head_d{d}_s{s}.model"
+                    src_m = pkg_out_dir / "models" / name
+                    dst_m = ed / "models" / name
+                    if dst_m.exists() or dst_m.is_symlink():
+                        dst_m.unlink()
+                    try:
+                        os.link(src_m, dst_m)
+                    except OSError:
+                        shutil.copy2(src_m, dst_m)
+            patch_pkg_lm_head_scales(ed, lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps)
+        return
 
     (pkg_out_dir / "models").mkdir(parents=True, exist_ok=True)
 
@@ -358,10 +615,19 @@ def main():
         manifest["model_name"] = model_dir.name
         (pkg_out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    # 2. Re-use or compile archetype models
+    # 2. Build INT16 LM-head slices + reuse or compile Class B archetype models
+    w_key = "model.embed_tokens.weight" if "model.embed_tokens.weight" in safe_open(str(model_dir / "model.safetensors"), framework="pt").keys() else "lm_head.weight"
+    with safe_open(str(model_dir / "model.safetensors"), framework="pt") as st_lm:
+        emb_w = st_lm.get_tensor(w_key).float()
+    x_cal_lm = collect_lm_head_calibration_activations(model_dir, args.lm_calib_cache, args.recalibrate_lm_head)
+    lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps = build_lm_head_int16_slices(
+        emb_w, x_cal_lm, lm_tmpl_path, pkg_out_dir / "models"
+    )
+    del emb_w
+
     if base_pkg_dir.exists() and (base_pkg_dir / "models").exists() and base_pkg_dir != pkg_out_dir:
-        print(f"[+] Reusing existing archetype models and LM head slices from {base_pkg_dir / 'models'}...")
-        for m_file in (base_pkg_dir / "models").glob("*.model"):
+        print(f"[+] Reusing existing archetype models from {base_pkg_dir / 'models'}...")
+        for m_file in (base_pkg_dir / "models").glob("*_classb.model"):
             dst_m = pkg_out_dir / "models" / m_file.name
             if not dst_m.exists():
                 try:
@@ -444,8 +710,12 @@ def main():
         return off, int(arr_f32.size)
 
     def record_scale_entry(k_name: str, in_dt: str, out_dt: str, in_t: float, in_s: float,
-                           in_inv: np.ndarray, out_step_c: np.ndarray):
-        in_off, in_cnt = append_chan_vec(in_inv)
+                           in_inv: np.ndarray, out_step_c: np.ndarray,
+                           shared_in_off_cnt: tuple[int, int] = None):
+        if shared_in_off_cnt is not None:
+            in_off, in_cnt = shared_in_off_cnt
+        else:
+            in_off, in_cnt = append_chan_vec(in_inv)
         out_off, out_cnt = append_chan_vec(out_step_c)
         out_s_med = float(np.median(out_step_c))
         out_div = 32767.0 if out_dt == "int16" else 127.0
@@ -461,6 +731,15 @@ def main():
             "out_step_offset": out_off,
             "out_step_count": out_cnt,
         }
+
+    lm_in_off_cnt = append_chan_vec(lm_inv_smooth)
+    for d_lm in range(2):
+        for s_lm in range(4):
+            record_scale_entry(
+                f"lfm3_lm_head_d{d_lm}_s{s_lm}", "int8", "int16",
+                lm_in_t, lm_in_s, lm_inv_smooth, lm_slice_out_steps[d_lm * 4 + s_lm],
+                shared_in_off_cnt=lm_in_off_cnt,
+            )
 
     for l in range(24):
         d_id = 0 if l < 12 else 1

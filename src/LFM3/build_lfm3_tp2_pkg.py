@@ -280,8 +280,12 @@ def main():
         return off, int(arr_f32.size)
 
     def record_scale_entry(k_name: str, in_dt: str, out_dt: str, in_t: float, in_s: float,
-                           in_inv: np.ndarray, out_step_c: np.ndarray):
-        in_off, in_cnt = append_chan_vec(in_inv)
+                           in_inv: np.ndarray, out_step_c: np.ndarray,
+                           shared_in_off_cnt: tuple[int, int] = None):
+        if shared_in_off_cnt is not None:
+            in_off, in_cnt = shared_in_off_cnt
+        else:
+            in_off, in_cnt = append_chan_vec(in_inv)
         out_off, out_cnt = append_chan_vec(out_step_c)
         out_s_med = float(np.median(out_step_c))
         out_div = 32767.0 if out_dt == "int16" else 127.0
@@ -297,6 +301,22 @@ def main():
             "out_step_offset": out_off,
             "out_step_count": out_cnt,
         }
+
+    # Copy LM-head per-channel SmoothQuant & INT16 output step vectors from base_pkg into TP=2's chan_floats
+    lm_sc0 = base_qs["subgraphs"].get("lfm3_lm_head_d0_s0", {})
+    if lm_sc0.get("in_smooth_count", 0) > 0:
+        lm_inv_base = base_chan[lm_sc0["in_smooth_offset"]:lm_sc0["in_smooth_offset"] + lm_sc0["in_smooth_count"]]
+        lm_in_off_cnt = append_chan_vec(lm_inv_base)
+        for d_lm in range(2):
+            for s_lm in range(4):
+                k_lm = f"lfm3_lm_head_d{d_lm}_s{s_lm}"
+                bsc = base_qs["subgraphs"][k_lm]
+                osc_lm = base_chan[bsc["out_step_offset"]:bsc["out_step_offset"] + bsc["out_step_count"]]
+                record_scale_entry(
+                    k_lm, bsc["input_dtype"], bsc["output_dtype"],
+                    bsc["input_threshold"], bsc["input_step"],
+                    lm_inv_base, osc_lm, shared_in_off_cnt=lm_in_off_cnt,
+                )
 
     for l in range(24):
         pfx = f"model.layers.{l}."
